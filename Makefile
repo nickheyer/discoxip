@@ -9,7 +9,7 @@ LDFLAGS := -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=$(VERSION)
 
 all: build
 
-build:
+build: clean
 	@mkdir -p $(BUILD_DIR)
 	go build $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME) ./cmd/discoxip
 

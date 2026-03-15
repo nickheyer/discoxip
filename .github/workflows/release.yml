@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=${{ github.ref_name }} -X github.com/nickheyer/discoxip/pkg/cli.Commit=${{ github.sha }}" \
+            -o discoxip-${{ matrix.suffix }} ./cmd/discoxip
+
+      - name: Compress (tar)
+        if: matrix.goos != 'windows'
+        run: tar -czf discoxip-${{ matrix.suffix }}.tar.gz discoxip-${{ matrix.suffix }}
+
+      - name: Compress (zip)
+        if: matrix.goos == 'windows'
+        run: zip discoxip-${{ matrix.suffix }}.zip discoxip-${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.suffix }}
+          path: |
+            discoxip-${{ matrix.suffix }}.tar.gz
+            discoxip-${{ matrix.suffix }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: ./artifacts
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: discoxip ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            ./artifacts/**/*.tar.gz
+            ./artifacts/**/*.zip
