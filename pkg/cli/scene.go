@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/nickheyer/discoxip/pkg/buffer"
 	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/spf13/cobra"
 )
@@ -46,6 +47,10 @@ func runSceneExport(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	for _, w := range s.Warnings {
+		fmt.Fprintf(os.Stderr, "  warning: %s\n", w)
+	}
+
 	outPath := sceneExportOutput
 	if outPath == "" {
 		outPath = strings.TrimSuffix(args[0], filepath.Ext(args[0])) + ".glb"
@@ -61,7 +66,7 @@ func runSceneExport(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Exported scene to %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "Exported scene (%d meshes) to %s\n", len(s.Meshes), outPath)
 	return nil
 }
 
@@ -74,14 +79,37 @@ func runSceneInfo(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Scene: %s\n", args[0])
 	fmt.Printf("  Directory: %s\n", s.Dir)
 	fmt.Printf("  XAP: %s\n", s.XAP)
-	fmt.Printf("  Meshes resolved: %d\n", len(s.Meshes))
 
+	fmt.Printf("  Buffer pools: %d\n", len(s.Pools))
+	for _, pool := range s.Pools {
+		verts := int(pool.VB.Header.VertexCount)
+		format := buffer.VertexFormat(pool.VB.Header.FormatCode)
+		idxCount := 0
+		if pool.IB != nil {
+			idxCount = len(pool.IB.Indices)
+		}
+		decoded := "no"
+		if pool.VB.Vertices != nil {
+			decoded = "yes"
+		}
+		fmt.Printf("    %s: %d verts (%s), %d indices, decoded=%s\n",
+			pool.Name, verts, format, idxCount, decoded)
+	}
+
+	fmt.Printf("  Mesh refs: %d\n", len(s.Meshes))
 	for url, md := range s.Meshes {
 		status := "no geometry"
 		if len(md.Vertices) > 0 {
 			status = fmt.Sprintf("%d vertices, %d indices", len(md.Vertices), len(md.Indices))
 		}
 		fmt.Printf("    %s: %s\n", url, status)
+	}
+
+	if len(s.Warnings) > 0 {
+		fmt.Printf("  Warnings:\n")
+		for _, w := range s.Warnings {
+			fmt.Printf("    - %s\n", w)
+		}
 	}
 
 	return nil

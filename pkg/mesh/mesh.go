@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"bytes"
 	"io"
 	"os"
 )
@@ -11,7 +12,7 @@ type ContentType int
 const (
 	ContentEmpty  ContentType = iota // all zeros or zero-length
 	ContentText                      // ASCII VRML scene text
-	ContentBinary                    // binary packed records
+	ContentBinary                    // binary vertex color data or other binary
 )
 
 func (c ContentType) String() string {
@@ -29,13 +30,28 @@ func (c ContentType) String() string {
 
 // Mesh is the parsed result of an XM file.
 type Mesh struct {
-	Type     ContentType
-	Size     int64
-	Text     *TextMesh
-	Binary   *BinaryMesh
+	Type   ContentType
+	Size   int64
+	Text   *TextMesh
+	Binary *BinaryMesh
 }
 
-// Detect determines the content type from the first bytes of data.
+// vrmlKeywords are tokens that reliably identify VRML text content.
+// RGBA vertex color data often has >90% printable bytes (because the 0xFF
+// alpha byte and color values 0x20-0x7E are "printable"), so we must check
+// for actual VRML structure rather than relying on byte-range heuristics.
+var vrmlKeywords = [][]byte{
+	[]byte("Shape"),
+	[]byte("Transform"),
+	[]byte("DEF "),
+	[]byte("material"),
+	[]byte("appearance"),
+	[]byte("geometry"),
+	[]byte("children"),
+	[]byte("url "),
+}
+
+// Detect determines the content type from the data.
 func Detect(data []byte, size int64) ContentType {
 	if size == 0 {
 		return ContentEmpty
@@ -53,16 +69,12 @@ func Detect(data []byte, size int64) ContentType {
 		return ContentEmpty
 	}
 
-	// Check if printable ASCII (VRML text)
-	printable := 0
-	for _, b := range data {
-		if (b >= 0x20 && b <= 0x7E) || b == '\r' || b == '\n' || b == '\t' {
-			printable++
+	// Check for VRML keywords — this is more reliable than byte-range analysis
+	// because RGBA color data often passes the "90% printable" test.
+	for _, kw := range vrmlKeywords {
+		if bytes.Contains(data, kw) {
+			return ContentText
 		}
-	}
-	// If >90% printable, treat as text
-	if len(data) > 0 && float64(printable)/float64(len(data)) > 0.9 {
-		return ContentText
 	}
 
 	return ContentBinary

@@ -7,7 +7,8 @@ type Node interface {
 
 // Scene is the top-level container of nodes.
 type Scene struct {
-	Nodes []Node
+	Nodes    []Node
+	Warnings []string // non-fatal parse issues (unknown node types, etc.)
 }
 
 // Transform is a VRML Transform node with children and spatial properties.
@@ -44,8 +45,9 @@ type Appearance struct {
 
 // Material holds material properties.
 type Material struct {
-	Type string // e.g. "MaxMaterial"
-	Name string
+	Type    string // e.g. "MaxMaterial"
+	Name    string
+	DefName string // DEF identifier for USE references
 }
 
 // MeshRef references an external mesh file.

@@ -54,15 +54,20 @@ func ReadXPR(r io.Reader, size int64) (*Texture, error) {
 		return nil, ErrNoTexture
 	}
 
-	// Read remaining header bytes to get to the format register
-	// The format register is the last dword of the 16-byte resource descriptor
-	// which starts right after the XPR header at byte 12
-	// We already read 16 bytes (the XPR header itself contains the start of resource desc)
-	// Actually: the XPR header is 12 bytes (magic+total+header), then 4 bytes res_count+type
-	// Then there are per-resource entries. For a single texture, the format register
-	// is at the end of the resource descriptor.
+	// XPR0 file layout (single-texture resource):
+	//   0x00: "XPR0" magic          (4 bytes)
+	//   0x04: total file size       (4 bytes)
+	//   0x08: header size           (4 bytes) — offset to pixel data
+	//   0x0C: D3DResource.Common    (4 bytes) — refcount(16) + type(16)
+	//   0x10: D3DTexture.Data       (4 bytes) — GPU data offset
+	//   0x14: D3DTexture.Lock       (4 bytes) — unused at rest
+	//   0x18: D3DTexture.Format     (4 bytes) — NV2A format register
+	//   0x1C: D3DTexture.Size       (4 bytes) — NV2A size register
+	//   [header_size]: pixel data starts
+	//
+	// We already read 16 bytes (XPR header + Common field as ResCount/ResType).
+	// The format register is at file offset 0x18 = headerData[8:12].
 
-	// Read the rest of the header area
 	remainingHeader := int(h.HeaderSize) - 16
 	if remainingHeader < 0 {
 		return nil, ErrTruncatedFile
@@ -73,26 +78,10 @@ func ReadXPR(r io.Reader, size int64) (*Texture, error) {
 		return nil, fmt.Errorf("texture: reading header data: %w", err)
 	}
 
-	// The format register is at the very end of the first resource descriptor
-	// For single-resource XPR0, the resource descriptor follows the header
-	// Based on analysis: the format register is at offset 12 from the resource start
-	// Resource descriptor starts at byte 12 of the file (after magic+totalsize+headersize)
-	// We already consumed bytes 12-15 as rescount+restype
-	// The format register is the DWORD at file offset 0x1C (byte 28)
-	// Which is headerData offset 12 (28 - 16 = 12)
 	if len(headerData) < 12 {
 		return nil, ErrTruncatedFile
 	}
 
-	// XPR0 layout:
-	// 0x00: XPR0 magic
-	// 0x04: total_size
-	// 0x08: header_size
-	// 0x0C: res_count(2) + res_type(2)
-	// 0x10: GPU register 0 (unused)
-	// 0x14: GPU register 1 (unused)
-	// 0x18: NV2A format register
-	// Format reg is at file offset 0x18 = headerData[8:12]
 	formatReg := binary.LittleEndian.Uint32(headerData[8:12])
 
 	info := decodeFormatRegister(formatReg)
@@ -124,14 +113,18 @@ func OpenXPR(path string) (*Texture, error) {
 	return ReadXPR(f, fi.Size())
 }
 
-// decodeFormatRegister extracts texture info from the NV2A format register.
+// decodeFormatRegister extracts texture info from the NV2A SET_TEXTURE_FORMAT register.
 func decodeFormatRegister(reg uint32) TextureInfo {
-	// Bit layout (from analysis):
-	// [7:0]   = context DMA + flags
-	// [15:8]  = color format
-	// [19:16] = mip levels
-	// [23:20] = log2(width)
-	// [27:24] = log2(height)
+	// NV2A SET_TEXTURE_FORMAT register bit layout:
+	// [1:0]   = context DMA select
+	// [2]     = cubemap enable
+	// [3]     = border source
+	// [7:4]   = dimensionality
+	// [15:8]  = color format (D3DFMT_*)
+	// [19:16] = mipmap levels
+	// [23:20] = base size U (log2 width)
+	// [27:24] = base size V (log2 height)
+	// [31:28] = base size P (log2 depth, for 3D textures)
 	colorFmt := PixelFormat((reg >> 8) & 0xFF)
 	mipLevels := int((reg >> 16) & 0xF)
 	log2W := int((reg >> 20) & 0xF)

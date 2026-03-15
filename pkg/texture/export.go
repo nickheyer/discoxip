@@ -62,7 +62,7 @@ func decodeARGB32(data []byte, w, h int, hasAlpha bool) *image.RGBA {
 		if off+4 > len(data) {
 			break
 		}
-		// ARGB → RGBA
+		// D3DFMT_A8R8G8B8 in little-endian memory: B, G, R, A
 		b := data[off]
 		g := data[off+1]
 		r := data[off+2]

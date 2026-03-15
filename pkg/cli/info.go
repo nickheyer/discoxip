@@ -38,7 +38,13 @@ func runInfo(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(w, "TYPE\tSIZE\tOFFSET\tNAME")
 	fmt.Fprintln(w, "----\t----\t------\t----")
 	for _, e := range r.Entries() {
-		fmt.Fprintf(w, "%s\t%d\t0x%X\t%s\n", e.Type, e.Size, e.Offset, e.Name)
+		if e.Type == xip.FileTypeMesh {
+			meta := xip.DecodeMeshEntry(e)
+			fmt.Fprintf(w, "%s\tpool=~%d idx=%d tris=%d\t\t%s\n",
+				e.Type, meta.Pool, meta.IndexStart, meta.TriCount, e.Name)
+		} else {
+			fmt.Fprintf(w, "%s\t%d\t0x%X\t%s\n", e.Type, e.Size, e.Offset, e.Name)
+		}
 	}
 	return w.Flush()
 }

@@ -55,17 +55,11 @@ func runMeshInfo(cmd *cobra.Command, args []string) error {
 			}
 		case mesh.ContentBinary:
 			if m.Binary != nil {
-				fmt.Printf("  Records: %d (4-byte each)\n", len(m.Binary.Records))
-				// Count distinct tags
-				tags := make(map[byte]int)
-				for _, r := range m.Binary.Records {
-					tags[r.Tag]++
+				if len(m.Binary.VertexColors) > 0 {
+					fmt.Printf("  Vertex colors: %d\n", len(m.Binary.VertexColors))
+				} else {
+					fmt.Printf("  Color entries: %d (all zero / no color data)\n", m.Binary.ColorCount)
 				}
-				fmt.Printf("  Tags:")
-				for tag, count := range tags {
-					fmt.Printf(" 0x%02X×%d", tag, count)
-				}
-				fmt.Println()
 			}
 		}
 

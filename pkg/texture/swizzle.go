@@ -1,13 +1,17 @@
 package texture
 
 // deswizzle converts NV2A Morton Z-order (swizzled) data to linear layout.
-// bytesPerPixel is the pixel size (2 for R5G6B5, 4 for A8R8G8B8).
+// Handles non-square textures correctly by building dimension-specific bit masks.
+// The NV2A GPU interleaves X and Y coordinate bits, but when one dimension is
+// smaller than the other, it stops interleaving that dimension's bits and assigns
+// the remaining bit positions to the larger dimension.
 func deswizzle(data []byte, width, height, bytesPerPixel int) []byte {
 	out := make([]byte, width*height*bytesPerPixel)
+	xMask, yMask := buildSwizzleMasks(width, height)
 
 	for y := range height {
 		for x := range width {
-			srcIdx := mortonIndex(x, y) * bytesPerPixel
+			srcIdx := int(fillPattern(x, xMask)|fillPattern(y, yMask)) * bytesPerPixel
 			dstIdx := (y*width + x) * bytesPerPixel
 			if srcIdx+bytesPerPixel <= len(data) && dstIdx+bytesPerPixel <= len(out) {
 				copy(out[dstIdx:dstIdx+bytesPerPixel], data[srcIdx:srcIdx+bytesPerPixel])
@@ -17,16 +21,38 @@ func deswizzle(data []byte, width, height, bytesPerPixel int) []byte {
 	return out
 }
 
-// mortonIndex computes the Morton Z-order index for (x, y).
-func mortonIndex(x, y int) int {
-	return interleave(x) | (interleave(y) << 1)
+// buildSwizzleMasks creates bit masks for X and Y coordinates.
+// Bits are allocated alternating between dimensions. When one dimension
+// runs out of bits (i >= that dimension's size), remaining bit positions
+// go to the other dimension. This matches the NV2A hardware swizzle for
+// non-square textures.
+func buildSwizzleMasks(width, height int) (xMask, yMask uint32) {
+	bit := uint32(1)
+	for i := 1; i < width || i < height; i <<= 1 {
+		if i < width {
+			xMask |= bit
+			bit <<= 1
+		}
+		if i < height {
+			yMask |= bit
+			bit <<= 1
+		}
+	}
+	return
 }
 
-// interleave spreads bits of v into even bit positions.
-func interleave(v int) int {
-	v = (v | (v << 8)) & 0x00FF00FF
-	v = (v | (v << 4)) & 0x0F0F0F0F
-	v = (v | (v << 2)) & 0x33333333
-	v = (v | (v << 1)) & 0x55555555
-	return v
+// fillPattern distributes the bits of val into the bit positions set in mask.
+// Example: val=0b111, mask=0b10101 -> result=0b10101 (val bits fill mask positions).
+func fillPattern(val int, mask uint32) uint32 {
+	result := uint32(0)
+	srcBit := uint32(1)
+	for dstBit := uint32(1); dstBit <= mask; dstBit <<= 1 {
+		if mask&dstBit != 0 {
+			if uint32(val)&srcBit != 0 {
+				result |= dstBit
+			}
+			srcBit <<= 1
+		}
+	}
+	return result
 }

@@ -15,15 +15,26 @@ type GlyphRange struct {
 	Count uint16
 }
 
+// GlyphMetric holds per-glyph layout information.
+type GlyphMetric struct {
+	Width        int    // glyph bitmap width in pixels
+	Height       int    // glyph bitmap height in pixels
+	XOffset      int    // horizontal bearing (signed)
+	YOffset      int    // vertical bearing (signed)
+	Advance      int    // horizontal advance width
+	BitmapOffset int    // byte offset into bitmap data for this glyph
+}
+
 // Font holds parsed XTF font metadata.
 type Font struct {
-	Name        string
-	GlyphCount  int
-	Ranges      []GlyphRange
-	MaxHeight   int
+	Name         string
+	GlyphCount   int
+	Ranges       []GlyphRange
+	Glyphs       []GlyphMetric // per-glyph metrics (len == TotalGlyphs from ranges)
+	MaxHeight    int
 	BitmapOffset int
-	FileSize    int64
-	RawData     []byte
+	FileSize     int64
+	RawData      []byte
 }
 
 // ReadXTF parses an XTF font file from r with given size.
@@ -68,7 +79,6 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		if start == 0 && count == 0 {
 			break
 		}
-		// Sanity check: don't read too many ranges
 		if count == 0 || (start == 0 && totalGlyphs > 0) {
 			break
 		}
@@ -76,9 +86,29 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		totalGlyphs += int(count)
 		off += 4
 
-		// Limit to reasonable number of ranges
 		if len(ranges) > 256 {
 			break
+		}
+	}
+
+	// Skip the terminating 0,0 pair if present
+	if off+4 <= len(data) {
+		termStart := binary.LittleEndian.Uint16(data[off:])
+		termCount := binary.LittleEndian.Uint16(data[off+2:])
+		if termStart == 0 && termCount == 0 {
+			off += 4
+		}
+	}
+
+	// Parse per-glyph metric records between range table and bitmap data.
+	// Auto-detect record size from the available space.
+	var glyphs []GlyphMetric
+	if totalGlyphs > 0 && bitmapOffset > off && bitmapOffset <= len(data) {
+		metricSpace := bitmapOffset - off
+		recordSize := metricSpace / totalGlyphs
+
+		if recordSize >= 8 && metricSpace%totalGlyphs == 0 {
+			glyphs = parseGlyphMetrics(data[off:bitmapOffset], totalGlyphs, recordSize)
 		}
 	}
 
@@ -86,11 +116,56 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		Name:         name,
 		GlyphCount:   glyphCount,
 		Ranges:       ranges,
+		Glyphs:       glyphs,
 		MaxHeight:    maxHeight,
 		BitmapOffset: bitmapOffset,
 		FileSize:     size,
 		RawData:      data,
 	}, nil
+}
+
+// parseGlyphMetrics extracts per-glyph records of the given size.
+func parseGlyphMetrics(data []byte, count, recordSize int) []GlyphMetric {
+	glyphs := make([]GlyphMetric, count)
+
+	for i := range count {
+		off := i * recordSize
+		if off+recordSize > len(data) {
+			break
+		}
+		rec := data[off : off+recordSize]
+
+		switch {
+		case recordSize >= 12:
+			// 12+ byte records: width(2) + height(2) + xoff(2) + yoff(2) + advance(2) + padding(2+)
+			glyphs[i].Width = int(binary.LittleEndian.Uint16(rec[0:]))
+			glyphs[i].Height = int(binary.LittleEndian.Uint16(rec[2:]))
+			glyphs[i].XOffset = int(int16(binary.LittleEndian.Uint16(rec[4:])))
+			glyphs[i].YOffset = int(int16(binary.LittleEndian.Uint16(rec[6:])))
+			glyphs[i].Advance = int(binary.LittleEndian.Uint16(rec[8:]))
+			if recordSize >= 14 {
+				glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint32(rec[10:]))
+			}
+		case recordSize >= 10:
+			// 10 byte records: width(2) + height(2) + xoff(1) + yoff(1) + advance(2) + bitmapOff(2)
+			glyphs[i].Width = int(binary.LittleEndian.Uint16(rec[0:]))
+			glyphs[i].Height = int(binary.LittleEndian.Uint16(rec[2:]))
+			glyphs[i].XOffset = int(int8(rec[4]))
+			glyphs[i].YOffset = int(int8(rec[5]))
+			glyphs[i].Advance = int(binary.LittleEndian.Uint16(rec[6:]))
+			glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint16(rec[8:]))
+		case recordSize >= 8:
+			// 8 byte records: width(1) + height(1) + xoff(1) + yoff(1) + advance(1) + pad(1) + bitmapOff(2)
+			glyphs[i].Width = int(rec[0])
+			glyphs[i].Height = int(rec[1])
+			glyphs[i].XOffset = int(int8(rec[2]))
+			glyphs[i].YOffset = int(int8(rec[3]))
+			glyphs[i].Advance = int(rec[4])
+			glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint16(rec[6:]))
+		}
+	}
+
+	return glyphs
 }
 
 // Open reads an XTF font file from disk.

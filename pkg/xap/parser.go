@@ -9,8 +9,13 @@ import (
 )
 
 type parser struct {
-	tokens []token
-	pos    int
+	tokens   []token
+	pos      int
+	warnings []string
+}
+
+func (p *parser) warn(msg string) {
+	p.warnings = append(p.warnings, msg)
 }
 
 // Parse parses XAP text into a Scene.
@@ -66,12 +71,14 @@ func (p *parser) parseScene() (*Scene, error) {
 	for p.peek().typ != tokEOF {
 		node, err := p.parseNode()
 		if err != nil {
+			scene.Warnings = p.warnings
 			return scene, err
 		}
 		if node != nil {
 			scene.Nodes = append(scene.Nodes, node)
 		}
 	}
+	scene.Warnings = p.warnings
 	return scene, nil
 }
 
@@ -86,8 +93,14 @@ func (p *parser) parseNode() (Node, error) {
 	case "Shape":
 		return p.parseShape()
 	default:
-		// Skip unknown top-level tokens
-		p.next()
+		// Unknown top-level token — skip it but record a warning
+		tok := p.next()
+		if tok.typ == tokIdent {
+			p.warn(fmt.Sprintf("skipping unknown node type %q at pos %d", tok.val, tok.pos))
+			if p.peek().typ == tokLBrace {
+				p.skipBlock()
+			}
+		}
 		return nil, nil
 	}
 }
@@ -283,7 +296,8 @@ func (p *parser) parseShape() (*Shape, error) {
 			case "USE":
 				p.next() // consume USE
 				name := p.next() // consume name
-				shape.Geometry = &MeshRef{Name: name.val}
+				// Reconstruct URL from DEF name (convention: name + ".xm")
+				shape.Geometry = &MeshRef{Name: name.val, URL: name.val + ".xm"}
 			case "Mesh":
 				ref, err := p.parseMeshRef("")
 				if err != nil {
@@ -321,15 +335,16 @@ func (p *parser) parseAppearance() (*Appearance, error) {
 		field := p.peek()
 		if field.val == "material" {
 			p.next()
-			// Handle "material DEF name TypeName { ... }" or "material TypeName { ... }"
+			var defName string
 			if p.peek().val == "DEF" {
 				p.next() // consume DEF
-				p.next() // consume name (e.g. MemoryPanelMaterial)
+				defName = p.next().val
 			}
 			mat, err := p.parseMaterial()
 			if err != nil {
 				return app, err
 			}
+			mat.DefName = defName
 			app.Material = mat
 		} else {
 			p.next()

@@ -2,6 +2,7 @@ package extract
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -14,10 +15,17 @@ import (
 
 const bufSize = 256 * 1024
 
+// MeshManifestEntry holds the per-mesh pool and index range info written to _meshes.json.
+type MeshManifestEntry struct {
+	Pool       int `json:"pool"`
+	IndexStart int `json:"index_start"`
+	TriCount   int `json:"tri_count"`
+}
+
 type Options struct {
 	OutputDir string
 	Verbose   bool
-	All       bool // include meshes
+	All       bool // include meshes (kept for backward compat, no longer writes .xm files)
 }
 
 // Extracts all (possible) entries from xip reader
@@ -31,11 +39,26 @@ func Archive(r *xip.Reader, opts Options) error {
 		return fmt.Errorf("extract: resolving output dir: %w", err)
 	}
 
+	// Collect mesh metadata from mesh-type entries (they have no file data to extract)
+	manifest := make(map[string]MeshManifestEntry)
+
 	for _, e := range r.Entries() {
 		if e.Type == xip.FileTypeDir {
 			continue
 		}
-		if e.Type == xip.FileTypeMesh && !opts.All {
+
+		// Mesh entries encode pool/index metadata, not file data.
+		// Collect metadata but do not extract — the Offset field is not a byte offset.
+		if e.Type == xip.FileTypeMesh {
+			meta := xip.DecodeMeshEntry(e)
+			manifest[e.Name] = MeshManifestEntry{
+				Pool:       meta.Pool,
+				IndexStart: meta.IndexStart,
+				TriCount:   meta.TriCount,
+			}
+			if opts.Verbose {
+				fmt.Printf("  %s → pool ~%d, index %d, %d tris\n", e.Name, meta.Pool, meta.IndexStart, meta.TriCount)
+			}
 			continue
 		}
 
@@ -47,6 +70,29 @@ func Archive(r *xip.Reader, opts Options) error {
 		if err := extractFile(r, e, safe, opts.Verbose); err != nil {
 			return err
 		}
+	}
+
+	// Write mesh manifest
+	if len(manifest) > 0 {
+		if err := writeManifest(absOut, manifest, opts.Verbose); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func writeManifest(dir string, manifest map[string]MeshManifestEntry, verbose bool) error {
+	path := filepath.Join(dir, "_meshes.json")
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("extract: encoding mesh manifest: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("extract: writing mesh manifest: %w", err)
+	}
+	if verbose {
+		fmt.Printf("  _meshes.json (%d mesh entries)\n", len(manifest))
 	}
 	return nil
 }
