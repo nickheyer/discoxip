@@ -53,6 +53,13 @@ func runXAPInfo(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    - %s\n", m)
 	}
 
+	if len(scene.Warnings) > 0 {
+		fmt.Printf("  Warnings:   %d\n", len(scene.Warnings))
+		for _, w := range scene.Warnings {
+			fmt.Printf("    - %s\n", w)
+		}
+	}
+
 	return nil
 }
 

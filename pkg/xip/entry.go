@@ -7,7 +7,7 @@ type FileType uint32
 const (
 	FileTypeRegular FileType = 0 // regular file (XAP, etc.)
 	FileTypeFile    FileType = 1 // regular file (alternate)
-	FileTypeDir     FileType = 2 // directory / texture container
+	FileTypeDir     FileType = 2 // texture / resource container (XBX textures use this type)
 	FileTypeMesh    FileType = 4 // mesh sub-range reference
 	FileTypeIB      FileType = 5 // index buffer pool
 	FileTypeVB      FileType = 6 // vertex buffer pool
@@ -20,7 +20,7 @@ func (t FileType) String() string {
 	case FileTypeFile:
 		return "file"
 	case FileTypeDir:
-		return "dir"
+		return "resource"
 	case FileTypeMesh:
 		return "mesh"
 	case FileTypeIB:

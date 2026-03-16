@@ -1,27 +1,28 @@
 package xap
 
 import (
-	"strings"
 	"unicode"
 )
 
 type tokenType int
 
 const (
-	tokEOF tokenType = iota
-	tokLBrace        // {
-	tokRBrace        // }
-	tokLBracket      // [
-	tokRBracket      // ]
-	tokIdent         // identifier/keyword
-	tokString        // "quoted string"
-	tokNumber        // number literal
+	tokEOF     tokenType = iota
+	tokLBrace            // {
+	tokRBrace            // }
+	tokLBracket          // [
+	tokRBracket          // ]
+	tokLParen            // (
+	tokRParen            // )
+	tokIdent             // identifier/keyword
+	tokString            // "quoted string"
+	tokNumber            // number literal
 )
 
 type token struct {
 	typ tokenType
 	val string
-	pos int
+	pos int // byte offset in input
 }
 
 type lexer struct {
@@ -54,11 +55,15 @@ func (l *lexer) run() {
 			l.emit(tokLBracket, "[")
 		case ch == ']':
 			l.emit(tokRBracket, "]")
+		case ch == '(':
+			l.emit(tokLParen, "(")
+		case ch == ')':
+			l.emit(tokRParen, ")")
 		case ch == '"':
 			l.lexString()
 			continue
 		case ch == '#':
-			// Comment — skip to end of line
+			// VRML-style line comment
 			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
 				l.pos++
 			}
@@ -66,6 +71,17 @@ func (l *lexer) run() {
 		case ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '/':
 			// C-style line comment
 			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
+				l.pos++
+			}
+			continue
+		case ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '*':
+			// Block comment /* ... */
+			l.pos += 2
+			for l.pos+1 < len(l.input) {
+				if l.input[l.pos] == '*' && l.input[l.pos+1] == '/' {
+					l.pos += 2
+					break
+				}
 				l.pos++
 			}
 			continue
@@ -102,12 +118,13 @@ func (l *lexer) skipWhitespace() {
 }
 
 func (l *lexer) lexString() {
-	l.pos++ // skip opening "
+	startPos := l.pos // position of opening "
+	l.pos++           // skip opening "
 	start := l.pos
 	for l.pos < len(l.input) && l.input[l.pos] != '"' {
 		l.pos++
 	}
-	l.emit(tokString, l.input[start:l.pos])
+	l.tokens = append(l.tokens, token{typ: tokString, val: l.input[start:l.pos], pos: startPos})
 	if l.pos < len(l.input) {
 		l.pos++ // skip closing "
 	}
@@ -131,7 +148,7 @@ func (l *lexer) lexNumber() {
 			l.pos++
 		}
 	}
-	l.emit(tokNumber, l.input[start:l.pos])
+	l.tokens = append(l.tokens, token{typ: tokNumber, val: l.input[start:l.pos], pos: start})
 }
 
 func (l *lexer) lexIdent() {
@@ -139,11 +156,7 @@ func (l *lexer) lexIdent() {
 	for l.pos < len(l.input) && isIdentChar(l.input[l.pos]) {
 		l.pos++
 	}
-	val := l.input[start:l.pos]
-
-	// Check if this looks like a number that starts with a letter prefix
-	// (shouldn't happen in VRML, treat as ident)
-	l.emit(tokIdent, val)
+	l.tokens = append(l.tokens, token{typ: tokIdent, val: l.input[start:l.pos], pos: start})
 }
 
 func isNumberStart(ch byte) bool {
@@ -160,17 +173,4 @@ func isIdentStart(ch byte) bool {
 
 func isIdentChar(ch byte) bool {
 	return isIdentStart(ch) || isDigit(ch) || ch == '-' || ch == '.' || ch == '/' || ch == '~'
-}
-
-// keywords that introduce known node types
-var nodeTypes = map[string]bool{
-	"Transform":  true,
-	"Shape":      true,
-	"Appearance": true,
-	"Material":   true,
-	"Mesh":       true,
-}
-
-func isNodeType(s string) bool {
-	return nodeTypes[s] || strings.HasSuffix(s, "Material")
 }

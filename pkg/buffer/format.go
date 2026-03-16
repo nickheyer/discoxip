@@ -38,7 +38,9 @@ func (f VertexFormat) Stride() int {
 
 // Vertex is the decoded vertex representation, always expanded to full floats.
 type Vertex struct {
-	Pos    [3]float32
-	Normal [3]float32
-	UV     [2]float32
+	Pos      [3]float32
+	Normal   [3]float32
+	UV       [2]float32
+	Color    [4]float32 // RGBA vertex color [0,1]; zero value = no color
+	HasColor bool
 }

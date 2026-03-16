@@ -115,34 +115,41 @@ func decodeStandard24(data []byte, count int) ([]Vertex, error) {
 
 // decodeCompressed16 decodes a 16-byte per-vertex format.
 //
-// Layout (best-effort interpretation — format not fully documented):
+// Layout (verified by data analysis):
 //
-//	Offset 0:  float32    — position X
-//	Offset 4:  int16 (SHORT2N) — position Y (normalized, GPU scales via vertex shader constants)
-//	Offset 6:  int16 (SHORT2N) — position Z (compressed)
-//	Offset 8:  float32    — W or additional position data (treated as secondary Z)
-//	Offset 12: uint16 (USHORT2N) — texture U coordinate [0,1]
-//	Offset 14: uint16 (USHORT2N) — texture V coordinate [0,1]
+//	Offset 0:  float32       — position X
+//	Offset 4:  int16 SHORT2N — normal X (divide by 32767 for [-1,1])
+//	Offset 6:  int16 SHORT2N — normal Y (divide by 32767 for [-1,1])
+//	Offset 8:  float32       — position Z
+//	Offset 12: uint16 USHORT2N — texture U coordinate [0,1]
+//	Offset 14: uint16 USHORT2N — texture V coordinate [0,1]
 //
-// The Y/Z int16 values are normalized by the GPU to [-1, 1]. Without the vertex
-// shader scale constants we cannot recover true world-space positions, but the
-// proportions remain correct for visualization.
+// Only two position axes are stored (X, Z). The Y axis is zero in local space;
+// the scene graph transforms handle 3D placement. Normal Z is derived from
+// the unit normal constraint: nz = sqrt(1 - nx² - ny²).
 func decodeCompressed16(data []byte, count int) ([]Vertex, error) {
 	verts := make([]Vertex, count)
 	for i := range count {
 		off := i * 16
+
+		// Position: X from first float, Z from second float, Y = 0
 		verts[i].Pos[0] = math.Float32frombits(binary.LittleEndian.Uint32(data[off:]))
+		verts[i].Pos[1] = 0
+		verts[i].Pos[2] = math.Float32frombits(binary.LittleEndian.Uint32(data[off+8:]))
 
-		s0 := int16(binary.LittleEndian.Uint16(data[off+4:]))
-		s1 := int16(binary.LittleEndian.Uint16(data[off+6:]))
-		verts[i].Pos[1] = float32(s0) / 32767.0
-		verts[i].Pos[2] = float32(s1) / 32767.0
+		// Normal: XY from SHORT2N, Z derived from unit length
+		nx := float32(int16(binary.LittleEndian.Uint16(data[off+4:]))) / 32767.0
+		ny := float32(int16(binary.LittleEndian.Uint16(data[off+6:]))) / 32767.0
+		sq := nx*nx + ny*ny
+		nz := float32(0)
+		if sq < 1.0 {
+			nz = float32(math.Sqrt(float64(1.0 - sq)))
+		}
+		verts[i].Normal[0] = nx
+		verts[i].Normal[1] = ny
+		verts[i].Normal[2] = nz
 
-		// Third float — may encode an additional axis or W; use as normal hint
-		f2 := math.Float32frombits(binary.LittleEndian.Uint32(data[off+8:]))
-		verts[i].Normal[2] = f2
-
-		// Second int16 pair — treat as unsigned normalized UV coordinates
+		// UV: USHORT2N normalized to [0,1]
 		u := binary.LittleEndian.Uint16(data[off+12:])
 		v := binary.LittleEndian.Uint16(data[off+14:])
 		verts[i].UV[0] = float32(u) / 65535.0

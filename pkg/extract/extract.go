@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/nickheyer/discoxip/pkg/texture"
 	"github.com/nickheyer/discoxip/pkg/xip"
 )
 
@@ -17,15 +18,17 @@ const bufSize = 256 * 1024
 
 // MeshManifestEntry holds the per-mesh pool and index range info written to _meshes.json.
 type MeshManifestEntry struct {
-	Pool       int `json:"pool"`
-	IndexStart int `json:"index_start"`
-	TriCount   int `json:"tri_count"`
+	Pool       string `json:"pool"`
+	IndexStart int    `json:"index_start"`
+	TriCount   int    `json:"tri_count"`
+	Archive    string `json:"archive,omitempty"` // source archive name (for multi-archive extraction)
 }
 
 type Options struct {
-	OutputDir string
-	Verbose   bool
-	All       bool // include meshes (kept for backward compat, no longer writes .xm files)
+	OutputDir   string
+	Verbose     bool
+	All         bool   // include meshes (kept for backward compat, no longer writes .xm files)
+	ArchiveName string // prefix for pool files to avoid collisions in shared output dirs
 }
 
 // Extracts all (possible) entries from xip reader
@@ -43,26 +46,43 @@ func Archive(r *xip.Reader, opts Options) error {
 	manifest := make(map[string]MeshManifestEntry)
 
 	for _, e := range r.Entries() {
-		if e.Type == xip.FileTypeDir {
-			continue
-		}
-
 		// Mesh entries encode pool/index metadata, not file data.
 		// Collect metadata but do not extract — the Offset field is not a byte offset.
 		if e.Type == xip.FileTypeMesh {
 			meta := xip.DecodeMeshEntry(e)
-			manifest[e.Name] = MeshManifestEntry{
-				Pool:       meta.Pool,
+			poolName := poolFileName(opts.ArchiveName, meta.Pool)
+			// Key includes archive name to avoid collisions when the same
+			// mesh name appears in multiple archives (e.g. shared UI meshes).
+			manifestKey := e.Name
+			if opts.ArchiveName != "" {
+				manifestKey = opts.ArchiveName + ":" + e.Name
+			}
+			manifest[manifestKey] = MeshManifestEntry{
+				Pool:       poolName,
 				IndexStart: meta.IndexStart,
 				TriCount:   meta.TriCount,
+				Archive:    opts.ArchiveName,
 			}
 			if opts.Verbose {
-				fmt.Printf("  %s → pool ~%d, index %d, %d tris\n", e.Name, meta.Pool, meta.IndexStart, meta.TriCount)
+				fmt.Printf("  %s → pool %s, index %d, %d tris\n", e.Name, poolName, meta.IndexStart, meta.TriCount)
 			}
 			continue
 		}
 
-		safe, err := sanitizePath(absOut, e.Name)
+		name := e.Name
+		if opts.ArchiveName != "" {
+			// Rename pool files to include archive prefix to avoid collisions
+			if e.Type == xip.FileTypeVB || e.Type == xip.FileTypeIB {
+				name = renamePoolFile(opts.ArchiveName, name)
+			}
+			// Prefix XAP files so each archive's scene is accessible
+			ext := strings.ToLower(filepath.Ext(name))
+			if ext == ".xap" {
+				name = opts.ArchiveName + "_" + name
+			}
+		}
+
+		safe, err := sanitizePath(absOut, name)
 		if err != nil {
 			return fmt.Errorf("extract: %s: %w", e.Name, err)
 		}
@@ -72,9 +92,9 @@ func Archive(r *xip.Reader, opts Options) error {
 		}
 	}
 
-	// Write mesh manifest
+	// Merge mesh manifest with any existing one (from other archives in the same dir)
 	if len(manifest) > 0 {
-		if err := writeManifest(absOut, manifest, opts.Verbose); err != nil {
+		if err := mergeManifest(absOut, manifest, opts.Verbose); err != nil {
 			return err
 		}
 	}
@@ -82,9 +102,42 @@ func Archive(r *xip.Reader, opts Options) error {
 	return nil
 }
 
-func writeManifest(dir string, manifest map[string]MeshManifestEntry, verbose bool) error {
+// poolFileName returns the on-disk pool name for a given archive and pool index.
+// When archiveName is set, returns "~<archive>_<idx>" to avoid collisions.
+// Otherwise returns "~<idx>" for backward compatibility with single-archive extraction.
+func poolFileName(archiveName string, poolIdx int) string {
+	if archiveName == "" {
+		return fmt.Sprintf("~%d", poolIdx)
+	}
+	return fmt.Sprintf("~%s_%d", archiveName, poolIdx)
+}
+
+// renamePoolFile prefixes a pool filename (e.g. "~0.vb" → "~mainmenu5_0.vb").
+func renamePoolFile(archiveName, name string) string {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	if strings.HasPrefix(base, "~") {
+		return "~" + archiveName + "_" + base[1:] + ext
+	}
+	return archiveName + "_" + name
+}
+
+// mergeManifest loads any existing _meshes.json, merges new entries, and writes it back.
+func mergeManifest(dir string, manifest map[string]MeshManifestEntry, verbose bool) error {
 	path := filepath.Join(dir, "_meshes.json")
-	data, err := json.MarshalIndent(manifest, "", "  ")
+
+	// Load existing manifest if present
+	existing := make(map[string]MeshManifestEntry)
+	if data, err := os.ReadFile(path); err == nil {
+		json.Unmarshal(data, &existing) // ignore parse errors on corrupt files
+	}
+
+	// Merge new entries (new entries win on collision)
+	for k, v := range manifest {
+		existing[k] = v
+	}
+
+	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return fmt.Errorf("extract: encoding mesh manifest: %w", err)
 	}
@@ -92,7 +145,7 @@ func writeManifest(dir string, manifest map[string]MeshManifestEntry, verbose bo
 		return fmt.Errorf("extract: writing mesh manifest: %w", err)
 	}
 	if verbose {
-		fmt.Printf("  _meshes.json (%d mesh entries)\n", len(manifest))
+		fmt.Printf("  _meshes.json (%d mesh entries total)\n", len(existing))
 	}
 	return nil
 }
@@ -119,7 +172,47 @@ func extractFile(r *xip.Reader, e xip.Entry, dest string, verbose bool) error {
 	if verbose {
 		fmt.Printf("  %s (%d bytes)\n", e.Name, e.Size)
 	}
+
+	// Auto-convert .xbx textures to .png alongside the raw file
+	if strings.ToLower(filepath.Ext(dest)) == ".xbx" {
+		convertTextureToPNG(dest, verbose)
+	}
+
 	return nil
+}
+
+// convertTextureToPNG decodes an XBX texture and writes a PNG next to it.
+func convertTextureToPNG(xbxPath string, verbose bool) {
+	tex, err := texture.OpenXPR(xbxPath)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  warning: %s: %v\n", filepath.Base(xbxPath), err)
+		}
+		return
+	}
+
+	pngPath := strings.TrimSuffix(xbxPath, filepath.Ext(xbxPath)) + ".png"
+	f, err := os.Create(pngPath)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  warning: creating %s: %v\n", filepath.Base(pngPath), err)
+		}
+		return
+	}
+	defer f.Close()
+
+	if err := texture.ExportPNG(f, tex); err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  warning: encoding %s: %v\n", filepath.Base(pngPath), err)
+		}
+		return
+	}
+
+	if verbose {
+		fmt.Printf("  %s → %s (%dx%d %s)\n",
+			filepath.Base(xbxPath), filepath.Base(pngPath),
+			tex.Info.Width, tex.Info.Height, tex.Info.Format)
+	}
 }
 
 // stop name escape from target dir

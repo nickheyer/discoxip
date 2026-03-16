@@ -6,12 +6,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type parser struct {
 	tokens   []token
 	pos      int
+	input    string // raw input for verbatim script extraction
 	warnings []string
+	defs     map[string]*Node
 }
 
 func (p *parser) warn(msg string) {
@@ -21,7 +24,7 @@ func (p *parser) warn(msg string) {
 // Parse parses XAP text into a Scene.
 func Parse(input string) (*Scene, error) {
 	tokens := lex(input)
-	p := &parser{tokens: tokens}
+	p := &parser{tokens: tokens, input: input, defs: make(map[string]*Node)}
 	return p.parseScene()
 }
 
@@ -67,175 +70,352 @@ func (p *parser) expect(typ tokenType) (token, error) {
 }
 
 func (p *parser) parseScene() (*Scene, error) {
-	scene := &Scene{}
+	scene := &Scene{Defs: make(map[string]*Node)}
 	for p.peek().typ != tokEOF {
-		node, err := p.parseNode()
+		t := p.peek()
+
+		// Top-level script keywords
+		if t.typ == tokIdent {
+			switch t.val {
+			case "function":
+				script := p.captureScript()
+				scene.Items = append(scene.Items, SceneItem{Kind: SScript, Script: script})
+				continue
+			case "var":
+				script := p.captureVarDecl()
+				scene.Items = append(scene.Items, SceneItem{Kind: SScript, Script: script})
+				continue
+			}
+		}
+
+		node, err := p.parseTopNode()
 		if err != nil {
 			scene.Warnings = p.warnings
+			scene.Defs = p.defs
 			return scene, err
 		}
 		if node != nil {
-			scene.Nodes = append(scene.Nodes, node)
+			scene.Items = append(scene.Items, SceneItem{Kind: SNode, Node: node})
 		}
 	}
 	scene.Warnings = p.warnings
+	scene.Defs = p.defs
 	return scene, nil
 }
 
-func (p *parser) parseNode() (Node, error) {
+func (p *parser) parseTopNode() (*Node, error) {
 	t := p.peek()
 
 	switch t.val {
 	case "DEF":
 		return p.parseDEF()
-	case "Transform":
-		return p.parseTransform("")
-	case "Shape":
-		return p.parseShape()
+	case "USE":
+		return p.parseUSE()
 	default:
-		// Unknown top-level token — skip it but record a warning
-		tok := p.next()
-		if tok.typ == tokIdent {
-			p.warn(fmt.Sprintf("skipping unknown node type %q at pos %d", tok.val, tok.pos))
-			if p.peek().typ == tokLBrace {
-				p.skipBlock()
-			}
+		if t.typ == tokIdent {
+			return p.parseNodeStart("")
 		}
+		// Non-ident stray token — consume and warn
+		tok := p.next()
+		p.warn(fmt.Sprintf("skipping stray token %q at pos %d", tok.val, tok.pos))
 		return nil, nil
 	}
 }
 
-func (p *parser) parseDEF() (Node, error) {
+func (p *parser) parseDEF() (*Node, error) {
 	p.next() // consume DEF
 	name, err := p.expect(tokIdent)
 	if err != nil {
 		return nil, err
 	}
-	typeTok := p.peek()
-	switch typeTok.val {
-	case "Transform":
-		return p.parseTransform(name.val)
-	case "Mesh":
-		return p.parseMeshRef(name.val)
-	default:
-		// DEF name SomeType — try to parse as a generic block
-		p.next() // consume type name
-		if p.peek().typ == tokLBrace {
-			p.skipBlock()
-		}
-		return nil, nil
-	}
-}
 
-func (p *parser) parseTransform(name string) (*Transform, error) {
-	p.next() // consume "Transform"
-	// Skip redundant idents (e.g. "Transform Transform {")
-	for p.peek().typ == tokIdent {
-		p.next()
-	}
-	if _, err := p.expect(tokLBrace); err != nil {
+	node, err := p.parseNodeStart(name.val)
+	if err != nil {
 		return nil, err
 	}
+	if node != nil {
+		p.defs[name.val] = node
+	}
+	return node, nil
+}
 
-	tf := &Transform{Name: name, Fields: make(map[string]interface{})}
+func (p *parser) parseUSE() (*Node, error) {
+	p.next() // consume USE
+	name := p.next()
+	if name.typ != tokIdent {
+		return nil, fmt.Errorf("%w: expected identifier after USE, got %q", ErrUnexpectedToken, name.val)
+	}
+	if defNode, ok := p.defs[name.val]; ok {
+		return defNode, nil
+	}
+	p.warn(fmt.Sprintf("USE %q: no matching DEF found", name.val))
+	// Return a placeholder node so it's not lost
+	return &Node{TypeName: "USE", DefName: name.val}, nil
+}
 
+// parseNodeStart parses a node starting from its type name identifier.
+// defName is set if this was preceded by DEF.
+func (p *parser) parseNodeStart(defName string) (*Node, error) {
+	typeTok := p.next() // consume type name
+	if typeTok.typ != tokIdent {
+		return nil, nil
+	}
+
+	node := &Node{TypeName: typeTok.val, DefName: defName}
+
+	// No brace body → bare node reference (e.g. "StarField" in children array)
+	if p.peek().typ != tokLBrace {
+		return node, nil
+	}
+
+	p.next() // consume {
+	if err := p.parseNodeBody(node); err != nil {
+		return node, err
+	}
+	return node, nil
+}
+
+// parseNodeBody parses the interior of a node between { and }.
+// This is the universal decision-tree parser.
+func (p *parser) parseNodeBody(node *Node) error {
 	for p.peek().typ != tokRBrace && p.peek().typ != tokEOF {
-		field := p.peek()
-		if field.typ != tokIdent {
-			// Try to skip unexpected tokens
+		t := p.peek()
+
+		if t.typ != tokIdent {
+			// Skip stray non-ident tokens (numbers, brackets, parens, etc.)
 			p.next()
 			continue
 		}
 
-		switch field.val {
-		case "children":
-			p.next() // consume "children"
-			children, err := p.parseChildren()
-			if err != nil {
-				return tf, err
-			}
-			tf.Children = children
-		case "rotation":
-			p.next()
-			vals, err := p.parseFloats(4)
-			if err != nil {
-				return tf, err
-			}
-			copy(tf.Rotation[:], vals)
-			tf.HasRotation = true
-		case "scale":
-			p.next()
-			vals, err := p.parseFloats(3)
-			if err != nil {
-				return tf, err
-			}
-			copy(tf.Scale[:], vals)
-			tf.HasScale = true
-		case "scaleOrientation":
-			p.next()
-			vals, err := p.parseFloats(4)
-			if err != nil {
-				return tf, err
-			}
-			copy(tf.ScaleOrientation[:], vals)
-			tf.HasScaleOri = true
-		case "translation":
-			p.next()
-			vals, err := p.parseFloats(3)
-			if err != nil {
-				return tf, err
-			}
-			copy(tf.Translation[:], vals)
-			tf.HasTranslation = true
-		case "fade":
-			p.next()
-			vals, err := p.parseFloats(1)
-			if err != nil {
-				return tf, err
-			}
-			tf.Fade = vals[0]
-			tf.HasFade = true
+		switch t.val {
+		case "function":
+			script := p.captureScript()
+			node.Scripts = append(node.Scripts, script)
+
+		case "behavior":
+			script := p.captureScript()
+			node.Scripts = append(node.Scripts, script)
+
+		case "var":
+			script := p.captureVarDecl()
+			node.Scripts = append(node.Scripts, script)
+
 		case "DEF":
 			child, err := p.parseDEF()
 			if err != nil {
-				return tf, err
+				return err
 			}
 			if child != nil {
-				tf.Children = append(tf.Children, child)
+				node.Children = append(node.Children, child)
 			}
-		case "Shape":
-			child, err := p.parseShape()
+
+		case "USE":
+			child, err := p.parseUSE()
 			if err != nil {
-				return tf, err
+				return err
 			}
-			tf.Children = append(tf.Children, child)
-		case "Transform":
-			child, err := p.parseTransform("")
+			if child != nil {
+				node.Children = append(node.Children, child)
+			}
+
+		case "children":
+			p.next() // consume "children"
+			children, err := p.parseChildrenArray()
 			if err != nil {
-				return tf, err
+				return err
 			}
-			tf.Children = append(tf.Children, child)
+			node.Children = append(node.Children, children...)
+
 		default:
-			// Unknown field — skip value(s)
-			p.next()
-			p.skipFieldValue()
+			// Decide: field (lowercase start) vs child node (uppercase start)
+			if isUpperStart(t.val) {
+				// Could be a bare child node: TypeName { ... }
+				child, err := p.parseNodeStart("")
+				if err != nil {
+					return err
+				}
+				if child != nil {
+					node.Children = append(node.Children, child)
+				}
+			} else {
+				// Lowercase → field key
+				p.next() // consume field key
+				field, err := p.parseFieldValues(t.val, node)
+				if err != nil {
+					return err
+				}
+				node.Fields = append(node.Fields, field)
+			}
 		}
 	}
 
-	p.next() // consume }
-	return tf, nil
+	if p.peek().typ == tokRBrace {
+		p.next() // consume }
+	}
+	return nil
 }
 
-func (p *parser) parseChildren() ([]Node, error) {
+// parseFieldValues parses the value(s) after a field key.
+func (p *parser) parseFieldValues(key string, parentNode *Node) (Field, error) {
+	field := Field{Key: key}
+
+	t := p.peek()
+
+	switch {
+	case t.typ == tokString:
+		p.next()
+		field.Values = append(field.Values, Value{Kind: VString, Str: t.val})
+
+	case t.typ == tokNumber:
+		// Collect consecutive numbers (for vectors: translation 1 2 3)
+		for p.peek().typ == tokNumber {
+			numTok := p.next()
+			v, err := strconv.ParseFloat(numTok.val, 64)
+			if err != nil {
+				p.warn(fmt.Sprintf("bad number %q at pos %d", numTok.val, numTok.pos))
+				continue
+			}
+			field.Values = append(field.Values, Value{Kind: VNumber, Num: v})
+		}
+
+	case t.typ == tokLBracket:
+		// Array value
+		arr, err := p.parseArrayValue()
+		if err != nil {
+			return field, err
+		}
+		field.Values = append(field.Values, Value{Kind: VArray, Array: arr})
+
+	case t.typ == tokLBrace:
+		// Block-valued field (e.g. behavior { ... })
+		script := p.captureBlockVerbatim()
+		field.Values = append(field.Values, Value{Kind: VScript, Str: script})
+
+	case t.typ == tokIdent:
+		switch t.val {
+		case "true", "TRUE":
+			p.next()
+			field.Values = append(field.Values, Value{Kind: VBool, Bool: true})
+		case "false", "FALSE":
+			p.next()
+			field.Values = append(field.Values, Value{Kind: VBool, Bool: false})
+		case "DEF":
+			// Node-valued field: DEF name Type { ... }
+			child, err := p.parseDEF()
+			if err != nil {
+				return field, err
+			}
+			if child != nil {
+				field.Values = append(field.Values, Value{Kind: VNode, Node: child})
+			}
+		case "USE":
+			p.next() // consume USE
+			name := p.next()
+			if defNode, ok := p.defs[name.val]; ok {
+				field.Values = append(field.Values, Value{Kind: VNode, Node: defNode})
+			} else {
+				p.warn(fmt.Sprintf("USE %q: no matching DEF found", name.val))
+				field.Values = append(field.Values, Value{Kind: VIdent, Str: name.val})
+			}
+		default:
+			// Could be a node-valued field (e.g. material MaxMaterial { ... })
+			// or a bare identifier value
+			if isUpperStart(t.val) && p.posAhead(1).typ == tokLBrace {
+				// Node-valued field
+				child, err := p.parseNodeStart("")
+				if err != nil {
+					return field, err
+				}
+				if child != nil {
+					field.Values = append(field.Values, Value{Kind: VNode, Node: child})
+				}
+			} else if isUpperStart(t.val) && p.posAhead(1).typ == tokIdent && p.posAhead(2).typ == tokLBrace {
+				// Implicit DEF in field context: name Type { ... }
+				// e.g. "material MUmat MaxMaterial { ... }" — but that's unusual.
+				// More likely: "geometry Mesh { ... }" where Mesh is just the type.
+				child, err := p.parseNodeStart("")
+				if err != nil {
+					return field, err
+				}
+				if child != nil {
+					field.Values = append(field.Values, Value{Kind: VNode, Node: child})
+				}
+			} else {
+				// Bare identifier value
+				p.next()
+				field.Values = append(field.Values, Value{Kind: VIdent, Str: t.val})
+			}
+		}
+
+	default:
+		// Nothing recognizable — empty field
+	}
+
+	return field, nil
+}
+
+// parseArrayValue parses [...] returning a slice of Values.
+func (p *parser) parseArrayValue() ([]Value, error) {
+	p.next() // consume [
+	var arr []Value
+	for p.peek().typ != tokRBracket && p.peek().typ != tokEOF {
+		t := p.peek()
+		switch {
+		case t.typ == tokNumber:
+			numTok := p.next()
+			v, _ := strconv.ParseFloat(numTok.val, 64)
+			arr = append(arr, Value{Kind: VNumber, Num: v})
+		case t.typ == tokString:
+			p.next()
+			arr = append(arr, Value{Kind: VString, Str: t.val})
+		case t.typ == tokIdent:
+			if t.val == "DEF" {
+				child, err := p.parseDEF()
+				if err != nil {
+					return arr, err
+				}
+				if child != nil {
+					arr = append(arr, Value{Kind: VNode, Node: child})
+				}
+			} else if t.val == "USE" {
+				child, err := p.parseUSE()
+				if err != nil {
+					return arr, err
+				}
+				if child != nil {
+					arr = append(arr, Value{Kind: VNode, Node: child})
+				}
+			} else if t.val == "true" || t.val == "TRUE" {
+				p.next()
+				arr = append(arr, Value{Kind: VBool, Bool: true})
+			} else if t.val == "false" || t.val == "FALSE" {
+				p.next()
+				arr = append(arr, Value{Kind: VBool, Bool: false})
+			} else {
+				arr = append(arr, Value{Kind: VIdent, Str: t.val})
+				p.next()
+			}
+		default:
+			p.next() // skip unknown
+		}
+	}
+	if p.peek().typ == tokRBracket {
+		p.next() // consume ]
+	}
+	return arr, nil
+}
+
+// parseChildrenArray parses children [ ... ] with node entries.
+func (p *parser) parseChildrenArray() ([]*Node, error) {
 	if _, err := p.expect(tokLBracket); err != nil {
 		return nil, err
 	}
 
-	var children []Node
+	var children []*Node
 	for p.peek().typ != tokRBracket && p.peek().typ != tokEOF {
 		t := p.peek()
-		switch t.val {
-		case "DEF":
+		switch {
+		case t.typ == tokIdent && t.val == "DEF":
 			child, err := p.parseDEF()
 			if err != nil {
 				return children, err
@@ -243,301 +423,231 @@ func (p *parser) parseChildren() ([]Node, error) {
 			if child != nil {
 				children = append(children, child)
 			}
-		case "Transform":
-			child, err := p.parseTransform("")
+
+		case t.typ == tokIdent && t.val == "USE":
+			child, err := p.parseUSE()
 			if err != nil {
 				return children, err
 			}
-			children = append(children, child)
-		case "Shape":
-			child, err := p.parseShape()
-			if err != nil {
-				return children, err
+			if child != nil {
+				children = append(children, child)
 			}
-			children = append(children, child)
+
+		case t.typ == tokIdent && isUpperStart(t.val):
+			// Check for implicit DEF: name Type { ... }
+			// where name is lowercase and Type is uppercase
+			// Actually in children arrays: could be "MUheader Transform { ... }"
+			// where MUheader is the implicit def name
+			if p.posAhead(1).typ == tokIdent && isUpperStart(p.posAhead(1).val) &&
+				(p.posAhead(2).typ == tokLBrace || p.posAhead(2).typ != tokIdent) {
+				// name Type { } pattern → implicit DEF
+				nameTok := p.next() // consume name
+				child, err := p.parseNodeStart(nameTok.val)
+				if err != nil {
+					return children, err
+				}
+				if child != nil {
+					p.defs[nameTok.val] = child
+					children = append(children, child)
+				}
+			} else {
+				// Regular node: Type { ... } or bare Type
+				child, err := p.parseNodeStart("")
+				if err != nil {
+					return children, err
+				}
+				if child != nil {
+					children = append(children, child)
+				}
+			}
+
+		case t.typ == tokIdent:
+			// Lowercase ident in children array — could be implicit DEF name
+			// e.g. "myNode Transform { ... }"
+			if p.posAhead(1).typ == tokIdent && isUpperStart(p.posAhead(1).val) {
+				nameTok := p.next() // consume name
+				child, err := p.parseNodeStart(nameTok.val)
+				if err != nil {
+					return children, err
+				}
+				if child != nil {
+					p.defs[nameTok.val] = child
+					children = append(children, child)
+				}
+			} else {
+				// Bare lowercase ident — skip
+				p.next()
+			}
+
 		default:
-			p.next() // skip unknown
+			p.next() // skip non-ident tokens
 		}
 	}
 
-	p.next() // consume ]
+	if p.peek().typ == tokRBracket {
+		p.next() // consume ]
+	}
 	return children, nil
 }
 
-func (p *parser) parseShape() (*Shape, error) {
-	p.next() // consume "Shape"
-	if _, err := p.expect(tokLBrace); err != nil {
-		return nil, err
+// captureScript captures a verbatim script block starting with "function" or "behavior".
+// Uses raw input scanning for perfect fidelity.
+func (p *parser) captureScript() string {
+	startTok := p.peek()
+	startPos := startTok.pos
+
+	// Consume the keyword
+	p.next()
+
+	// For "function", skip ahead to the opening brace (past name, params, etc.)
+	// For "behavior", skip to opening brace
+	for p.peek().typ != tokLBrace && p.peek().typ != tokEOF {
+		p.next()
 	}
 
-	shape := &Shape{}
+	if p.peek().typ != tokLBrace {
+		// No body found
+		return p.input[startPos:p.tokens[p.pos].pos]
+	}
 
-	for p.peek().typ != tokRBrace && p.peek().typ != tokEOF {
-		field := p.peek()
-		switch field.val {
-		case "appearance":
-			p.next()
-			app, err := p.parseAppearance()
-			if err != nil {
-				return shape, err
+	// Capture the body using brace-depth scanning on raw input
+	bracePos := p.peek().pos
+	endPos := p.scanMatchingBrace(bracePos)
+
+	// Skip all tokens that fall within this range
+	for p.peek().typ != tokEOF && p.peek().pos <= endPos {
+		p.next()
+	}
+
+	return strings.TrimRightFunc(p.input[startPos:endPos+1], unicode.IsSpace)
+}
+
+// captureVarDecl captures a var declaration up to the semicolon or end of statement.
+func (p *parser) captureVarDecl() string {
+	startTok := p.peek()
+	startPos := startTok.pos
+
+	// Scan raw input from startPos to the next semicolon or newline
+	endPos := startPos
+	for endPos < len(p.input) {
+		ch := p.input[endPos]
+		if ch == ';' {
+			endPos++ // include the semicolon
+			break
+		}
+		if ch == '\n' {
+			break
+		}
+		endPos++
+	}
+
+	// Advance tokens past this range
+	for p.peek().typ != tokEOF && p.peek().pos < endPos {
+		p.next()
+	}
+
+	return strings.TrimSpace(p.input[startPos:endPos])
+}
+
+// captureBlockVerbatim captures a { ... } block as raw text.
+func (p *parser) captureBlockVerbatim() string {
+	if p.peek().typ != tokLBrace {
+		return ""
+	}
+
+	bracePos := p.peek().pos
+	endPos := p.scanMatchingBrace(bracePos)
+
+	// Skip all tokens within this range
+	for p.peek().typ != tokEOF && p.peek().pos <= endPos {
+		p.next()
+	}
+
+	// Return content between braces (exclusive)
+	if bracePos+1 < endPos {
+		return strings.TrimSpace(p.input[bracePos+1 : endPos])
+	}
+	return ""
+}
+
+// scanMatchingBrace scans raw input from an opening brace to its matching close.
+// Handles nested braces, string literals, and comments.
+// Returns the position of the closing brace.
+func (p *parser) scanMatchingBrace(openPos int) int {
+	pos := openPos + 1 // skip opening {
+	depth := 1
+
+	for pos < len(p.input) && depth > 0 {
+		ch := p.input[pos]
+		switch ch {
+		case '{':
+			depth++
+			pos++
+		case '}':
+			depth--
+			if depth == 0 {
+				return pos
 			}
-			shape.Appearance = app
-		case "geometry":
-			p.next()
-			switch p.peek().val {
-			case "DEF":
-				node, err := p.parseDEF()
-				if err != nil {
-					return shape, err
+			pos++
+		case '"':
+			// Skip string literal
+			pos++
+			for pos < len(p.input) && p.input[pos] != '"' {
+				pos++
+			}
+			if pos < len(p.input) {
+				pos++ // skip closing "
+			}
+		case '/':
+			if pos+1 < len(p.input) {
+				if p.input[pos+1] == '/' {
+					// Line comment
+					for pos < len(p.input) && p.input[pos] != '\n' {
+						pos++
+					}
+				} else if p.input[pos+1] == '*' {
+					// Block comment
+					pos += 2
+					for pos+1 < len(p.input) {
+						if p.input[pos] == '*' && p.input[pos+1] == '/' {
+							pos += 2
+							break
+						}
+						pos++
+					}
+				} else {
+					pos++
 				}
-				if ref, ok := node.(*MeshRef); ok {
-					shape.Geometry = ref
-				}
-			case "USE":
-				p.next() // consume USE
-				name := p.next() // consume name
-				// Reconstruct URL from DEF name (convention: name + ".xm")
-				shape.Geometry = &MeshRef{Name: name.val, URL: name.val + ".xm"}
-			case "Mesh":
-				ref, err := p.parseMeshRef("")
-				if err != nil {
-					return shape, err
-				}
-				if ref != nil {
-					shape.Geometry = ref.(*MeshRef)
-				}
-			default:
-				// Unknown geometry type (e.g. Text) — skip it
-				p.next() // consume type name
-				if p.peek().typ == tokLBrace {
-					p.skipBlock()
-				}
+			} else {
+				pos++
+			}
+		case '#':
+			// VRML line comment
+			for pos < len(p.input) && p.input[pos] != '\n' {
+				pos++
 			}
 		default:
-			p.next()
-			p.skipFieldValue()
+			pos++
 		}
 	}
 
-	p.next() // consume }
-	return shape, nil
+	// If we ran out of input, return end
+	return pos
 }
 
-func (p *parser) parseAppearance() (*Appearance, error) {
-	p.next() // consume "Appearance"
-	if _, err := p.expect(tokLBrace); err != nil {
-		return nil, err
+// posAhead peeks n tokens ahead without consuming.
+func (p *parser) posAhead(n int) token {
+	idx := p.pos + n
+	if idx >= len(p.tokens) {
+		return token{typ: tokEOF}
 	}
-
-	app := &Appearance{}
-
-	for p.peek().typ != tokRBrace && p.peek().typ != tokEOF {
-		field := p.peek()
-		if field.val == "material" {
-			p.next()
-			var defName string
-			if p.peek().val == "DEF" {
-				p.next() // consume DEF
-				defName = p.next().val
-			}
-			mat, err := p.parseMaterial()
-			if err != nil {
-				return app, err
-			}
-			mat.DefName = defName
-			app.Material = mat
-		} else {
-			p.next()
-			p.skipFieldValue()
-		}
-	}
-
-	p.next() // consume }
-	return app, nil
+	return p.tokens[idx]
 }
 
-func (p *parser) parseMaterial() (*Material, error) {
-	typeName := p.next() // e.g. "MaxMaterial"
-	if _, err := p.expect(tokLBrace); err != nil {
-		return nil, err
+// isUpperStart returns true if the string starts with an uppercase letter.
+func isUpperStart(s string) bool {
+	if len(s) == 0 {
+		return false
 	}
-
-	mat := &Material{Type: typeName.val}
-
-	for p.peek().typ != tokRBrace && p.peek().typ != tokEOF {
-		field := p.peek()
-		if field.val == "name" {
-			p.next()
-			if p.peek().typ == tokString {
-				mat.Name = p.next().val
-			}
-		} else {
-			p.next()
-			p.skipFieldValue()
-		}
-	}
-
-	p.next() // consume }
-	return mat, nil
-}
-
-func (p *parser) parseMeshRef(name string) (Node, error) {
-	p.next() // consume "Mesh"
-	if _, err := p.expect(tokLBrace); err != nil {
-		return nil, err
-	}
-
-	ref := &MeshRef{Name: name}
-
-	for p.peek().typ != tokRBrace && p.peek().typ != tokEOF {
-		if p.peek().val == "url" {
-			p.next()
-			if p.peek().typ == tokString {
-				ref.URL = p.next().val
-			}
-		} else {
-			p.next()
-		}
-	}
-
-	p.next() // consume }
-	return ref, nil
-}
-
-func (p *parser) parseFloats(n int) ([]float64, error) {
-	vals := make([]float64, n)
-	for i := range n {
-		t := p.next()
-		if t.typ != tokNumber {
-			return nil, fmt.Errorf("%w: expected number, got %q", ErrUnexpectedToken, t.val)
-		}
-		v, err := strconv.ParseFloat(t.val, 64)
-		if err != nil {
-			return nil, fmt.Errorf("xap: parsing float %q: %w", t.val, err)
-		}
-		vals[i] = v
-	}
-	return vals, nil
-}
-
-func (p *parser) skipBlock() {
-	p.next() // consume {
-	depth := 1
-	for depth > 0 && p.peek().typ != tokEOF {
-		t := p.next()
-		switch t.typ {
-		case tokLBrace:
-			depth++
-		case tokRBrace:
-			depth--
-		}
-	}
-}
-
-func (p *parser) skipFieldValue() {
-	t := p.peek()
-	switch t.typ {
-	case tokLBrace:
-		p.skipBlock()
-	case tokLBracket:
-		p.next()
-		depth := 1
-		for depth > 0 && p.peek().typ != tokEOF {
-			t := p.next()
-			switch t.typ {
-			case tokLBracket:
-				depth++
-			case tokRBracket:
-				depth--
-			}
-		}
-	case tokString, tokNumber:
-		p.next()
-	case tokIdent:
-		// Consume the identifier value; if followed by a block, skip that too
-		p.next()
-		if p.peek().typ == tokLBrace {
-			p.skipBlock()
-		}
-	}
-}
-
-// NodeCount returns total node count in the scene.
-func (s *Scene) NodeCount() int {
-	count := 0
-	for _, n := range s.Nodes {
-		count += countNodes(n)
-	}
-	return count
-}
-
-func countNodes(n Node) int {
-	c := 1
-	if tf, ok := n.(*Transform); ok {
-		for _, child := range tf.Children {
-			c += countNodes(child)
-		}
-	}
-	return c
-}
-
-// MeshRefs returns all mesh URL references found in the scene.
-func (s *Scene) MeshRefs() []string {
-	var refs []string
-	for _, n := range s.Nodes {
-		collectMeshRefs(n, &refs)
-	}
-	return refs
-}
-
-func collectMeshRefs(n Node, refs *[]string) {
-	switch v := n.(type) {
-	case *Transform:
-		for _, child := range v.Children {
-			collectMeshRefs(child, refs)
-		}
-	case *Shape:
-		if v.Geometry != nil && v.Geometry.URL != "" {
-			*refs = append(*refs, v.Geometry.URL)
-		}
-	}
-}
-
-// Materials returns all unique material names found in the scene.
-func (s *Scene) Materials() []string {
-	seen := map[string]bool{}
-	var mats []string
-	for _, n := range s.Nodes {
-		collectMaterials(n, seen, &mats)
-	}
-	return mats
-}
-
-func collectMaterials(n Node, seen map[string]bool, mats *[]string) {
-	switch v := n.(type) {
-	case *Transform:
-		for _, child := range v.Children {
-			collectMaterials(child, seen, mats)
-		}
-	case *Shape:
-		if v.Appearance != nil && v.Appearance.Material != nil {
-			name := v.Appearance.Material.Name
-			if name != "" && !seen[name] {
-				seen[name] = true
-				*mats = append(*mats, name)
-			}
-		}
-	}
-}
-
-// String returns a summary string for the scene.
-func (s *Scene) String() string {
-	refs := s.MeshRefs()
-	mats := s.Materials()
-	parts := []string{
-		fmt.Sprintf("%d nodes", s.NodeCount()),
-		fmt.Sprintf("%d mesh refs", len(refs)),
-		fmt.Sprintf("%d materials", len(mats)),
-	}
-	return strings.Join(parts, ", ")
+	return s[0] >= 'A' && s[0] <= 'Z'
 }

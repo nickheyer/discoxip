@@ -80,17 +80,21 @@ func runPack(cmd *cobra.Command, args []string) error {
 
 	w := xip.NewWriter(out)
 
+	var opened []*os.File
+	defer func() {
+		for _, fh := range opened {
+			fh.Close()
+		}
+	}()
+
 	for _, f := range files {
 		fh, err := os.Open(f.path)
 		if err != nil {
 			return fmt.Errorf("pack: opening %s: %w", f.rel, err)
 		}
-		defer fh.Close()
+		opened = append(opened, fh)
 
-		ft := xip.FileTypeRegular
-		if strings.HasSuffix(strings.ToLower(f.rel), ".xm") {
-			ft = xip.FileTypeMesh
-		}
+		ft := fileTypeForExt(filepath.Ext(f.rel))
 
 		w.Add(xip.WriteEntry{
 			Name: f.rel,
@@ -106,4 +110,17 @@ func runPack(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "Packed %d files into %s\n", len(files), packOutput)
 	return nil
+}
+
+func fileTypeForExt(ext string) xip.FileType {
+	switch strings.ToLower(ext) {
+	case ".vb":
+		return xip.FileTypeVB
+	case ".ib":
+		return xip.FileTypeIB
+	case ".xbx":
+		return xip.FileTypeDir
+	default:
+		return xip.FileTypeRegular
+	}
 }
