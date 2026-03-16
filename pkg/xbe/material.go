@@ -27,11 +27,11 @@ func ARGB(color uint32) (a, r, g, b uint8) {
 // ExtractMaterials finds and decodes all CMaxMaterial instances from an XBE.
 //
 // The algorithm:
-// 1. Locate the material name string table (UTF-16LE strings in .text section)
-// 2. Find the function that creates all materials by searching for PUSH <name_va>
-//    patterns referencing those strings
-// 3. Trace the function, tracking register state at each material creation point
-// 4. Decode constructor arguments to extract color/shader data
+//  1. Locate the material name string table (UTF-16LE strings in .text section)
+//  2. Find the function that creates all materials by searching for PUSH <name_va>
+//     patterns referencing those strings
+//  3. Trace the function, tracking register state at each material creation point
+//  4. Decode constructor arguments to extract color/shader data
 func ExtractMaterials(img *Image) ([]Material, error) {
 	text := img.FindSection(".text")
 	if text == nil {

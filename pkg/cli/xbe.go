@@ -39,7 +39,14 @@ func init() {
 		RunE:  runXBEDisasm,
 	}
 
-	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd)
+	transpileCmd := &cobra.Command{
+		Use:   "transpile <file.xbe>",
+		Short: "Transpile XBE to JavaScript",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runXBETranspile,
+	}
+
+	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, transpileCmd)
 	rootCmd.AddCommand(xbeCmd)
 }
 
@@ -64,51 +71,16 @@ func runXBEInfo(cmd *cobra.Command, args []string) error {
 }
 
 func runXBEMaterials(cmd *cobra.Command, args []string) error {
-	img, err := xbe.Open(args[0])
-	if err != nil {
-		return err
-	}
-
-	materials, err := xbe.ExtractMaterials(img)
+	materials, err := xbe.ExtractMaterialsFromXBE(args[0])
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "Extracted %d materials\n", len(materials))
 
-	type matJSON struct {
-		Name      string   `json:"name"`
-		CtorAddr  string   `json:"ctor"`
-		Color1    string   `json:"color1"`
-		Color1R   uint8    `json:"color1_r"`
-		Color1G   uint8    `json:"color1_g"`
-		Color1B   uint8    `json:"color1_b"`
-		Color1A   uint8    `json:"color1_a"`
-		Color2    string   `json:"color2"`
-		ShaderCfg string   `json:"shader_cfg"`
-		StackArgs []uint32 `json:"stack_args,omitempty"`
-	}
-
-	var out []matJSON
-	for _, m := range materials {
-		a, r, g, b := xbe.ARGB(m.Color1)
-		out = append(out, matJSON{
-			Name:      m.Name,
-			CtorAddr:  fmt.Sprintf("0x%08X", m.CtorType),
-			Color1:    fmt.Sprintf("0x%08X", m.Color1),
-			Color1R:   r,
-			Color1G:   g,
-			Color1B:   b,
-			Color1A:   a,
-			Color2:    fmt.Sprintf("0x%08X", m.Color2),
-			ShaderCfg: fmt.Sprintf("0x%08X", m.ShaderCfg),
-			StackArgs: m.StackArgs,
-		})
-	}
-
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return enc.Encode(materials)
 }
 
 func runXBEDisasm(cmd *cobra.Command, args []string) error {
@@ -155,6 +127,41 @@ func runXBEDisasm(cmd *cobra.Command, args []string) error {
 		fmt.Fprint(w, df.Format())
 	}
 
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "  Written to %s\n", outPath)
+	return nil
+}
+
+func runXBETranspile(cmd *cobra.Command, args []string) error {
+	img, err := xbe.Open(args[0])
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "Transpiling %s...\n", args[0])
+
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "  %d instructions, %d functions\n", len(d.InsnByVA), len(d.Functions))
+	fmt.Fprintf(os.Stderr, "  Recovering control flow and transpiling to JS...\n")
+
+	js := xbe.TranspileToJS(d)
+
+	outPath := strings.TrimSuffix(args[0], filepath.Ext(args[0])) + ".js"
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 256*1024)
+	w.WriteString(js)
 	if err := w.Flush(); err != nil {
 		return err
 	}

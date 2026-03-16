@@ -82,7 +82,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 
 		r, err := xip.Open(xipPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "    error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "    skipped: %v\n", err)
 			continue
 		}
 
@@ -131,21 +131,21 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("web export: %w", err)
 	}
 
-	// ── Step 4: Decompile XBE ──
+	// ── Step 4: Transpile XBE to JavaScript ──
 	if len(xbeFiles) > 0 {
-		fmt.Fprintf(os.Stderr, "\nStep 4: Decompiling XBE...\n")
+		fmt.Fprintf(os.Stderr, "\nStep 4: Transpiling XBE...\n")
 
 		xbeSrc := xbeFiles[0]
 		xbeName := strings.TrimSuffix(filepath.Base(xbeSrc), filepath.Ext(filepath.Base(xbeSrc)))
-		decompPath := filepath.Join(outDir, xbeName+".c")
 
 		img, err := xbe.Open(xbeSrc)
 		if err == nil {
 			d, err := xbe.Disassemble(img)
 			if err == nil {
+				// Write decompiled C pseudocode to output root (reference)
+				decompPath := filepath.Join(outDir, xbeName+".c")
 				funcs := d.DecompileAll()
-				f, err := os.Create(decompPath)
-				if err == nil {
+				if f, err := os.Create(decompPath); err == nil {
 					fmt.Fprintf(f, "// Decompiled from %s\n", filepath.Base(xbeSrc))
 					fmt.Fprintf(f, "// %d functions, %d instructions\n\n", len(funcs), len(d.InsnByVA))
 					for _, df := range funcs {
@@ -153,7 +153,16 @@ func runBuild(cmd *cobra.Command, args []string) error {
 						fmt.Fprint(f, df.Format())
 					}
 					f.Close()
-					fmt.Fprintf(os.Stderr, "  %d functions → %s\n", len(funcs), decompPath)
+					fmt.Fprintf(os.Stderr, "  %d functions decompiled → %s\n", len(funcs), decompPath)
+				}
+
+				// Transpile to JavaScript and write into web output
+				js := xbe.TranspileToJS(d)
+				jsPath := filepath.Join(webDir, xbeName+".js")
+				if err := os.WriteFile(jsPath, []byte(js), 0o644); err == nil {
+					fmt.Fprintf(os.Stderr, "  %d functions transpiled → %s\n", len(d.Functions), jsPath)
+				} else {
+					fmt.Fprintf(os.Stderr, "  warning: writing transpiled JS: %v\n", err)
 				}
 			} else {
 				fmt.Fprintf(os.Stderr, "  warning: disassembly failed: %v\n", err)

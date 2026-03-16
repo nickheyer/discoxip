@@ -23,7 +23,7 @@ test:
 fmt:
 	go fmt ./...
 
-extract:
+extract: build
 	$(GO_RUN) build $(SRC) -o $(BUILD_DIR)/$(SRC)
 
 serve: extract

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
+import * as xbe from './xboxdash.js';
 
 // ============================================================================
 // XAP Runtime — Full-parity Three.js recreation of Xbox Dashboard
+// The transpiled xboxdash.js contains the decompiled Xbox executable.
 // ============================================================================
 
 const DATA_BASE = 'data';
@@ -79,20 +81,23 @@ class XAPRuntime {
       this.meshManifest = await manifestResp.json();
       _log(`[XAP] ${Object.keys(this.meshManifest).length} meshes in manifest`);
 
-      // Load materials extracted from XBE
-      try {
-        const matResp = await fetch(`${DATA_BASE}/materials.json`);
-        if (matResp.ok) {
-          const mats = await matResp.json();
-          this.xbeMaterials = {};
-          for (const m of mats) {
-            this.xbeMaterials[m.name] = m;
+      // Initialize the transpiled XBE material system
+      if (xbe.functions && xbe.functions.size > 0) {
+        const createAllMats = xbe.functions.get(0x00043B30); // CMaxMaterial::CreateAllMaterials
+        if (createAllMats) {
+          try {
+            createAllMats();
+            // Read how many materials were registered from the global counter
+            const matCount = xbe.mem.read32(0x127B2C);
+            _log(`[XBE] ${matCount} materials created by CreateAllMaterials`);
+          } catch (e) {
+            _warn('[XBE] CreateAllMaterials failed:', e.message);
           }
-          _log(`[XAP] ${Object.keys(this.xbeMaterials).length} materials from XBE`);
+        } else {
+          _log('[XBE] CreateAllMaterials not found in transpiled functions');
         }
-      } catch (e) {
-        _warn('[XAP] No materials.json found');
-        this.xbeMaterials = {};
+      } else {
+        _log('[XBE] No transpiled functions available');
       }
 
       // Load ALL scene data FIRST (Level/Inline nodes need sub-scene data during build)
@@ -438,22 +443,61 @@ class XAPRuntime {
     const texAlpha = texData ? getField(texData, 'alpha') : false;
 
     const cacheKey = (matName || '') + '|' + (texUrl || '');
-    if (this.materialCache[cacheKey]) return this.materialCache[cacheKey];
+    const cachedMat = this.materialCache[cacheKey];
+
+    // Register DEF'd material/appearance nodes globally so scripts can find them.
+    // This must happen even for cached materials — different Shapes may DEF the
+    // same material under different names (e.g. MemoryPanelMaterial, MusicPanelMaterial
+    // both using material name "GameHilite").
+    if (matData && matData.def) {
+      const matNode = new XAPNode(matData, this, '');
+      matNode._material = cachedMat || null; // will be set below if not cached
+      this.nodes[matData.def] = matNode;
+      this.scriptScope[matData.def] = matNode.proxy;
+      // Store ref so we can update _material after creation
+      matData._xapNode = matNode;
+    }
+    if (appData && appData.def) {
+      const appNode = new XAPNode(appData, this, '');
+      appNode._material = cachedMat || null;
+      this.nodes[appData.def] = appNode;
+      this.scriptScope[appData.def] = appNode.proxy;
+      appData._xapNode = appNode;
+    }
+
+    if (cachedMat) return cachedMat;
 
     const params = { side: THREE.DoubleSide };
 
-    // Look up material properties from XBE decompilation
-    const xbeMat = matName && this.xbeMaterials ? this.xbeMaterials[matName] : null;
-
-    if (xbeMat) {
-      // Apply color from decompiled XBE material data
-      params.color = new THREE.Color(xbeMat.r / 255, xbeMat.g / 255, xbeMat.b / 255);
-      if (xbeMat.a < 255) {
-        params.transparent = true;
-        params.opacity = xbeMat.a / 255;
+    // Apply material using transpiled XBE material system.
+    // The transpiled CMaxMaterial objects are registered by name in xbe.mem.
+    // Look up the material, call its Apply method, read D3D state from memory.
+    if (matName && xbe.functions) {
+      const xbeMaterial = this._findXBEMaterial(matName);
+      if (xbeMaterial) {
+        // Read color from the material object (this+0x0C is color1, set by constructor)
+        const color1 = xbe.mem.read32(xbeMaterial + 0x0C);
+        if (color1 !== 0) {
+          const a = (color1 >> 24) & 0xFF;
+          const r = (color1 >> 16) & 0xFF;
+          const g = (color1 >> 8) & 0xFF;
+          const b = color1 & 0xFF;
+          params.color = new THREE.Color(r / 255, g / 255, b / 255);
+          if (a < 255) {
+            params.transparent = true;
+            params.opacity = a / 255;
+          }
+          _log(`[XBE] Material ${matName}: color1=0x${color1.toString(16)} RGBA(${r},${g},${b},${a})`);
+        } else {
+          _log(`[XBE] Material ${matName}: color1 is zero at addr 0x${xbeMaterial.toString(16)}`);
+        }
+      } else {
+        _log(`[XBE] Material ${matName}: not found in XBE registry`);
       }
-    } else if (matData) {
-      // Fallback: use inline XAP material properties (Material nodes with diffuseColor)
+    }
+
+    // XAP inline material properties (Material nodes with diffuseColor)
+    if (!params.color && matData) {
       const diffuse = getFieldVec(matData, 'diffuseColor', 3);
       if (diffuse) params.color = new THREE.Color(diffuse[0], diffuse[1], diffuse[2]);
 
@@ -478,7 +522,29 @@ class XAPRuntime {
     const material = new THREE.MeshBasicMaterial(params);
     material.name = matName || '';
     this.materialCache[cacheKey] = material;
+
+    // Update _material on any DEF'd nodes we registered above
+    if (matData && matData._xapNode) matData._xapNode._material = material;
+    if (appData && appData._xapNode) appData._xapNode._material = material;
+
     return material;
+  }
+
+  // Look up a CMaxMaterial object address by name in the XBE global registry.
+  // CreateAllMaterials stores each material pointer at mem[0x127930 + index*4].
+  // Each material has: this+0x04 = name string VA. We match by reading the name.
+  _findXBEMaterial(name) {
+    if (!xbe.mem || !xbe.functions) return null;
+    const count = xbe.mem.read32(0x127B2C);
+    for (let i = 0; i < count; i++) {
+      const matAddr = xbe.mem.read32(0x127930 + i * 4);
+      if (matAddr === 0) continue;
+      const nameVA = xbe.mem.read32(matAddr + 0x04);
+      if (nameVA === 0) continue;
+      const matName = xbe.mem.readUTF16(nameVA);
+      if (matName === name) return matAddr;
+    }
+    return null;
   }
 
   loadTexture(url) {
@@ -626,8 +692,7 @@ class XAPRuntime {
     window.TellUser = (msg, fn) => { _log('[XAP] TellUser:', msg); };
     window.AskUser = (msg, yesFn, noFn) => { _log('[XAP] AskUser:', msg); };
 
-    // Protect console from being clobbered by scripts
-    Object.defineProperty(window, 'console', { value: console, writable: false, configurable: false });
+    // Keep console accessible — do NOT lock it down, we need logs for debugging.
 
     // Bind the first Joystick with event handlers so input works
     for (const node of Object.values(this.nodes)) {

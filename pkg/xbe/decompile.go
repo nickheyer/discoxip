@@ -229,9 +229,10 @@ func (df *DecompiledFunc) generateStmts(d *Disassembly) {
 	for _, sv := range df.StackFrame {
 		if sv.Offset < 0 {
 			typeName := "int"
-			if sv.Size == 1 {
+			switch sv.Size {
+			case 1:
 				typeName = "byte"
-			} else if sv.Size == 2 {
+			case 2:
 				typeName = "short"
 			}
 			df.Stmts = append(df.Stmts, Stmt{1, fmt.Sprintf("%s %s;", typeName, sv.Name)})

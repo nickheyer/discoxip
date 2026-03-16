@@ -1,6 +1,10 @@
 package xbe
 
-import "golang.org/x/arch/x86/x86asm"
+import (
+	"fmt"
+
+	"golang.org/x/arch/x86/x86asm"
+)
 
 // D3D8 render state and texture stage state enumerations.
 // These are the Xbox D3D8 SDK constants used by the dashboard.
@@ -161,24 +165,44 @@ type NamedD3DFunc struct {
 // IdentifyD3DFunctions analyzes the disassembly to identify and name
 // known D3D8 functions based on their code patterns and section location.
 func (d *Disassembly) IdentifyD3DFunctions() {
-	// Name functions in the D3D section by their behavior patterns.
-	d3d := d.Image.FindSection("D3D")
-	d3dx := d.Image.FindSection("D3DX")
-
-	for va, fn := range d.Functions {
-		// Already named (kernel import)
+	// Identify functions in all library sections by code pattern matching.
+	// Track used names to avoid duplicates — append VA suffix if a name is already taken.
+	usedNames := make(map[string]bool)
+	for _, fn := range d.Functions {
 		if fn.Name != "" {
+			usedNames[fn.Name] = true
+		}
+	}
+
+	libSections := []struct {
+		name     string
+		identify func(*Function, uint32) string
+	}{
+		{"D3D", identifyD3DFunc},
+		{"D3DX", identifyD3DXFunc},
+		{"XGRPH", identifyXGRPHFunc},
+		{"DSOUND", identifyDSOUNDFunc},
+		{"XPP", identifyXPPFunc},
+	}
+
+	for _, lib := range libSections {
+		sec := d.Image.FindSection(lib.name)
+		if sec == nil {
 			continue
 		}
-
-		// Functions in D3D section
-		if d3d != nil && va >= d3d.VirtualAddr && va < d3d.VirtualAddr+d3d.VirtualSize {
-			fn.Name = identifyD3DFunc(fn, va)
-		}
-
-		// Functions in D3DX section
-		if d3dx != nil && va >= d3dx.VirtualAddr && va < d3dx.VirtualAddr+d3dx.VirtualSize {
-			fn.Name = identifyD3DXFunc(fn, va)
+		for va, fn := range d.Functions {
+			if fn.Name != "" {
+				continue
+			}
+			if va >= sec.VirtualAddr && va < sec.VirtualAddr+sec.VirtualSize {
+				if name := lib.identify(fn, va); name != "" {
+					if usedNames[name] {
+						name = fmt.Sprintf("%s_%08X", name, va)
+					}
+					fn.Name = name
+					usedNames[name] = true
+				}
+			}
 		}
 	}
 
@@ -204,8 +228,18 @@ func (d *Disassembly) IdentifyD3DFunctions() {
 		0x0004386C: "CMaxMaterial::ApplyAlpha",
 		0x00043889: "CMaxMaterial::Apply_flatcolor",
 		0x00043936: "CMaxMaterial::Apply_combiner",
-		0x000439D6: "CMaxMaterial::Apply_combiner2",
-		0x00043AAB: "CMaxMaterial::Apply_combiner3",
+		0x000439D6: "CMaxMaterial::Apply_wireframe",
+		0x00043AAB: "CMaxMaterial::Apply_chrome",
+		0x0004496E: "CMaxMaterial::Apply_innerwall",
+		0x00043434: "CMaxMaterial::Apply_numbered",
+		0x00044A60: "CMaxMaterial::Apply_orb",
+		0x00044B69: "CMaxMaterial::Apply_panel",
+		0x00044C67: "CMaxMaterial::Apply_reflect",
+		0x00044D22: "CMaxMaterial::Apply_backing",
+		0x00044DED: "CMaxMaterial::Apply_eggpulse",
+		0x00044E61: "CMaxMaterial::Apply_eggglow",
+		0x00044EF1: "CMaxMaterial::Apply_key",
+		0x00043646: "CMaxMaterial::Apply_icon",
 		0x00043B30: "CMaxMaterial::CreateAllMaterials",
 		0x00046660: "LookupTexture",
 		0x00046912: "SetRegisterCombinerConstants",
@@ -215,6 +249,26 @@ func (d *Disassembly) IdentifyD3DFunctions() {
 	for va, name := range knownFuncs {
 		if fn, ok := d.Functions[va]; ok {
 			fn.Name = name
+		} else {
+			// Function not discovered by prologue/call heuristic (e.g. vtable targets).
+			// Create it now by scanning forward from VA to RET.
+			fn := &Function{EntryVA: va, Name: name}
+			for addr := va; ; {
+				insn, ok := d.InsnByVA[addr]
+				if !ok {
+					break
+				}
+				fn.Instructions = append(fn.Instructions, *insn)
+				if insn.Inst.Op == x86asm.RET {
+					break
+				}
+				addr += uint32(insn.Inst.Len)
+			}
+			if len(fn.Instructions) > 0 {
+				last := fn.Instructions[len(fn.Instructions)-1]
+				fn.Size = int(last.VA - va + uint32(last.Inst.Len))
+				d.Functions[va] = fn
+			}
 		}
 	}
 }
@@ -254,6 +308,101 @@ func identifyD3DFunc(fn *Function, _ uint32) string {
 	return ""
 }
 
-func identifyD3DXFunc(_ *Function, _ uint32) string {
+// identifyXGRPHFunc identifies XGRPH (Xbox graphics helper) functions.
+func identifyXGRPHFunc(fn *Function, _ uint32) string {
+	if len(fn.Instructions) == 0 {
+		return ""
+	}
+	for _, insn := range fn.Instructions {
+		for _, arg := range insn.Inst.Args {
+			if arg == nil {
+				continue
+			}
+			if mem, ok := arg.(x86asm.Mem); ok {
+				disp := uint32(mem.Disp)
+				switch {
+				case disp == 0xE67B0:
+					return "XGRPH_GetDisplayMode"
+				case disp == 0xE67B4:
+					return "XGRPH_GetBackBuffer"
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// identifyDSOUNDFunc identifies DirectSound functions.
+func identifyDSOUNDFunc(fn *Function, _ uint32) string {
+	if len(fn.Instructions) == 0 {
+		return ""
+	}
+	for _, insn := range fn.Instructions {
+		for _, arg := range insn.Inst.Args {
+			if arg == nil {
+				continue
+			}
+			if mem, ok := arg.(x86asm.Mem); ok {
+				disp := uint32(mem.Disp)
+				switch {
+				case disp == 0xE6440:
+					return "DirectSound_CreateSoundBuffer"
+				case disp == 0xE6448:
+					return "DirectSound_GetCaps"
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// identifyXPPFunc identifies XPP (Xbox Platform/Presentation) functions.
+func identifyXPPFunc(fn *Function, _ uint32) string {
+	if len(fn.Instructions) == 0 {
+		return ""
+	}
+	for _, insn := range fn.Instructions {
+		for _, arg := range insn.Inst.Args {
+			if arg == nil {
+				continue
+			}
+			if mem, ok := arg.(x86asm.Mem); ok {
+				disp := uint32(mem.Disp)
+				switch {
+				case disp == 0x110220:
+					return "XPP_GetSystemTime"
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// identifyD3DXFunc identifies D3DX utility library functions.
+func identifyD3DXFunc(fn *Function, _ uint32) string {
+	if len(fn.Instructions) == 0 {
+		return ""
+	}
+
+	for _, insn := range fn.Instructions {
+		if insn.Inst.Op == 0 {
+			continue
+		}
+		for _, arg := range insn.Inst.Args {
+			if arg == nil {
+				continue
+			}
+			if mem, ok := arg.(x86asm.Mem); ok {
+				disp := uint32(mem.Disp)
+				switch {
+				case disp == 0xBEB50:
+					return "D3DX_GetPushBuffer"
+				case disp == 0xBEFC0:
+					return "D3DX_GetDeviceState"
+				}
+			}
+		}
+	}
+
 	return ""
 }
