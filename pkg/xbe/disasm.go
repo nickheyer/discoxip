@@ -22,7 +22,6 @@ type Function struct {
 	CallTargets  []uint32 // VAs of functions this function calls
 	CalledBy     []uint32 // VAs of functions that call this one
 	Size         int      // total bytes
-	jsName       string   // deduplicated JavaScript function name (set during transpile)
 }
 
 // Disassembly is the complete disassembled image.

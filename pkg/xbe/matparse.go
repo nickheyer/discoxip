@@ -32,9 +32,11 @@ type DecodedMaterial struct {
 
 // D3DCall is a D3D API call extracted from the Apply method.
 type D3DCall struct {
-	Function string   `json:"fn"`             // resolved function name
-	TargetVA uint32   `json:"target_va"`      // call target address
-	Args     []uint32 `json:"args,omitempty"` // immediate arguments (from preceding pushes)
+	Function string   `json:"fn"`              // resolved function name
+	TargetVA uint32   `json:"target_va"`       // call target address
+	Args     []uint32 `json:"args,omitempty"`  // immediate arguments (from preceding pushes)
+	ECX      int32    `json:"ecx"`   // ECX value at call site (-1 = unknown)
+	EDX      int32    `json:"edx"`   // EDX value at call site (-1 = unknown)
 }
 
 // MemWrite is an immediate value written to a this+offset field in the Apply method.
@@ -224,20 +226,119 @@ func TraceApplyMethods(img *Image, d *Disassembly, materials []DecodedMaterial) 
 }
 
 // traceApplyFunction traces an Apply method's instructions to extract:
-// 1. All CALL instructions with their preceding push arguments (D3D API calls)
+// 1. All CALL instructions with their preceding push arguments AND register values (D3D API calls)
 // 2. All MOV [esi/ecx+offset], imm32 instructions (this->field = value)
+//
+// For SetTextureStageState_Deferred, the calling convention is:
+//   ECX = texture stage number (0-3)
+//   EDX = state type index (0-31, Xbox D3DTSS enum)
+//   stack arg0 = value
+// For SetRenderState wrappers (sub_0002989C):
+//   stack args = (value, state_type) or (state_type) with value in register
 func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 	var calls []D3DCall
 	var writes []MemWrite
 
 	insns := fn.Instructions
 
+	// Track register values forward through the function.
+	// Values are int32 where -1 = unknown.
+	regs := map[x86asm.Reg]int32{
+		x86asm.ECX: -1,
+		x86asm.EDX: -1,
+		x86asm.EAX: -1,
+	}
+
 	for i, insn := range insns {
+		// Track register assignments
+		switch insn.Inst.Op {
+		case x86asm.MOV:
+			if len(insn.Inst.Args) >= 2 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					if _, tracked := regs[dst]; tracked {
+						if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+							regs[dst] = int32(imm)
+						} else {
+							regs[dst] = -1 // unknown source
+						}
+					}
+				}
+			}
+		case x86asm.XOR:
+			// XOR reg, reg → zero
+			if len(insn.Inst.Args) >= 2 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
+						if dst == src {
+							if _, tracked := regs[dst]; tracked {
+								regs[dst] = 0
+							}
+						}
+					}
+				}
+			}
+		case x86asm.POP:
+			// POP reg — value comes from stack. Look at the most recent PUSH imm.
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+				if _, tracked := regs[dst]; tracked {
+					// Walk backwards to find the matching PUSH
+					regs[dst] = -1
+					for j := i - 1; j >= 0; j-- {
+						prev := insns[j]
+						if prev.Inst.Op == x86asm.PUSH {
+							if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok {
+								regs[dst] = int32(imm)
+							}
+							break
+						}
+						// Skip non-push instructions within a push-pop pair
+						if prev.Inst.Op == x86asm.CALL || prev.Inst.Op == x86asm.RET {
+							break
+						}
+					}
+				}
+			}
+		case x86asm.SHL:
+			// SHL reg, imm — used for stage*32 computation
+			if len(insn.Inst.Args) >= 2 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+						if v, ok2 := regs[dst]; ok2 && v >= 0 {
+							regs[dst] = v << uint(imm)
+						}
+					}
+				}
+			}
+		case x86asm.ADD:
+			if len(insn.Inst.Args) >= 2 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+						if v, ok2 := regs[dst]; ok2 && v >= 0 {
+							regs[dst] = v + int32(imm)
+						}
+					}
+					if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
+						if dv, ok2 := regs[dst]; ok2 {
+							if sv, ok3 := regs[src]; ok3 && dv >= 0 && sv >= 0 {
+								regs[dst] = dv + sv
+							} else {
+								regs[dst] = -1
+							}
+						}
+					}
+				}
+			}
+		case x86asm.CALL:
+			// After a call, EAX/ECX/EDX are clobbered
+			regs[x86asm.EAX] = -1
+			regs[x86asm.ECX] = -1
+			regs[x86asm.EDX] = -1
+		}
+
 		// Extract MOV [this+offset], imm32 writes
 		if insn.Inst.Op == x86asm.MOV && len(insn.Inst.Args) >= 2 {
 			if mem, ok := insn.Inst.Args[0].(x86asm.Mem); ok {
 				if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
-					// Writing an immediate to a this-relative offset
 					if mem.Base == x86asm.ESI || mem.Base == x86asm.ECX || mem.Base == x86asm.EDI || mem.Base == x86asm.EBX {
 						writes = append(writes, MemWrite{
 							Offset: int32(mem.Disp),
@@ -248,24 +349,22 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 			}
 		}
 
-		// Extract OR [this+offset], imm32 (used to set color components)
+		// Extract OR reg, imm32
 		if insn.Inst.Op == x86asm.OR && len(insn.Inst.Args) >= 2 {
 			if _, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
 				if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
-					// OR eax, imm32 — often used to combine alpha with color
 					writes = append(writes, MemWrite{
-						Offset: -1, // register, not memory
+						Offset: -1,
 						Value:  uint32(imm),
 					})
 				}
 			}
 		}
 
-		// Extract CALL instructions with preceding push arguments
+		// Extract CALL instructions with stack args AND register state
 		if insn.Inst.Op == x86asm.CALL {
 			target := resolveTarget(&insns[i])
 
-			// Resolve function name
 			fnName := fmt.Sprintf("sub_%08X", target)
 			if target != 0 {
 				if callee, ok := d.Functions[target]; ok && callee.Name != "" {
@@ -285,8 +384,14 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 						args = append([]uint32{uint32(imm)}, args...)
 						continue
 					}
+					// PUSH reg — try to resolve from tracked value
+					if reg, ok := prev.Inst.Args[0].(x86asm.Reg); ok {
+						if v, ok2 := regs[reg]; ok2 && v >= 0 {
+							args = append([]uint32{uint32(v)}, args...)
+							continue
+						}
+					}
 				}
-				// Stop at non-push instructions (but skip POP used for mov edx, pop pattern)
 				if prev.Inst.Op != x86asm.POP {
 					break
 				}
@@ -296,6 +401,8 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 				Function: fnName,
 				TargetVA: target,
 				Args:     args,
+				ECX:      regs[x86asm.ECX],
+				EDX:      regs[x86asm.EDX],
 			})
 		}
 	}

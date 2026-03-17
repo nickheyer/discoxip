@@ -39,14 +39,7 @@ func init() {
 		RunE:  runXBEDisasm,
 	}
 
-	transpileCmd := &cobra.Command{
-		Use:   "transpile <file.xbe>",
-		Short: "Transpile XBE to JavaScript",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runXBETranspile,
-	}
-
-	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, transpileCmd)
+	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd)
 	rootCmd.AddCommand(xbeCmd)
 }
 
@@ -135,37 +128,3 @@ func runXBEDisasm(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runXBETranspile(cmd *cobra.Command, args []string) error {
-	img, err := xbe.Open(args[0])
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stderr, "Transpiling %s...\n", args[0])
-
-	d, err := xbe.Disassemble(img)
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stderr, "  %d instructions, %d functions\n", len(d.InsnByVA), len(d.Functions))
-	fmt.Fprintf(os.Stderr, "  Recovering control flow and transpiling to JS...\n")
-
-	js := xbe.TranspileToJS(d)
-
-	outPath := strings.TrimSuffix(args[0], filepath.Ext(args[0])) + ".js"
-	f, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := bufio.NewWriterSize(f, 256*1024)
-	w.WriteString(js)
-	if err := w.Flush(); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stderr, "  Written to %s\n", outPath)
-	return nil
-}

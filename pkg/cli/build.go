@@ -8,7 +8,6 @@ import (
 
 	"github.com/nickheyer/discoxip/pkg/extract"
 	"github.com/nickheyer/discoxip/pkg/web"
-	"github.com/nickheyer/discoxip/pkg/xbe"
 	"github.com/nickheyer/discoxip/pkg/xip"
 	"github.com/spf13/cobra"
 )
@@ -26,8 +25,7 @@ Three.js web application.
 This is the single entry point for the full pipeline:
   1. Extract all .xip archives (meshes, textures, scenes)
   2. Copy auxiliary data (audio files)
-  3. Decompile .xbe to extract material definitions
-  4. Generate Three.js web app with all assets
+  3. Generate Three.js web app with all assets (includes XBE material extraction)
 
 Example:
   discoxip build sample/4304 -o output/dashboard`,
@@ -129,47 +127,6 @@ func runBuild(cmd *cobra.Command, args []string) error {
 
 	if err := web.Export(extractDir, webDir); err != nil {
 		return fmt.Errorf("web export: %w", err)
-	}
-
-	// ── Step 4: Transpile XBE to JavaScript ──
-	if len(xbeFiles) > 0 {
-		fmt.Fprintf(os.Stderr, "\nStep 4: Transpiling XBE...\n")
-
-		xbeSrc := xbeFiles[0]
-		xbeName := strings.TrimSuffix(filepath.Base(xbeSrc), filepath.Ext(filepath.Base(xbeSrc)))
-
-		img, err := xbe.Open(xbeSrc)
-		if err == nil {
-			d, err := xbe.Disassemble(img)
-			if err == nil {
-				// Write decompiled C pseudocode to output root (reference)
-				decompPath := filepath.Join(outDir, xbeName+".c")
-				funcs := d.DecompileAll()
-				if f, err := os.Create(decompPath); err == nil {
-					fmt.Fprintf(f, "// Decompiled from %s\n", filepath.Base(xbeSrc))
-					fmt.Fprintf(f, "// %d functions, %d instructions\n\n", len(funcs), len(d.InsnByVA))
-					for _, df := range funcs {
-						fmt.Fprintf(f, "\n// --- 0x%08X, %d blocks ---\n", df.EntryVA, len(df.Blocks))
-						fmt.Fprint(f, df.Format())
-					}
-					f.Close()
-					fmt.Fprintf(os.Stderr, "  %d functions decompiled → %s\n", len(funcs), decompPath)
-				}
-
-				// Transpile to JavaScript and write into web output
-				js := xbe.TranspileToJS(d)
-				jsPath := filepath.Join(webDir, xbeName+".js")
-				if err := os.WriteFile(jsPath, []byte(js), 0o644); err == nil {
-					fmt.Fprintf(os.Stderr, "  %d functions transpiled → %s\n", len(d.Functions), jsPath)
-				} else {
-					fmt.Fprintf(os.Stderr, "  warning: writing transpiled JS: %v\n", err)
-				}
-			} else {
-				fmt.Fprintf(os.Stderr, "  warning: disassembly failed: %v\n", err)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "  warning: XBE load failed: %v\n", err)
-		}
 	}
 
 	fmt.Fprintf(os.Stderr, "\nBuild complete.\n")

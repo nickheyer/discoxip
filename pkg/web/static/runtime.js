@@ -1,9 +1,8 @@
 import * as THREE from 'three';
-import * as xbe from './xboxdash.js';
+import * as matSystem from './materials.js';
 
 // ============================================================================
 // XAP Runtime — Full-parity Three.js recreation of Xbox Dashboard
-// The transpiled xboxdash.js contains the decompiled Xbox executable.
 // ============================================================================
 
 const DATA_BASE = 'data';
@@ -40,8 +39,11 @@ class XAPRuntime {
     this.meshCache = {};       // key → Promise<THREE.BufferGeometry>
     this.textureCache = {};    // name → THREE.Texture
     this.materialCache = {};   // name → THREE.Material
+    this.namedMaterials = [];  // [{threeMat, matName}] for per-frame color updates
     this.sceneData = {};       // sceneName → parsed JSON
     this.nodes = {};           // global DEF name → XAPNode
+    this._viewpointSet = false;   // only apply the first Viewpoint to camera
+    this._backgroundSet = false;  // only apply the first Background to scene
     this.rootGroup = new THREE.Group();
     this.scene.add(this.rootGroup);
 
@@ -81,24 +83,9 @@ class XAPRuntime {
       this.meshManifest = await manifestResp.json();
       _log(`[XAP] ${Object.keys(this.meshManifest).length} meshes in manifest`);
 
-      // Initialize the transpiled XBE material system
-      if (xbe.functions && xbe.functions.size > 0) {
-        const createAllMats = xbe.functions.get(0x00043B30); // CMaxMaterial::CreateAllMaterials
-        if (createAllMats) {
-          try {
-            createAllMats();
-            // Read how many materials were registered from the global counter
-            const matCount = xbe.mem.read32(0x127B2C);
-            _log(`[XBE] ${matCount} materials created by CreateAllMaterials`);
-          } catch (e) {
-            _warn('[XBE] CreateAllMaterials failed:', e.message);
-          }
-        } else {
-          _log('[XBE] CreateAllMaterials not found in transpiled functions');
-        }
-      } else {
-        _log('[XBE] No transpiled functions available');
-      }
+      // Initialize material system (transpiled from XBE CMaxMaterial)
+      const matCount = matSystem.createAllMaterials();
+      _log(`[XBE] ${matCount} materials created`);
 
       // Load ALL scene data FIRST (Level/Inline nodes need sub-scene data during build)
       const loadPromises = this.config.scenes.map(name => this.loadSceneData(name));
@@ -207,31 +194,39 @@ class XAPRuntime {
       this.buildGeometry(node, group, geomData, appData, archiveName);
     }
 
-    // --- Viewpoint: if node has fieldOfView, configure camera ---
+    // --- Viewpoint: store data on node, apply first one to camera ---
     if (f.fieldOfView !== undefined) {
-      const fov = asNumber(f.fieldOfView);
-      this.camera.fov = THREE.MathUtils.radToDeg(fov);
-      this.camera.updateProjectionMatrix();
-      if (f.position) {
-        const p = asVec3(f.position);
-        this.camera.position.set(p[0], p[1], p[2]);
-      }
-      if (f.orientation) {
-        const r = asVec4(f.orientation);
-        const axis = new THREE.Vector3(r[0], r[1], r[2]).normalize();
-        this.camera.quaternion.setFromAxisAngle(axis, r[3]);
+      node._viewpoint = {
+        fov: asNumber(f.fieldOfView),
+        position: f.position ? asVec3(f.position) : null,
+        orientation: f.orientation ? asVec4(f.orientation) : null,
+      };
+      // Only apply the FIRST Viewpoint to the camera during scene build.
+      // Subsequent Viewpoints are stored on nodes for script-driven navigation
+      // (GoTo/GoBackTo calls applyViewpoint on the target level).
+      if (!this._viewpointSet) {
+        this._viewpointSet = true;
+        this._applyViewpoint(node._viewpoint);
       }
     }
 
-    // --- Background: if node has skyColor or backdrop ---
-    if (f.skyColor) {
-      const c = asVec3(f.skyColor);
-      this.scene.background = new THREE.Color(c[0], c[1], c[2]);
-    }
-    const backdropData = extractNode(f.backdrop);
-    if (backdropData) {
-      const url = getField(backdropData, 'url');
-      if (url) this.scene.background = this.loadTexture(url);
+    // --- Background: store on node, apply only the first ---
+    // The Xbox dashboard has multiple Background nodes (4:3, 16:9 variants).
+    // Scripts switch between them. Apply only the first one initially.
+    if (f.skyColor || f.backdrop) {
+      node._background = { skyColor: f.skyColor, backdrop: extractNode(f.backdrop) };
+      if (!this._backgroundSet) {
+        this._backgroundSet = true;
+        if (f.skyColor) {
+          const c = asVec3(f.skyColor);
+          this.scene.background = new THREE.Color(c[0], c[1], c[2]);
+        }
+        const backdropData = extractNode(f.backdrop);
+        if (backdropData) {
+          const url = getField(backdropData, 'url');
+          if (url) this.scene.background = this.loadTexture(url);
+        }
+      }
     }
 
     // --- Screen dimensions ---
@@ -292,6 +287,11 @@ class XAPRuntime {
         rpm: node._waverRPM, field: node._waverField,
         elapsed: Math.random() * 100, // randomize phase
       });
+    }
+
+    // --- Layer: starts hidden, activated by scripts ---
+    if (data.type === 'Layer') {
+      group.visible = false;
     }
 
     // --- Level: register as navigable level ---
@@ -469,30 +469,18 @@ class XAPRuntime {
 
     const params = { side: THREE.DoubleSide };
 
-    // Apply material using transpiled XBE material system.
-    // The transpiled CMaxMaterial objects are registered by name in xbe.mem.
-    // Look up the material, call its Apply method, read D3D state from memory.
-    if (matName && xbe.functions) {
-      const xbeMaterial = this._findXBEMaterial(matName);
-      if (xbeMaterial) {
-        // Read color from the material object (this+0x0C is color1, set by constructor)
-        const color1 = xbe.mem.read32(xbeMaterial + 0x0C);
-        if (color1 !== 0) {
-          const a = (color1 >> 24) & 0xFF;
-          const r = (color1 >> 16) & 0xFF;
-          const g = (color1 >> 8) & 0xFF;
-          const b = color1 & 0xFF;
-          params.color = new THREE.Color(r / 255, g / 255, b / 255);
-          if (a < 255) {
-            params.transparent = true;
-            params.opacity = a / 255;
-          }
-          _log(`[XBE] Material ${matName}: color1=0x${color1.toString(16)} RGBA(${r},${g},${b},${a})`);
-        } else {
-          _log(`[XBE] Material ${matName}: color1 is zero at addr 0x${xbeMaterial.toString(16)}`);
+    // Apply material color from transpiled XBE material system
+    if (matName) {
+      const color = matSystem.applyMaterial(matName);
+      if (color) {
+        // Xbox D3DCOLOR bytes are SRGB — must tell Three.js to convert to linear
+        params.color = new THREE.Color().setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
+        // Backing materials use alpha bytes for D3D blend state config, not opacity.
+        const vtable = matSystem.getVtable(matName);
+        if (vtable !== 'backing' && color.a < 255) {
+          params.transparent = true;
+          params.opacity = color.a / 255;
         }
-      } else {
-        _log(`[XBE] Material ${matName}: not found in XBE registry`);
       }
     }
 
@@ -523,6 +511,12 @@ class XAPRuntime {
     material.name = matName || '';
     this.materialCache[cacheKey] = material;
 
+    // Track named materials for per-frame color updates (animated materials)
+    if (matName) {
+      const vtable = matSystem.getVtable(matName);
+      this.namedMaterials.push({ threeMat: material, matName, vtable });
+    }
+
     // Update _material on any DEF'd nodes we registered above
     if (matData && matData._xapNode) matData._xapNode._material = material;
     if (appData && appData._xapNode) appData._xapNode._material = material;
@@ -530,22 +524,6 @@ class XAPRuntime {
     return material;
   }
 
-  // Look up a CMaxMaterial object address by name in the XBE global registry.
-  // CreateAllMaterials stores each material pointer at mem[0x127930 + index*4].
-  // Each material has: this+0x04 = name string VA. We match by reading the name.
-  _findXBEMaterial(name) {
-    if (!xbe.mem || !xbe.functions) return null;
-    const count = xbe.mem.read32(0x127B2C);
-    for (let i = 0; i < count; i++) {
-      const matAddr = xbe.mem.read32(0x127930 + i * 4);
-      if (matAddr === 0) continue;
-      const nameVA = xbe.mem.read32(matAddr + 0x04);
-      if (nameVA === 0) continue;
-      const matName = xbe.mem.readUTF16(nameVA);
-      if (matName === name) return matAddr;
-    }
-    return null;
-  }
 
   loadTexture(url) {
     let base = String(url);
@@ -560,7 +538,8 @@ class XAPRuntime {
     const tex = loader.load(
       `${DATA_BASE}/textures/${base}.png`,
       (t) => { t.colorSpace = THREE.SRGBColorSpace; },
-      undefined, () => {}
+      undefined,
+      () => { _warn(`[XAP] Texture not found: ${base}.png`); }
     );
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
@@ -984,6 +963,11 @@ class XAPRuntime {
   animate() {
     requestAnimationFrame(() => this.animate());
     const dt = this.clock.getDelta();
+    const elapsed = this.clock.elapsedTime;
+
+    // Update material system time for animated materials (eggpulse, eggglow, etc.)
+    matSystem.updateTime(elapsed);
+    this.updateMaterialColors();
 
     this.updateAnimations(dt);
     this.pollGamepad();
@@ -995,6 +979,35 @@ class XAPRuntime {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  _applyViewpoint(vp) {
+    this.camera.fov = THREE.MathUtils.radToDeg(vp.fov);
+    this.camera.updateProjectionMatrix();
+    if (vp.position) {
+      this.camera.position.set(vp.position[0], vp.position[1], vp.position[2]);
+    }
+    if (vp.orientation) {
+      const axis = new THREE.Vector3(vp.orientation[0], vp.orientation[1], vp.orientation[2]).normalize();
+      this.camera.quaternion.setFromAxisAngle(axis, vp.orientation[3]);
+    }
+    _log(`[XAP] Camera: fov=${vp.fov.toFixed(2)} pos=[${vp.position}]`);
+  }
+
+  updateMaterialColors() {
+    for (const { threeMat, matName, vtable } of this.namedMaterials) {
+      const color = matSystem.applyMaterial(matName);
+      if (!color) continue;
+      threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
+      // Backing materials use alpha for D3D blend config, not opacity
+      if (vtable === 'backing') continue;
+      if (color.a < 255) {
+        threeMat.transparent = true;
+        threeMat.opacity = color.a / 255;
+      } else if (threeMat.opacity < 1) {
+        threeMat.opacity = 1;
+      }
+    }
   }
 }
 
@@ -1346,6 +1359,9 @@ class XAPNode {
     if (this.threeObj) this.threeObj.visible = true;
     this._levelActive = true;
 
+    // Apply this level's Viewpoint to the camera
+    this._applyLevelViewpoint();
+
     // Bind the joystick control for this level
     this._bindLevelControl();
 
@@ -1361,10 +1377,29 @@ class XAPNode {
     if (this.threeObj) this.threeObj.visible = true;
     this._levelActive = true;
 
+    // Apply this level's Viewpoint to the camera
+    this._applyLevelViewpoint();
+
     // Bind the joystick control for this level
     this._bindLevelControl();
 
     _log(`[Level] GoBackTo: ${this.data.def}`);
+  }
+
+  _applyLevelViewpoint() {
+    // Find the first Viewpoint node in this level's subtree
+    const findVP = (xapNode) => {
+      if (xapNode._viewpoint) return xapNode._viewpoint;
+      for (const child of xapNode._xapChildren) {
+        const vp = findVP(child);
+        if (vp) return vp;
+      }
+      return null;
+    };
+    const vp = findVP(this);
+    if (vp) {
+      this.runtime._applyViewpoint(vp);
+    }
   }
 
   _bindLevelControl() {
