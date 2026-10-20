@@ -7,16 +7,16 @@ import (
 type tokenType int
 
 const (
-	tokEOF     tokenType = iota
-	tokLBrace            // {
-	tokRBrace            // }
-	tokLBracket          // [
-	tokRBracket          // ]
-	tokLParen            // (
-	tokRParen            // )
-	tokIdent             // identifier/keyword
-	tokString            // "quoted string"
-	tokNumber            // number literal
+	tokEOF      tokenType = iota
+	tokLBrace             // {
+	tokRBrace             // }
+	tokLBracket           // [
+	tokRBracket           // ]
+	tokLParen             // (
+	tokRParen             // )
+	tokIdent              // identifier/keyword
+	tokString             // "quoted string"
+	tokNumber             // number literal
 )
 
 type token struct {

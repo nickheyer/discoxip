@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var xbeDisasmOutput string
+
 func init() {
 	xbeCmd := &cobra.Command{
 		Use:   "xbe",
@@ -38,6 +40,7 @@ func init() {
 		Args:  cobra.ExactArgs(1),
 		RunE:  runXBEDisasm,
 	}
+	disasmCmd.Flags().StringVarP(&xbeDisasmOutput, "output", "o", "", "output file (default: input with .c extension)")
 
 	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd)
 	rootCmd.AddCommand(xbeCmd)
@@ -102,8 +105,13 @@ func runXBEDisasm(cmd *cobra.Command, args []string) error {
 	decompiledFuncs := d.DecompileAll()
 	fmt.Fprintf(os.Stderr, "  %d functions decompiled\n", len(decompiledFuncs))
 
-	// Write decompiled output next to input: xboxdash.xbe → xboxdash.c
-	outPath := strings.TrimSuffix(args[0], filepath.Ext(args[0])) + ".c"
+	outPath := xbeDisasmOutput
+	if outPath == "" {
+		outPath = strings.TrimSuffix(args[0], filepath.Ext(args[0])) + ".c"
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
 	f, err := os.Create(outPath)
 	if err != nil {
 		return err
@@ -127,4 +135,3 @@ func runXBEDisasm(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "  Written to %s\n", outPath)
 	return nil
 }
-

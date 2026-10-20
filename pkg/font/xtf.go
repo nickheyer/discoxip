@@ -32,9 +32,9 @@ type GlyphMesh struct {
 
 // Glyph combines metrics and mesh data for a single glyph.
 type Glyph struct {
-	Metrics  GlyphMetrics
-	Mesh     GlyphMesh
-	meshOff  uint32 // absolute file offset to mesh data (internal)
+	Metrics GlyphMetrics
+	Mesh    GlyphMesh
+	meshOff uint32 // absolute file offset to mesh data (internal)
 }
 
 // Font holds a parsed XTF vector font.
@@ -196,21 +196,6 @@ func Open(path string) (*Font, error) {
 	}
 
 	return ReadXTF(f, fi.Size())
-}
-
-// GlyphIndex returns the glyph table index for a Unicode codepoint,
-// or -1 if the codepoint is not covered.
-func (f *Font) GlyphIndex(cp rune) int {
-	idx := 0
-	for _, r := range f.Ranges {
-		start := rune(r.Start)
-		count := int(r.Count)
-		if cp >= start && cp < start+rune(count) {
-			return idx + int(cp-start)
-		}
-		idx += count
-	}
-	return -1
 }
 
 // UnicodeBlocks returns a summary of which Unicode blocks are covered.

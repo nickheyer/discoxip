@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/nickheyer/discoxip/pkg/mesh"
 	"github.com/spf13/cobra"
@@ -12,29 +11,51 @@ import (
 func init() {
 	meshCmd := &cobra.Command{
 		Use:   "mesh",
-		Short: "Inspect and export XM mesh files",
+		Short: "Inspect XM mesh files",
 	}
 
 	infoCmd := &cobra.Command{
-		Use:   "info <file.xm> [file.xm...]",
+		Use:   "info <file.xm|directory> [...]",
 		Short: "Display mesh file content type and summary",
 		Args:  cobra.MinimumNArgs(1),
 		RunE:  runMeshInfo,
 	}
 
-	exportAllCmd := &cobra.Command{
-		Use:   "export-all <directory>",
-		Short: "Batch info for all XM files in a directory",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runMeshExportAll,
-	}
-
-	meshCmd.AddCommand(infoCmd, exportAllCmd)
+	meshCmd.AddCommand(infoCmd)
 	rootCmd.AddCommand(meshCmd)
 }
 
+// Expands directory arguments into their .xm files
+func expandMeshPaths(args []string) ([]string, error) {
+	var paths []string
+	for _, arg := range args {
+		info, err := os.Stat(arg)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			paths = append(paths, arg)
+			continue
+		}
+		found, err := findFiles(arg, ".xm")
+		if err != nil {
+			return nil, err
+		}
+		if len(found) == 0 {
+			return nil, fmt.Errorf("no .xm files found in %s", arg)
+		}
+		paths = append(paths, found...)
+	}
+	return paths, nil
+}
+
 func runMeshInfo(cmd *cobra.Command, args []string) error {
-	for _, path := range args {
+	paths, err := expandMeshPaths(args)
+	if err != nil {
+		return err
+	}
+
+	for _, path := range paths {
 		m, err := mesh.Open(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
@@ -63,30 +84,9 @@ func runMeshInfo(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if len(args) > 1 {
+		if len(paths) > 1 {
 			fmt.Println()
 		}
 	}
 	return nil
-}
-
-func runMeshExportAll(cmd *cobra.Command, args []string) error {
-	dir := args[0]
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-
-	var paths []string
-	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".xm" {
-			paths = append(paths, filepath.Join(dir, e.Name()))
-		}
-	}
-
-	if len(paths) == 0 {
-		return fmt.Errorf("no .xm files found in %s", dir)
-	}
-
-	return runMeshInfo(cmd, paths)
 }

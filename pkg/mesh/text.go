@@ -2,7 +2,6 @@ package mesh
 
 import (
 	"regexp"
-	"strings"
 )
 
 // TextMesh holds parsed VRML-like text content from an XM file.
@@ -33,16 +32,4 @@ func ParseText(data []byte) *TextMesh {
 	}
 
 	return tm
-}
-
-// Summary returns a brief description of the text mesh.
-func (t *TextMesh) Summary() string {
-	var parts []string
-	if len(t.NodeNames) > 0 {
-		parts = append(parts, strings.Join(t.NodeNames[:min(5, len(t.NodeNames))], ", "))
-		if len(t.NodeNames) > 5 {
-			parts = append(parts, "...")
-		}
-	}
-	return strings.Join(parts, " ")
 }

@@ -26,7 +26,7 @@ const (
 
 // rawHeader is the on-disk XBE image header (first 0x178+ bytes).
 type rawHeader struct {
-	Magic              [4]byte  // "XBEH"
+	Magic              [4]byte // "XBEH"
 	Signature          [256]byte
 	BaseAddr           uint32
 	HeadersSize        uint32
@@ -61,16 +61,16 @@ type rawHeader struct {
 
 // rawSection is the on-disk section header (0x38 bytes).
 type rawSection struct {
-	Flags                    uint32
-	VirtualAddr              uint32
-	VirtualSize              uint32
-	RawAddr                  uint32
-	RawSize                  uint32
-	SectionNameAddr          uint32
-	SectionNameRefCount      uint32
-	HeadSharedPageRefCount   uint32
-	TailSharedPageRefCount   uint32
-	Digest                   [20]byte
+	Flags                  uint32
+	VirtualAddr            uint32
+	VirtualSize            uint32
+	RawAddr                uint32
+	RawSize                uint32
+	SectionNameAddr        uint32
+	SectionNameRefCount    uint32
+	HeadSharedPageRefCount uint32
+	TailSharedPageRefCount uint32
+	Digest                 [20]byte
 }
 
 // Section is a loaded XBE section with name and virtual address range.
@@ -135,7 +135,7 @@ func Parse(data []byte) (*Image, error) {
 	if entry&0xF0000000 == 0x40000000 {
 		img.EntryPoint = entry ^ entrySega
 		img.KernThunk = kthunk ^ kthunkSega
-	} else if (entry^entryDebug) < 0x4000000 {
+	} else if (entry ^ entryDebug) < 0x4000000 {
 		img.EntryPoint = entry ^ entryDebug
 		img.KernThunk = kthunk ^ kthunkDebug
 	} else {

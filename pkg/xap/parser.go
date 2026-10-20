@@ -2,7 +2,6 @@ package xap
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -31,15 +30,6 @@ func Parse(input string) (*Scene, error) {
 // ParseFile reads and parses an XAP file.
 func ParseFile(path string) (*Scene, error) {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return Parse(string(data))
-}
-
-// ReadScene parses XAP from a reader.
-func ReadScene(r io.Reader) (*Scene, error) {
-	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}

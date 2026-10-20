@@ -539,16 +539,13 @@ class XAPRuntime {
       // Apply D3D blend state extracted from XBE Apply method trace
       const d3d = matSystem.getD3DState(matName);
       if (d3d) {
-        if (d3d.alphaBlendEnable || d3d.alpha_blend_enable) {
+        if (d3d.alpha_blend_enable) {
           params.transparent = true;
           params.blending = THREE.CustomBlending;
-          const src = d3d.srcBlend || d3d.src_blend || 0;
-          const dst = d3d.dstBlend || d3d.dst_blend || 0;
-          params.blendSrc = _xboxBlendToThree(src);
-          params.blendDst = _xboxBlendToThree(dst);
+          params.blendSrc = _xboxBlendToThree(d3d.src_blend);
+          params.blendDst = _xboxBlendToThree(d3d.dst_blend);
         }
-        const zw = d3d.zWriteEnable ?? d3d.z_write_enable;
-        if (zw === false) {
+        if (d3d.z_write_enable === false) {
           params.depthWrite = false;
         }
       }
@@ -897,27 +894,6 @@ class XAPRuntime {
     }
   }
 
-  evalScript(code) {
-    try {
-      return (0, eval)(code);
-    } catch (e) {
-      // Suppress missing-reference errors from system stubs
-      if (!e.message.includes('is not defined')) {
-        _warn('eval error:', e.message);
-      }
-    }
-  }
-
-  callFunction(name, ...args) {
-    if (typeof window[name] === 'function') {
-      try {
-        return window[name](...args);
-      } catch (e) {
-        _warn(`Error calling ${name}:`, e.message);
-      }
-    }
-  }
-
   // ========================================================================
   // Input System (Keyboard → Joystick events)
   // ========================================================================
@@ -1020,11 +996,6 @@ class XAPRuntime {
   // ========================================================================
   // Animation System
   // ========================================================================
-
-  addAnimation(target, prop, to, duration) {
-    const from = target[prop];
-    this.animations.push({ target, prop, from, to, duration, elapsed: 0 });
-  }
 
   updateAnimations(dt) {
     for (let i = this.animations.length - 1; i >= 0; i--) {

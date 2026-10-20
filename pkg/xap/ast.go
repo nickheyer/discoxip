@@ -17,12 +17,12 @@ const (
 
 // Value is a typed property value.
 type Value struct {
-	Kind   ValueKind
-	Num    float64
-	Str    string
-	Bool   bool
-	Node   *Node
-	Array  []Value
+	Kind  ValueKind
+	Num   float64
+	Str   string
+	Bool  bool
+	Node  *Node
+	Array []Value
 }
 
 // Field is a named property with one or more values.
@@ -45,7 +45,7 @@ type Node struct {
 type SceneItemKind int
 
 const (
-	SNode   SceneItemKind = iota
+	SNode SceneItemKind = iota
 	SScript
 )
 
@@ -118,18 +118,6 @@ func (n *Node) Floats(key string) []float64 {
 	return out
 }
 
-// Bool returns the first boolean value of the named field.
-func (n *Node) Bool(key string) (bool, bool) {
-	f := n.GetField(key)
-	if f == nil || len(f.Values) == 0 {
-		return false, false
-	}
-	if f.Values[0].Kind == VBool {
-		return f.Values[0].Bool, true
-	}
-	return false, false
-}
-
 // ChildNode returns the first node-valued field with the given key.
 func (n *Node) ChildNode(key string) *Node {
 	f := n.GetField(key)
@@ -140,17 +128,6 @@ func (n *Node) ChildNode(key string) *Node {
 		return f.Values[0].Node
 	}
 	return nil
-}
-
-// ChildrenByType returns all child nodes matching the given type name.
-func (n *Node) ChildrenByType(typeName string) []*Node {
-	var out []*Node
-	for _, c := range n.Children {
-		if c.TypeName == typeName {
-			out = append(out, c)
-		}
-	}
-	return out
 }
 
 // --- Scene convenience methods ---

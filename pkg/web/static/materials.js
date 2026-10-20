@@ -24,6 +24,7 @@ class CMaxMaterial {
     this.color1 = 0;         // packed ARGB
     this.color2 = 0;         // packed ARGB
     this.textureIndex = 0;
+    this.textureFile = null;
     this.colorBytes = null;  // [R,G,B,A] for flatcolor/panel/backing types
     this.keyMode1 = 0;
     this.keyMode2 = 0;
@@ -31,25 +32,6 @@ class CMaxMaterial {
     // Register in global table
     materials[name] = this;
     materialList.push(this);
-  }
-
-  // Unpack color1 as ARGB components
-  getARGB() {
-    if (this.colorBytes) {
-      return {
-        r: this.colorBytes[0],
-        g: this.colorBytes[1],
-        b: this.colorBytes[2],
-        a: this.colorBytes[3]
-      };
-    }
-    const c = this.color1 >>> 0;
-    return {
-      a: (c >> 24) & 0xFF,
-      r: (c >> 16) & 0xFF,
-      g: (c >> 8) & 0xFF,
-      b: c & 0xFF
-    };
   }
 }
 
@@ -107,8 +89,7 @@ function _applyCombiner(m) {
   const c1 = _unpackARGB(m.color1);
   const c2 = _unpackARGB(m.color2);
 
-  // T = texture sample from bound material texture (index 1=gradient, 2=chrome,
-  // 3=cellwall). Blocked on GAPS.md #6 — textures not loaded yet.
+  // Uniform midpoint sample stands in for the per pixel texture value
   const t = 0.5;
 
   const r = Math.round(c1.r + (c2.r - c1.r) * t);
@@ -232,45 +213,16 @@ export function applyMaterial(name) {
   return fn(m);
 }
 
-// Look up a material by name
-export function getMaterial(name) {
-  return materials[name] || null;
-}
-
-// Get the vtable type for a material (e.g. 'backing', 'combiner', 'flatcolor')
-export function getVtable(name) {
-  const m = materials[name];
-  return m ? m.vtable : null;
-}
-
-// Get the material's own texture index (0 = none, 1 = combiner gradient,
-// 2 = chrome/steel, 3 = cellwall). The NV2A register combiner binds this
-// texture via LookupTexture(this+0x14) before rendering.
-export function getTextureIndex(name) {
-  const m = materials[name];
-  return m ? m.textureIndex : 0;
-}
-
-
-export function getMaterialCount() {
-  return materialList.length;
-}
-
-// Get the resolved D3D blend state for a material.
-// Returns { alphaBlendEnable, srcBlend, dstBlend, zWriteEnable,
-//           usesCombiner, usesTextureFactor, textureFile }
+// Returns the d3d_state object resolved from the Apply trace or null
 export function getD3DState(name) {
   const m = materials[name];
   return m ? m._d3dState : null;
 }
 
-// Get the texture filename for a material's texture index.
-// Index 2 = steel.png, 3 = cellwall.png, 1 = GPU gradient (no file).
-const _textureFiles = { 2: 'steel', 3: 'cellwall' };
+// Returns the extracted texture filename bound to a material or null
 export function getTextureFile(name) {
   const m = materials[name];
-  if (!m || !m.textureIndex) return null;
-  return _textureFiles[m.textureIndex] || null;
+  return m ? m.textureFile : null;
 }
 
 // --- Load materials from extracted JSON (materials.json) ---
@@ -285,6 +237,7 @@ export function loadFromJSON(jsonArray) {
     m.color1 = (entry.color1 || 0) >>> 0;
     m.color2 = (entry.color2 || 0) >>> 0;
     m.textureIndex = entry.texture_index || 0;
+    m.textureFile = entry.texture_file || null;
     m.keyMode1 = entry.key_mode1 || 0;
     m.keyMode2 = entry.key_mode2 || 0;
     m.colorBytes = [entry.r, entry.g, entry.b, entry.a];
@@ -313,39 +266,7 @@ export function loadFromJSON(jsonArray) {
       if (pairs.length >= 2) m._colorPairs = pairs;
     }
 
-    // Resolve D3D blend state from Apply trace.
-    // SetRenderState calls have args = [Value, State] (reversed push order).
-    // Xbox render state IDs (from cxbx XbD3D8Types.h):
-    //   59=ALPHABLENDENABLE, 62/131=SRCBLEND, 63/132=DESTBLEND,
-    //   64=ZWRITEENABLE, 128=TEXTUREFACTOR
-    // Xbox blend factors (OpenGL-style): 0=ZERO, 1=ONE, 0x302=SRCALPHA,
-    //   0x303=INVSRCALPHA
-    if (entry.d3d_state) {
-      // New format: pre-resolved by Go
-      m._d3dState = entry.d3d_state;
-    } else {
-      // Resolve from raw Apply trace
-      const d3d = {
-        alphaBlendEnable: false, srcBlend: 0, dstBlend: 0,
-        zWriteEnable: null, usesCombiner: false, usesTextureFactor: false,
-      };
-      const apply = entry.apply || [];
-      for (const call of apply) {
-        if (call.fn === 'SetRegisterCombinerConstants') {
-          d3d.usesCombiner = true;
-        }
-        if (call.fn && (call.fn.includes('SetRenderState') || call.fn === 'sub_0002989C' || call.fn === 'CMaxMaterial::SetRenderState') && call.args) {
-          const state = call.args[call.args.length - 1];
-          const value = call.args.length >= 2 ? call.args[0] : 0;
-          if (state === 59) d3d.alphaBlendEnable = value !== 0;
-          if (state === 62 || state === 131) d3d.srcBlend = value;
-          if (state === 63 || state === 132) d3d.dstBlend = value;
-          if (state === 64) d3d.zWriteEnable = value !== 0;
-          if (state === 128) d3d.usesTextureFactor = true;
-        }
-      }
-      m._d3dState = d3d;
-    }
+    m._d3dState = entry.d3d_state;
   }
   return materialList.length;
 }

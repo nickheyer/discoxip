@@ -106,9 +106,6 @@ func Load(xapPath string) (*Scene, error) {
 		s.Meshes[url] = s.resolveMesh(url, manifest, archiveName)
 	}
 
-
-
-
 	// Apply vertex colors from .xm files to resolved meshes
 	s.applyVertexColors()
 

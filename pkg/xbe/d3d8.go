@@ -50,9 +50,9 @@ var D3DTextureStageStates = map[uint32]string{
 	6:  "X_D3DTSS_MIPMAPLODBIAS",
 	7:  "X_D3DTSS_MAXMIPLEVEL",
 	8:  "X_D3DTSS_MAXANISOTROPY",
-	9:  "X_D3DTSS_COLORKEYOP",  // Xbox ext
-	10: "X_D3DTSS_COLORSIGN",   // Xbox ext
-	11: "X_D3DTSS_ALPHAKILL",   // Xbox ext
+	9:  "X_D3DTSS_COLORKEYOP", // Xbox ext
+	10: "X_D3DTSS_COLORSIGN",  // Xbox ext
+	11: "X_D3DTSS_ALPHAKILL",  // Xbox ext
 	12: "X_D3DTSS_COLOROP",
 	13: "X_D3DTSS_COLORARG0",
 	14: "X_D3DTSS_COLORARG1",
@@ -120,8 +120,8 @@ var D3DTextureArgs = map[uint32]string{
 
 // D3DTA modifier flags (OR'd with the source value)
 const (
-	D3DTA_COMPLEMENT      = 0x10 // 1 - arg
-	D3DTA_ALPHAREPLICATE  = 0x20 // replicate alpha to all channels
+	D3DTA_COMPLEMENT     = 0x10 // 1 - arg
+	D3DTA_ALPHAREPLICATE = 0x20 // replicate alpha to all channels
 )
 
 // D3DBLEND — Xbox blend factor values (OpenGL-style constants).

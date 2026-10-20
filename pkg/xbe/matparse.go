@@ -14,26 +14,26 @@ import (
 // The resolved values are computed by the Go decompiler from the binary —
 // the JavaScript runtime just reads them directly.
 type DecodedMaterial struct {
-	Name         string       `json:"name"`
-	Type         string       `json:"type"`                  // constructor variant name
-	ShaderCfg    uint32       `json:"shader_cfg"`            // shader configuration flags
-	R            uint8        `json:"r"`                     // resolved diffuse red (0-255)
-	G            uint8        `json:"g"`                     // resolved diffuse green (0-255)
-	B            uint8        `json:"b"`                     // resolved diffuse blue (0-255)
-	A            uint8        `json:"a"`                     // resolved alpha (0-255)
-	Color1       uint32       `json:"color1"`                // primary packed ARGB (from ctor or Apply writes)
-	Color2       uint32       `json:"color2"`                // secondary packed ARGB
-	TextureIndex uint32       `json:"texture_index"`         // material texture (0=none, 1=gradient, 2=chrome, 3=cellwall)
-	TextureFile  string       `json:"texture_file,omitempty"` // resolved texture filename (e.g. "steel.png")
-	KeyMode1     uint8        `json:"key_mode1,omitempty"`   // key mode byte 1 (this+0x220)
-	KeyMode2     uint8        `json:"key_mode2,omitempty"`   // key mode byte 2 (this+0x221)
-	CtorVA       uint32       `json:"ctor_va"`               // constructor address
-	VtableVA     uint32       `json:"vtable_va"`             // vtable pointer set by constructor
-	ApplyVA      uint32       `json:"apply_va"`              // Apply method address (vtable slot 0)
-	CtorArgs     []uint32     `json:"ctor_args,omitempty"`   // raw constructor arguments (reversed push order)
-	Apply        []D3DCall    `json:"apply"`                 // D3D calls made by Apply method
-	InitWrites   []MemWrite   `json:"init_writes,omitempty"` // immediate writes to this+offset in Apply
-	D3DState     *D3DState    `json:"d3d_state,omitempty"`   // resolved D3D render state from Apply trace
+	Name         string     `json:"name"`
+	Type         string     `json:"type"`                   // constructor variant name
+	ShaderCfg    uint32     `json:"shader_cfg"`             // shader configuration flags
+	R            uint8      `json:"r"`                      // resolved diffuse red (0-255)
+	G            uint8      `json:"g"`                      // resolved diffuse green (0-255)
+	B            uint8      `json:"b"`                      // resolved diffuse blue (0-255)
+	A            uint8      `json:"a"`                      // resolved alpha (0-255)
+	Color1       uint32     `json:"color1"`                 // primary packed ARGB (from ctor or Apply writes)
+	Color2       uint32     `json:"color2"`                 // secondary packed ARGB
+	TextureIndex uint32     `json:"texture_index"`          // material texture (0=none, 1=gradient, 2=chrome, 3=cellwall)
+	TextureFile  string     `json:"texture_file,omitempty"` // resolved texture filename (e.g. "steel.png")
+	KeyMode1     uint8      `json:"key_mode1,omitempty"`    // key mode byte 1 (this+0x220)
+	KeyMode2     uint8      `json:"key_mode2,omitempty"`    // key mode byte 2 (this+0x221)
+	CtorVA       uint32     `json:"ctor_va"`                // constructor address
+	VtableVA     uint32     `json:"vtable_va"`              // vtable pointer set by constructor
+	ApplyVA      uint32     `json:"apply_va"`               // Apply method address (vtable slot 0)
+	CtorArgs     []uint32   `json:"ctor_args,omitempty"`    // raw constructor arguments (reversed push order)
+	Apply        []D3DCall  `json:"apply"`                  // D3D calls made by Apply method
+	InitWrites   []MemWrite `json:"init_writes,omitempty"`  // immediate writes to this+offset in Apply
+	D3DState     *D3DState  `json:"d3d_state,omitempty"`    // resolved D3D render state from Apply trace
 }
 
 // D3DState holds the resolved D3D render state extracted from a material's
@@ -41,23 +41,23 @@ type DecodedMaterial struct {
 // SetTextureStageState calls in the XBE binary, mapped using the Xbox D3D8
 // enum values from cxbx-reloaded.
 type D3DState struct {
-	AlphaBlendEnable bool   `json:"alpha_blend_enable"`
-	SrcBlend         uint32 `json:"src_blend"`                    // Xbox blend factor (0x000=ZERO, 0x001=ONE, 0x302=SRCALPHA, etc.)
-	DstBlend         uint32 `json:"dst_blend"`                    // Xbox blend factor
-	SrcBlendName     string `json:"src_blend_name,omitempty"`     // resolved name (e.g. "D3DBLEND_SRCALPHA")
-	DstBlendName     string `json:"dst_blend_name,omitempty"`     // resolved name
-	ZWriteEnable     *bool  `json:"z_write_enable,omitempty"`     // nil = not set by Apply
-	UsesCombiner     bool   `json:"uses_combiner"`                // true if Apply calls SetRegisterCombinerConstants
-	UsesTextureFactor bool  `json:"uses_texture_factor"`          // true if Apply sets D3DRS_TEXTUREFACTOR
+	AlphaBlendEnable  bool   `json:"alpha_blend_enable"`
+	SrcBlend          uint32 `json:"src_blend"`                // Xbox blend factor (0x000=ZERO, 0x001=ONE, 0x302=SRCALPHA, etc.)
+	DstBlend          uint32 `json:"dst_blend"`                // Xbox blend factor
+	SrcBlendName      string `json:"src_blend_name,omitempty"` // resolved name (e.g. "D3DBLEND_SRCALPHA")
+	DstBlendName      string `json:"dst_blend_name,omitempty"` // resolved name
+	ZWriteEnable      *bool  `json:"z_write_enable,omitempty"` // nil = not set by Apply
+	UsesCombiner      bool   `json:"uses_combiner"`            // true if Apply calls SetRegisterCombinerConstants
+	UsesTextureFactor bool   `json:"uses_texture_factor"`      // true if Apply sets D3DRS_TEXTUREFACTOR
 }
 
 // D3DCall is a D3D API call extracted from the Apply method.
 type D3DCall struct {
-	Function string   `json:"fn"`              // resolved function name
-	TargetVA uint32   `json:"target_va"`       // call target address
-	Args     []uint32 `json:"args,omitempty"`  // immediate arguments (from preceding pushes)
-	ECX      int32    `json:"ecx"`   // ECX value at call site (-1 = unknown)
-	EDX      int32    `json:"edx"`   // EDX value at call site (-1 = unknown)
+	Function string   `json:"fn"`             // resolved function name
+	TargetVA uint32   `json:"target_va"`      // call target address
+	Args     []uint32 `json:"args,omitempty"` // immediate arguments (from preceding pushes)
+	ECX      int32    `json:"ecx"`            // ECX value at call site (-1 = unknown)
+	EDX      int32    `json:"edx"`            // EDX value at call site (-1 = unknown)
 }
 
 // MemWrite is an immediate value written to a this+offset field in the Apply method.
@@ -597,11 +597,14 @@ func TraceApplyMethods(img *Image, d *Disassembly, materials []DecodedMaterial) 
 // 2. All MOV [esi/ecx+offset], imm32 instructions (this->field = value)
 //
 // For SetTextureStageState_Deferred, the calling convention is:
-//   ECX = texture stage number (0-3)
-//   EDX = state type index (0-31, Xbox D3DTSS enum)
-//   stack arg0 = value
+//
+//	ECX = texture stage number (0-3)
+//	EDX = state type index (0-31, Xbox D3DTSS enum)
+//	stack arg0 = value
+//
 // For SetRenderState wrappers (sub_0002989C):
-//   stack args = (value, state_type) or (state_type) with value in register
+//
+//	stack args = (value, state_type) or (state_type) with value in register
 func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 	var calls []D3DCall
 	var writes []MemWrite

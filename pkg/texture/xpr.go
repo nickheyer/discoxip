@@ -20,13 +20,13 @@ type XPRHeader struct {
 
 // TextureInfo holds decoded texture metadata.
 type TextureInfo struct {
-	Width       int
-	Height      int
-	Format      PixelFormat
-	MipLevels   int
-	HeaderSize  int
-	DataSize    int
-	FormatReg   uint32 // raw NV2A format register
+	Width      int
+	Height     int
+	Format     PixelFormat
+	MipLevels  int
+	HeaderSize int
+	DataSize   int
+	FormatReg  uint32 // raw NV2A format register
 }
 
 // Texture is a parsed XPR0 texture with metadata and raw data.

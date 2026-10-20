@@ -1,30 +1,42 @@
-APP_NAME := discoxip
+APP       := discoxip
 BUILD_DIR := build
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
-LDFLAGS := -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=$(VERSION) \
-                      -X github.com/nickheyer/discoxip/pkg/cli.Commit=$(COMMIT)"
-GO_RUN := go run $(LDFLAGS) ./cmd/discoxip
+BIN       := $(BUILD_DIR)/$(APP)
+SRC       ?= sample/4304
+OUT       ?= $(BUILD_DIR)/dev
+PORT      ?= 8000
+XBE       ?= $(firstword $(wildcard $(SRC)/*.xbe))
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+LDFLAGS   := -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=$(VERSION) -X github.com/nickheyer/discoxip/pkg/cli.Commit=$(COMMIT)"
 
-.PHONY: all build clean test fmt serve extract
+.PHONY: all build dev pipeline decompile serve test vet fmt clean
 
 all: build
 
-build: clean
+build:
 	@mkdir -p $(BUILD_DIR)
-	go build $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME) ./cmd/discoxip
+	go build $(LDFLAGS) -o $(BIN) ./cmd/discoxip
 
-clean:
-	rm -rf $(BUILD_DIR)
+dev: pipeline decompile serve
+
+pipeline: build
+	rm -rf $(OUT)
+	$(BIN) build $(SRC) -o $(OUT)
+
+decompile: build
+	$(BIN) xbe disasm $(XBE) -o $(OUT)/$(notdir $(basename $(XBE))).c
+
+serve:
+	cd $(OUT)/web && python3 -m http.server $(PORT)
 
 test:
 	go test ./...
 
+vet:
+	go vet ./...
+
 fmt:
 	go fmt ./...
 
-extract: build
-	$(GO_RUN) build $(SRC) -o $(BUILD_DIR)/$(SRC)
-
-serve: extract
-	cd $(BUILD_DIR)/$(SRC)/web && python3 -m http.server
+clean:
+	rm -rf $(BUILD_DIR)

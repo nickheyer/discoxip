@@ -526,7 +526,9 @@ func clampSample(s int32) int16 {
 // decodeXboxADPCM converts Xbox ADPCM (format 0x0069) WAV data to PCM16 WAV.
 //
 // Xbox ADPCM block layout (e.g. stereo, blockAlign=72):
-//   [ch0 header 4B][ch1 header 4B][interleaved nibble data 64B]
+//
+//	[ch0 header 4B][ch1 header 4B][interleaved nibble data 64B]
+//
 // Header: int16 predictor, uint8 stepIndex, uint8 reserved
 // Data: groups of (channels × 4 bytes), each 4 bytes = 8 nibbles = 8 samples.
 // The predictor seeds the decoder but is NOT emitted as an output sample.
