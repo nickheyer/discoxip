@@ -9,6 +9,7 @@ import { DevicePipeline, describeGeometry } from './pipeline.js';
 const DATA_BASE = 'data';
 
 // Capture console before XAP scripts can clobber globals
+const nativeConsole = console;
 const _console = { log: console.log, warn: console.warn, error: console.error };
 const _log = _console.log.bind(console);
 const _warn = _console.warn.bind(console);
@@ -443,6 +444,7 @@ class XAPRuntime {
         if (!geometry) return;
         const mesh = new THREE.Mesh(geometry, material);
         mesh.name = geomData.def || geomFields.url;
+        mesh.frustumCulled = false;
         group.add(mesh);
         node._mesh = mesh;
         const entry = geometry.userData.entry;
@@ -476,6 +478,7 @@ class XAPRuntime {
     if (geomFields.radius !== undefined) {
       const geometry = this.sphereGeometry(asNumber(geomFields.radius), geomFields.slices, geomFields.stacks);
       const sphere = new THREE.Mesh(geometry, material);
+      sphere.frustumCulled = false;
       group.add(sphere);
       node._mesh = sphere;
       const sb = this.derived.draw.sphere;
@@ -613,12 +616,14 @@ class XAPRuntime {
     const loader = new THREE.TextureLoader();
     const tex = loader.load(
       `${DATA_BASE}/textures/${base}.png`,
-      (t) => { t.colorSpace = THREE.SRGBColorSpace; },
+      undefined,
       undefined,
       () => { _warn(`[XAP] Texture not found: ${base}.png`); }
     );
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
+    // The device sampled texels as stored, with the first image row at v = 0.
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.flipY = false;
+    tex.generateMipmaps = true;
     this.textureCache[base] = tex;
     return tex;
   }
@@ -723,8 +728,9 @@ class XAPRuntime {
   // ========================================================================
 
   executeScripts() {
-    // Expose all DEF'd node proxies as window globals
+    // Expose all DEF'd node proxies as window globals, keeping the browser console reachable
     for (const [name, node] of Object.entries(this.nodes)) {
+      if (name === 'console') continue;
       window[name] = node.proxy;
     }
 
@@ -787,6 +793,10 @@ class XAPRuntime {
       }
     }
     _log(`[XAP] Scripts: ${ok} ok, ${fail} failed, ${skipped} skipped (of ${this.pendingScripts.length})`);
+    if (window.console !== nativeConsole) {
+      window.console = nativeConsole;
+      _warn('[XAP] scripts replaced the console, restored it');
+    }
   }
 
   // Inject system API methods on nodes based on their type
@@ -1565,6 +1575,7 @@ class TextRenderer {
     geometry.setIndex(allIndices);
 
     const textMesh = new THREE.Mesh(geometry, this.material);
+    textMesh.frustumCulled = false;
     this.mesh.add(textMesh);
   }
 }

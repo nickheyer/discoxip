@@ -94,8 +94,6 @@ export class DevicePipeline {
       tex.wrapT = wrapV;
       tex.needsUpdate = true;
     }
-    tex.flipY = false;
-    tex.colorSpace = THREE.SRGBColorSpace;
     return tex;
   }
 
@@ -223,7 +221,7 @@ export class DevicePipeline {
       for (let i = 0; i < 4; i++) vertex += a['texcoord' + i] !== undefined ? `vT${i} = vec4(a_${a['texcoord' + i]}, 0.0, 1.0);\n` : `vT${i} = vec4(0.0, 0.0, 0.0, 1.0);\n`;
       vertex += '}\n';
     }
-    let fragment = 'precision mediump float;\n' + varyings + 'uniform vec4 u_tfactor;\n';
+    let fragment = 'precision highp float;\n' + varyings + 'uniform vec4 u_tfactor;\n';
     for (const st of plan.stages) {
       if (st.texture) { fragment += `uniform sampler2D u_tex${st.index};\n`; uniformNames.push('u_tex' + st.index); }
       if (st.transform) { fragment += `uniform mat4 u_texXf${st.index};\n`; uniformNames.push('u_texXf' + st.index); }
