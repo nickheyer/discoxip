@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"math"
 	"os"
 	"path/filepath"
@@ -16,12 +18,11 @@ import (
 	"github.com/nickheyer/discoxip/pkg/xbe"
 )
 
-//go:embed static/index.html static/runtime.js static/materials.js
+//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js
 var staticFiles embed.FS
 
-// Export generates a self-contained web application from extracted XIP data.
+// Export generates a self-contained web application from extracted XIP data and the dashboard executable.
 func Export(inputDir, outputDir string) error {
-	// Create output directories
 	for _, dir := range []string{
 		outputDir,
 		filepath.Join(outputDir, "data", "scenes"),
@@ -33,7 +34,6 @@ func Export(inputDir, outputDir string) error {
 		}
 	}
 
-	// Find all XAP files
 	xapFiles, err := filepath.Glob(filepath.Join(inputDir, "*.xap"))
 	if err != nil {
 		return err
@@ -41,28 +41,34 @@ func Export(inputDir, outputDir string) error {
 	if len(xapFiles) == 0 {
 		return fmt.Errorf("web: no .xap files found in %s", inputDir)
 	}
-
 	fmt.Fprintf(os.Stderr, "Found %d XAP scene(s)\n", len(xapFiles))
 
-	// Build config: archive mappings, inline mappings
+	xbeFiles, _ := filepath.Glob(filepath.Join(inputDir, "*.xbe"))
+	if len(xbeFiles) != 1 {
+		return fmt.Errorf("web: expected one .xbe in %s, found %d", inputDir, len(xbeFiles))
+	}
+	fmt.Fprintf(os.Stderr, "Deriving render model from %s\n", filepath.Base(xbeFiles[0]))
+	layouts, model, err := scene.LoadLayouts(xbeFiles[0])
+	if err != nil {
+		return fmt.Errorf("web: %w", err)
+	}
+	if err := writeRenderModel(model, filepath.Join(outputDir, "data")); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "  %d materials, %d vertex programs, %d procedural textures\n", len(model.Materials), len(model.Programs), len(model.Textures))
+
 	config := buildConfig(xapFiles)
-
-	// Global mesh manifest
 	meshManifest := make(map[string]meshEntry)
+	var missing []string
 
-	// Process each XAP
 	for _, xapPath := range xapFiles {
 		baseName := strings.TrimSuffix(filepath.Base(xapPath), ".xap")
 		fmt.Fprintf(os.Stderr, "  Processing %s\n", baseName)
 
-		// Parse XAP scene graph
 		ast, err := xap.ParseFile(xapPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "    warning: parse error: %v\n", err)
-			continue
+			return fmt.Errorf("web: parsing %s: %w", baseName, err)
 		}
-
-		// Serialize scene to JSON
 		sceneJSON := serializeScene(ast)
 		jsonData, err := json.MarshalIndent(sceneJSON, "", "  ")
 		if err != nil {
@@ -73,37 +79,33 @@ func Export(inputDir, outputDir string) error {
 			return err
 		}
 
-		// Resolve and export meshes
-		s, err := scene.Load(xapPath)
+		s, err := scene.Load(xapPath, layouts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "    warning: scene load error: %v\n", err)
-			continue
+			return fmt.Errorf("web: %s: %w", baseName, err)
 		}
-
+		for _, url := range s.Missing {
+			fmt.Fprintf(os.Stderr, "    missing: %s is packed in no extracted archive\n", url)
+			missing = append(missing, baseName+":"+url)
+		}
 		archiveName := extractArchiveName(baseName)
 		for url, md := range s.Meshes {
-			if len(md.Vertices) == 0 {
+			if md.Count == 0 {
 				continue
 			}
 			key := archiveName + ":" + url
 			if _, exists := meshManifest[key]; exists {
 				continue
 			}
-
 			binName := sanitizeFilename(archiveName+"_"+strings.TrimSuffix(url, filepath.Ext(url))) + ".bin"
 			binPath := filepath.Join(outputDir, "data", "meshes", binName)
-			hasColors := exportMeshBinary(binPath, md)
-
-			meshManifest[key] = meshEntry{
-				File:        binName,
-				VertexCount: len(md.Vertices),
-				IndexCount:  len(md.Indices),
-				HasColors:   hasColors,
+			entry, err := exportMeshBinary(binPath, md, layouts[md.Format])
+			if err != nil {
+				return fmt.Errorf("web: mesh %s: %w", url, err)
 			}
+			meshManifest[key] = entry
 		}
 	}
 
-	// Write mesh manifest
 	manifestData, err := json.MarshalIndent(meshManifest, "", "  ")
 	if err != nil {
 		return err
@@ -111,42 +113,21 @@ func Export(inputDir, outputDir string) error {
 	if err := os.WriteFile(filepath.Join(outputDir, "data", "meshes", "manifest.json"), manifestData, 0o644); err != nil {
 		return err
 	}
+	config.Missing = missing
 
-	// Copy textures
 	texCount := copyTextures(inputDir, filepath.Join(outputDir, "data", "textures"))
 	fmt.Fprintf(os.Stderr, "  Copied %d textures\n", texCount)
 
-	// Extract materials from XBE if present
-	xbeFiles, _ := filepath.Glob(filepath.Join(inputDir, "*.xbe"))
-	if len(xbeFiles) == 0 {
-		// Check parent directory (XBE is alongside XIP files, not in extracted output)
-		xbeFiles, _ = filepath.Glob(filepath.Join(filepath.Dir(inputDir), "*.xbe"))
-	}
-	if len(xbeFiles) > 0 {
-		materials, err := xbe.ExtractMaterialsFromXBE(xbeFiles[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: XBE material extraction: %v\n", err)
-		} else {
-			matData, _ := json.MarshalIndent(materials, "", "  ")
-			matPath := filepath.Join(outputDir, "data", "materials.json")
-			os.WriteFile(matPath, matData, 0o644)
-			fmt.Fprintf(os.Stderr, "  Extracted %d materials from %s\n", len(materials), filepath.Base(xbeFiles[0]))
-		}
-	}
-
-	// Copy audio files
 	audioCount := copyAudio(inputDir, filepath.Join(outputDir, "data"))
 	if audioCount > 0 {
 		fmt.Fprintf(os.Stderr, "  Copied %d audio files\n", audioCount)
 	}
 
-	// Export fonts
 	fontCount := exportFonts(inputDir, filepath.Join(outputDir, "data", "fonts"))
 	if fontCount > 0 {
 		fmt.Fprintf(os.Stderr, "  Exported %d fonts\n", fontCount)
 	}
 
-	// Write config
 	configData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
@@ -155,22 +136,48 @@ func Export(inputDir, outputDir string) error {
 		return err
 	}
 
-	// Write static files
-	for _, name := range []string{"static/index.html", "static/runtime.js", "static/materials.js"} {
+	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js"} {
 		data, err := staticFiles.ReadFile(name)
 		if err != nil {
 			return fmt.Errorf("web: reading embedded %s: %w", name, err)
 		}
-		outName := filepath.Base(name)
-		if err := os.WriteFile(filepath.Join(outputDir, outName), data, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(outputDir, filepath.Base(name)), data, 0o644); err != nil {
 			return err
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "Web app exported to %s\n", outputDir)
-	fmt.Fprintf(os.Stderr, "  Scenes: %d, Meshes: %d, Textures: %d\n",
-		len(xapFiles), len(meshManifest), texCount)
-	fmt.Fprintf(os.Stderr, "  Run: cd %s && python3 -m http.server\n", outputDir)
+	fmt.Fprintf(os.Stderr, "  Scenes: %d, Meshes: %d, Textures: %d\n", len(xapFiles), len(meshManifest), texCount)
+	return nil
+}
+
+// Writes render.json and the procedural textures the executable generates at runtime
+func writeRenderModel(model *xbe.RenderModel, dataDir string) error {
+	data, err := json.Marshal(model)
+	if err != nil {
+		return fmt.Errorf("web: encoding render model: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "render.json"), data, 0o644); err != nil {
+		return err
+	}
+	for _, tex := range model.Textures {
+		img := image.NewNRGBA(image.Rect(0, 0, tex.Width, tex.Height))
+		for i, px := range tex.Pixels {
+			img.Pix[i*4+0] = uint8(px >> 16)
+			img.Pix[i*4+1] = uint8(px >> 8)
+			img.Pix[i*4+2] = uint8(px)
+			img.Pix[i*4+3] = uint8(px >> 24)
+		}
+		f, err := os.Create(filepath.Join(dataDir, "textures", fmt.Sprintf("proc_%08X.png", tex.VA)))
+		if err != nil {
+			return err
+		}
+		if err := png.Encode(f, img); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+	}
 	return nil
 }
 
@@ -181,6 +188,7 @@ type exportConfig struct {
 	Archives map[string]string `json:"archives"`
 	Inlines  map[string]string `json:"inlines"`
 	Scenes   []string          `json:"scenes"`
+	Missing  []string          `json:"missing"`
 }
 
 func buildConfig(xapFiles []string) exportConfig {
@@ -393,71 +401,48 @@ func serializeValue(v xap.Value) interface{} {
 // --- Mesh binary export ---
 
 type meshEntry struct {
-	File        string `json:"file"`
-	VertexCount int    `json:"vertexCount"`
-	IndexCount  int    `json:"indexCount"`
-	HasColors   bool   `json:"hasColors"`
+	File        string          `json:"file"`
+	VertexCount int             `json:"vertexCount"`
+	IndexCount  int             `json:"indexCount"`
+	Format      uint32          `json:"format"`
+	Stride      int             `json:"stride"`
+	Attributes  []meshAttribute `json:"attributes"`
 }
 
-func exportMeshBinary(path string, md *scene.MeshData) bool {
+type meshAttribute struct {
+	Register int    `json:"register"`
+	Semantic string `json:"semantic"`
+	Type     string `json:"type"`
+	Offset   int    `json:"offset"`
+	Comps    int    `json:"comps"`
+}
+
+// Writes every declared attribute as float32 arrays followed by uint16 indices
+func exportMeshBinary(path string, md *scene.MeshData, layout scene.Layout) (meshEntry, error) {
 	f, err := os.Create(path)
 	if err != nil {
-		return false
+		return meshEntry{}, err
 	}
 	defer f.Close()
-
-	hasColors := false
-	for _, v := range md.Vertices {
-		if v.HasColor {
-			hasColors = true
-			break
-		}
-	}
-
+	entry := meshEntry{File: filepath.Base(path), VertexCount: md.Count, IndexCount: len(md.Indices), Format: md.Format, Stride: layout.Stride}
 	buf := make([]byte, 4)
-
-	// Positions
-	for _, v := range md.Vertices {
-		for _, c := range v.Pos {
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(c))
-			f.Write(buf)
-		}
-	}
-
-	// Normals
-	for _, v := range md.Vertices {
-		for _, c := range v.Normal {
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(c))
-			f.Write(buf)
-		}
-	}
-
-	// UVs
-	for _, v := range md.Vertices {
-		for _, c := range v.UV {
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(c))
-			f.Write(buf)
-		}
-	}
-
-	// Colors (if present)
-	if hasColors {
-		for _, v := range md.Vertices {
-			for _, c := range v.Color {
-				binary.LittleEndian.PutUint32(buf, math.Float32bits(c))
-				f.Write(buf)
+	for _, a := range md.Attributes {
+		entry.Attributes = append(entry.Attributes, meshAttribute{Register: a.Element.Register, Semantic: layout.Semantics[a.Element.Register], Type: a.Element.Type, Offset: a.Element.Offset, Comps: a.Element.Comps})
+		for _, v := range a.Data {
+			binary.LittleEndian.PutUint32(buf, math.Float32bits(v))
+			if _, err := f.Write(buf); err != nil {
+				return meshEntry{}, err
 			}
 		}
 	}
-
-	// Indices
 	buf2 := make([]byte, 2)
 	for _, idx := range md.Indices {
 		binary.LittleEndian.PutUint16(buf2, idx)
-		f.Write(buf2)
+		if _, err := f.Write(buf2); err != nil {
+			return meshEntry{}, err
+		}
 	}
-
-	return hasColors
+	return entry, nil
 }
 
 // --- Texture copy ---

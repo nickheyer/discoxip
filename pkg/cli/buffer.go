@@ -1,18 +1,21 @@
 package cli
 
 import (
-	"encoding/hex"
+	"bufio"
 	"fmt"
 	"os"
-	"text/tabwriter"
+	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/buffer"
+	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/spf13/cobra"
 )
 
-var bufferDumpLimit int
-var bufferExportFormat string
-var bufferExportOutput string
+var (
+	bufferDumpLimit    int
+	bufferExportOutput string
+	bufferXBE          string
+)
 
 func init() {
 	bufferCmd := &cobra.Command{
@@ -20,32 +23,32 @@ func init() {
 		Short: "Inspect and export vertex/index buffers",
 	}
 
-	// buffer info
 	infoCmd := &cobra.Command{
 		Use:   "info <file.vb>",
-		Short: "Display vertex buffer header and format info",
+		Short: "Display vertex buffer header and stride",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runBufferInfo,
 	}
 
-	// buffer dump
 	dumpCmd := &cobra.Command{
 		Use:   "dump <file.vb>",
-		Short: "Dump decoded vertex data",
+		Short: "Dump vertex data decoded through the executable's declaration",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runBufferDump,
 	}
 	dumpCmd.Flags().IntVar(&bufferDumpLimit, "limit", 0, "max vertices to print (0 = all)")
+	dumpCmd.Flags().StringVar(&bufferXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
+	dumpCmd.MarkFlagRequired("xbe")
 
-	// buffer export
 	exportCmd := &cobra.Command{
 		Use:   "export <file.vb> <file.ib>",
-		Short: "Export vertex+index buffer pair to mesh format",
+		Short: "Export a vertex and index buffer pair to Wavefront OBJ",
 		Args:  cobra.ExactArgs(2),
 		RunE:  runBufferExport,
 	}
-	exportCmd.Flags().StringVarP(&bufferExportFormat, "format", "f", "obj", "output format (obj)")
 	exportCmd.Flags().StringVarP(&bufferExportOutput, "output", "o", "", "output file (default: stdout)")
+	exportCmd.Flags().StringVar(&bufferXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
+	exportCmd.MarkFlagRequired("xbe")
 
 	bufferCmd.AddCommand(infoCmd, dumpCmd, exportCmd)
 	rootCmd.AddCommand(bufferCmd)
@@ -56,103 +59,105 @@ func runBufferInfo(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	f := buffer.VertexFormat(vb.Header.FormatCode)
 	fmt.Printf("Vertex Buffer: %s\n", args[0])
 	fmt.Printf("  Vertex Count: %d\n", vb.Header.VertexCount)
-	fmt.Printf("  Format Code:  0x%08X (%s)\n", vb.Header.FormatCode, f)
+	fmt.Printf("  Format Code:  0x%08X\n", vb.Header.FormatCode)
 	fmt.Printf("  Stride:       %d bytes\n", vb.Stride)
-	fmt.Printf("  Data Size:    %d bytes\n", len(vb.RawData))
-
-	if vb.Vertices != nil {
-		fmt.Printf("  Decoded:      yes (%d vertices)\n", len(vb.Vertices))
-	} else if vb.Header.VertexCount > 0 {
-		fmt.Printf("  Decoded:      no (unknown format)\n")
-	}
-
 	return nil
 }
 
+// Decodes a vertex buffer through the layout the executable binds to its format
+func decodeBuffer(path string) (*buffer.VBReader, scene.Layout, []buffer.Attribute, error) {
+	vb, err := buffer.OpenVB(path)
+	if err != nil {
+		return nil, scene.Layout{}, nil, err
+	}
+	layouts, _, err := scene.LoadLayouts(bufferXBE)
+	if err != nil {
+		return nil, scene.Layout{}, nil, err
+	}
+	layout, ok := layouts[vb.Header.FormatCode]
+	if !ok {
+		return nil, scene.Layout{}, nil, fmt.Errorf("format 0x%08X is not declared by %s", vb.Header.FormatCode, bufferXBE)
+	}
+	attrs, err := vb.Decode(layout.Elements, layout.Stride)
+	if err != nil {
+		return nil, scene.Layout{}, nil, err
+	}
+	return vb, layout, attrs, nil
+}
+
 func runBufferDump(cmd *cobra.Command, args []string) error {
-	vb, err := buffer.OpenVB(args[0])
+	vb, layout, attrs, err := decodeBuffer(args[0])
 	if err != nil {
 		return err
 	}
-
-	if vb.Vertices != nil {
-		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "IDX\tPOS_X\tPOS_Y\tPOS_Z\tNRM_X\tNRM_Y\tNRM_Z\tUV_U\tUV_V")
-		limit := len(vb.Vertices)
-		if bufferDumpLimit > 0 && bufferDumpLimit < limit {
-			limit = bufferDumpLimit
-		}
-		for i := 0; i < limit; i++ {
-			v := vb.Vertices[i]
-			fmt.Fprintf(w, "%d\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n",
-				i, v.Pos[0], v.Pos[1], v.Pos[2],
-				v.Normal[0], v.Normal[1], v.Normal[2],
-				v.UV[0], v.UV[1])
-		}
-		if bufferDumpLimit > 0 && bufferDumpLimit < len(vb.Vertices) {
-			fmt.Fprintf(w, "... (%d more vertices)\n", len(vb.Vertices)-bufferDumpLimit)
-		}
-		return w.Flush()
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	var heads []string
+	for _, a := range attrs {
+		heads = append(heads, fmt.Sprintf("%s(v%d %s)", layout.Semantics[a.Element.Register], a.Element.Register, a.Element.Type))
 	}
-
-	// Unknown format — raw hex dump per stride
-	fmt.Printf("Unknown format 0x%08X — raw dump (stride %d):\n\n", vb.Header.FormatCode, vb.Stride)
-	limit := int(vb.Header.VertexCount)
-	if bufferDumpLimit > 0 && bufferDumpLimit < limit {
+	fmt.Fprintf(w, "format 0x%08X stride %d: %s\n", vb.Header.FormatCode, vb.Stride, strings.Join(heads, " "))
+	count := int(vb.Header.VertexCount)
+	limit := count
+	if bufferDumpLimit > 0 && bufferDumpLimit < count {
 		limit = bufferDumpLimit
 	}
 	for i := 0; i < limit; i++ {
-		off := i * vb.Stride
-		end := off + vb.Stride
-		if end > len(vb.RawData) {
-			break
+		fmt.Fprintf(w, "%6d:", i)
+		for _, a := range attrs {
+			c := a.Element.Comps
+			fmt.Fprintf(w, "  %v", a.Data[i*c:(i+1)*c])
 		}
-		fmt.Printf("[%5d] %s\n", i, hex.EncodeToString(vb.RawData[off:end]))
+		fmt.Fprintln(w)
+	}
+	if limit < count {
+		fmt.Fprintf(w, "... (%d more vertices)\n", count-limit)
 	}
 	return nil
 }
 
 func runBufferExport(cmd *cobra.Command, args []string) error {
-	vb, err := buffer.OpenVB(args[0])
+	_, layout, attrs, err := decodeBuffer(args[0])
 	if err != nil {
-		return fmt.Errorf("reading VB: %w", err)
+		return err
 	}
-	if vb.Vertices == nil {
-		return fmt.Errorf("cannot export: unknown vertex format 0x%08X (use buffer dump for raw data)", vb.Header.FormatCode)
-	}
-
 	ib, err := buffer.OpenIB(args[1])
 	if err != nil {
-		return fmt.Errorf("reading IB: %w", err)
+		return err
 	}
-
-	var w *os.File
+	md := &scene.MeshData{Attributes: attrs, Indices: ib.Indices}
+	for _, a := range attrs {
+		md.Count = len(a.Data) / a.Element.Comps
+	}
+	verts, err := md.Vertices(map[uint32]scene.Layout{md.Format: layout})
+	if err != nil {
+		return err
+	}
+	out := os.Stdout
 	if bufferExportOutput != "" {
-		w, err = os.Create(bufferExportOutput)
+		f, err := os.Create(bufferExportOutput)
 		if err != nil {
 			return err
 		}
-		defer w.Close()
-	} else {
-		w = os.Stdout
+		defer f.Close()
+		out = f
 	}
-
-	switch bufferExportFormat {
-	case "obj":
-		if err := buffer.ExportOBJ(w, vb.Vertices, ib.Indices); err != nil {
-			return fmt.Errorf("writing OBJ: %w", err)
-		}
-	default:
-		return fmt.Errorf("unsupported format: %s (supported: obj)", bufferExportFormat)
+	w := bufio.NewWriter(out)
+	defer w.Flush()
+	for _, v := range verts {
+		fmt.Fprintf(w, "v %g %g %g\n", v.Pos[0], v.Pos[1], v.Pos[2])
 	}
-
-	if bufferExportOutput != "" {
-		fmt.Fprintf(os.Stderr, "Exported %d vertices, %d triangles to %s\n",
-			len(vb.Vertices), ib.TriangleCount, bufferExportOutput)
+	for _, v := range verts {
+		fmt.Fprintf(w, "vn %g %g %g\n", v.Normal[0], v.Normal[1], v.Normal[2])
+	}
+	for _, v := range verts {
+		fmt.Fprintf(w, "vt %g %g\n", v.UV[0], v.UV[1])
+	}
+	for i := 0; i+2 < len(ib.Indices); i += 3 {
+		a, b, c := ib.Indices[i]+1, ib.Indices[i+1]+1, ib.Indices[i+2]+1
+		fmt.Fprintf(w, "f %d/%d/%d %d/%d/%d %d/%d/%d\n", a, a, a, b, b, b, c, c, c)
 	}
 	return nil
 }

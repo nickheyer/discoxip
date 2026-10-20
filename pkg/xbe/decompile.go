@@ -464,23 +464,23 @@ func (df *DecompiledFunc) decompileInsn(d *Disassembly, insn *Instruction) strin
 	case x86asm.FISTP:
 		return fmt.Sprintf("%s = (int)fpu_pop();", df.fmtArg(d, args[0], insn))
 	case x86asm.FADD:
-		return fmt.Sprintf("fpu_top() += %s;", df.fmtArgOrST(args))
+		return fmt.Sprintf("fpu_top() += %s;", df.fmtArgOrST(d, args))
 	case x86asm.FADDP:
 		return "st1 += st0; fpu_pop();"
 	case x86asm.FSUB:
-		return fmt.Sprintf("fpu_top() -= %s;", df.fmtArgOrST(args))
+		return fmt.Sprintf("fpu_top() -= %s;", df.fmtArgOrST(d, args))
 	case x86asm.FSUBP:
 		return "st1 -= st0; fpu_pop();"
 	case x86asm.FMUL:
-		return fmt.Sprintf("fpu_top() *= %s;", df.fmtArgOrST(args))
+		return fmt.Sprintf("fpu_top() *= %s;", df.fmtArgOrST(d, args))
 	case x86asm.FMULP:
 		return "st1 *= st0; fpu_pop();"
 	case x86asm.FDIV:
-		return fmt.Sprintf("fpu_top() /= %s;", df.fmtArgOrST(args))
+		return fmt.Sprintf("fpu_top() /= %s;", df.fmtArgOrST(d, args))
 	case x86asm.FDIVP:
 		return "st1 /= st0; fpu_pop();"
 	case x86asm.FCOM, x86asm.FCOMP, x86asm.FCOMPP:
-		return fmt.Sprintf("// fcompare st0, %s", df.fmtArgOrST(args))
+		return fmt.Sprintf("// fcompare st0, %s", df.fmtArgOrST(d, args))
 	case x86asm.FCHS:
 		return "st0 = -st0;"
 	case x86asm.FABS:
@@ -522,8 +522,7 @@ func (df *DecompiledFunc) fmtArg(d *Disassembly, arg x86asm.Arg, insn *Instructi
 			return fmt.Sprintf("%d", val)
 		}
 		uval := uint32(val)
-		// Check if it's a string reference
-		if str := d.Image.ReadUTF16(uval); len(str) > 2 && len(str) < 200 {
+		if str := d.Image.ReadUTF16(uval); len(str) > 2 && len(str) < 200 && isPrintable(str) {
 			return fmt.Sprintf("%q /* 0x%X */", str, uval)
 		}
 		return fmt.Sprintf("0x%X", uval)
@@ -534,6 +533,16 @@ func (df *DecompiledFunc) fmtArg(d *Disassembly, arg x86asm.Arg, insn *Instructi
 		return fmt.Sprintf("0x%X", target)
 	}
 	return fmt.Sprintf("%v", arg)
+}
+
+// Reports whether every character is printable ASCII
+func isPrintable(s string) bool {
+	for _, c := range s {
+		if c < 0x20 || c > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 // fmtArgAddr formats a memory argument as an address expression (for LEA).
@@ -641,16 +650,26 @@ func (df *DecompiledFunc) resolveCallTarget(d *Disassembly, target uint32, insn 
 	return fmt.Sprintf("sub_%08X", target)
 }
 
-func (df *DecompiledFunc) fmtArgOrST(args x86asm.Args) string {
+// Formats the operand of an x87 arithmetic instruction, which is a memory cell or a stack register
+func (df *DecompiledFunc) fmtArgOrST(d *Disassembly, args x86asm.Args) string {
+	var regs []string
 	for _, a := range args {
-		if a == nil {
+		switch v := a.(type) {
+		case nil:
 			continue
-		}
-		if r, ok := a.(x86asm.Reg); ok {
-			return strings.ToLower(r.String())
+		case x86asm.Mem:
+			return df.fmtMem(d, v)
+		case x86asm.Reg:
+			regs = append(regs, strings.ToLower(v.String()))
 		}
 	}
-	return "st0"
+	if len(regs) == 2 {
+		return regs[1]
+	}
+	if len(regs) == 1 {
+		return regs[0]
+	}
+	return "st1"
 }
 
 func isJump(op x86asm.Op) bool {

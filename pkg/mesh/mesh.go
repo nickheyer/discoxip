@@ -12,7 +12,7 @@ type ContentType int
 const (
 	ContentEmpty  ContentType = iota // all zeros or zero-length
 	ContentText                      // ASCII VRML scene text
-	ContentBinary                    // binary vertex color data or other binary
+	ContentBinary                    // binary data that is not scene text
 )
 
 func (c ContentType) String() string {
@@ -30,10 +30,9 @@ func (c ContentType) String() string {
 
 // Mesh is the parsed result of an XM file.
 type Mesh struct {
-	Type   ContentType
-	Size   int64
-	Text   *TextMesh
-	Binary *BinaryMesh
+	Type ContentType
+	Size int64
+	Text *TextMesh
 }
 
 // vrmlKeywords are tokens that reliably identify VRML text content.
@@ -97,8 +96,6 @@ func Read(r io.Reader, size int64) (*Mesh, error) {
 	switch ct {
 	case ContentText:
 		m.Text = ParseText(data)
-	case ContentBinary:
-		m.Binary = ParseBinary(data)
 	}
 
 	return m, nil

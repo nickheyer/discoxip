@@ -17,17 +17,20 @@ discoxip extract [path] [-o <dir>] [-r] [-v]
 discoxip pack <directory> -o <archive.xip>
 
 discoxip xbe info <file.xbe>
-discoxip xbe materials <file.xbe>
+discoxip xbe symbols <file.xbe>
+discoxip xbe materials <file.xbe> [-v]
+discoxip xbe render <file.xbe> [-o <file.json>]
 discoxip xbe disasm <file.xbe> [-o <file.c>]
 
-discoxip scene info <file.xap>
-discoxip scene export <file.xap> [-o <file.glb>]
-discoxip scene build <directory> [-o <dir>]
+discoxip scene info <file.xap> --xbe <file.xbe>
+discoxip scene export <file.xap> --xbe <file.xbe> [-o <file.glb>]
+discoxip scene build <directory> --xbe <file.xbe> [-o <dir>]
 
 discoxip xap info|dump <file.xap>
 discoxip mesh info <file.xm|directory> [...]
-discoxip buffer info|dump <file.vb>
-discoxip buffer export <file.vb> <file.ib> [-o <file.obj>]
+discoxip buffer info <file.vb>
+discoxip buffer dump <file.vb> --xbe <file.xbe>
+discoxip buffer export <file.vb> <file.ib> --xbe <file.xbe> [-o <file.obj>]
 discoxip texture info|export <file.xbx>
 discoxip texture export-all <directory>
 discoxip font info|export <file.xtf>

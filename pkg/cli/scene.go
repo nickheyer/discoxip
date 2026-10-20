@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nickheyer/discoxip/pkg/buffer"
 	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/spf13/cobra"
 )
@@ -14,6 +13,13 @@ import (
 var sceneExportOutput string
 var sceneExportFormat string
 var sceneBuildOutput string
+var sceneXBE string
+
+// Loads the vertex layouts the dashboard executable declares
+func sceneLayouts() (map[uint32]scene.Layout, error) {
+	layouts, _, err := scene.LoadLayouts(sceneXBE)
+	return layouts, err
+}
 
 func init() {
 	sceneCmd := &cobra.Command{
@@ -47,11 +53,17 @@ func init() {
 		RunE:  runSceneInfo,
 	}
 
+	sceneCmd.PersistentFlags().StringVar(&sceneXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
+	sceneCmd.MarkPersistentFlagRequired("xbe")
 	sceneCmd.AddCommand(buildCmd, exportCmd, infoCmd)
 	rootCmd.AddCommand(sceneCmd)
 }
 
 func runSceneBuild(cmd *cobra.Command, args []string) error {
+	layouts, err := sceneLayouts()
+	if err != nil {
+		return err
+	}
 	srcDir := args[0]
 	outDir := sceneBuildOutput
 	if outDir == "" {
@@ -67,7 +79,7 @@ func runSceneBuild(cmd *cobra.Command, args []string) error {
 
 	// Step 2: Find all XAP files in output and export those with geometry
 	exported := 0
-	err := filepath.WalkDir(outDir, func(path string, d os.DirEntry, err error) error {
+	err = filepath.WalkDir(outDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -75,7 +87,7 @@ func runSceneBuild(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		s, err := scene.Load(path)
+		s, err := scene.Load(path, layouts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  %s: %v\n", path, err)
 			return nil
@@ -87,7 +99,7 @@ func runSceneBuild(cmd *cobra.Command, args []string) error {
 
 		hasGeometry := false
 		for _, md := range s.Meshes {
-			if len(md.Vertices) > 0 {
+			if md.Count > 0 {
 				hasGeometry = true
 				break
 			}
@@ -122,7 +134,11 @@ func runSceneBuild(cmd *cobra.Command, args []string) error {
 }
 
 func runSceneExport(cmd *cobra.Command, args []string) error {
-	s, err := scene.Load(args[0])
+	layouts, err := sceneLayouts()
+	if err != nil {
+		return err
+	}
+	s, err := scene.Load(args[0], layouts)
 	if err != nil {
 		return err
 	}
@@ -151,7 +167,11 @@ func runSceneExport(cmd *cobra.Command, args []string) error {
 }
 
 func runSceneInfo(cmd *cobra.Command, args []string) error {
-	s, err := scene.Load(args[0])
+	layouts, err := sceneLayouts()
+	if err != nil {
+		return err
+	}
+	s, err := scene.Load(args[0], layouts)
 	if err != nil {
 		return err
 	}
@@ -163,17 +183,12 @@ func runSceneInfo(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Buffer pools: %d\n", len(s.Pools))
 	for _, pool := range s.Pools {
 		verts := int(pool.VB.Header.VertexCount)
-		format := buffer.VertexFormat(pool.VB.Header.FormatCode)
 		idxCount := 0
 		if pool.IB != nil {
 			idxCount = len(pool.IB.Indices)
 		}
-		decoded := "no"
-		if pool.VB.Vertices != nil {
-			decoded = "yes"
-		}
-		fmt.Printf("    %s: %d verts (%s), %d indices, decoded=%s\n",
-			pool.Name, verts, format, idxCount, decoded)
+		fmt.Printf("    %s: %d verts (format 0x%08X, stride %d), %d indices, %d attributes\n",
+			pool.Name, verts, pool.VB.Header.FormatCode, pool.VB.Stride, idxCount, len(pool.Attributes))
 	}
 
 	fmt.Printf("  Textures: %d\n", len(s.Textures))
@@ -184,8 +199,8 @@ func runSceneInfo(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Mesh refs: %d\n", len(s.Meshes))
 	for url, md := range s.Meshes {
 		status := "no geometry"
-		if len(md.Vertices) > 0 {
-			status = fmt.Sprintf("%d vertices, %d indices", len(md.Vertices), len(md.Indices))
+		if md.Count > 0 {
+			status = fmt.Sprintf("%d vertices, %d indices", md.Count, len(md.Indices))
 		}
 		fmt.Printf("    %s: %s\n", url, status)
 	}

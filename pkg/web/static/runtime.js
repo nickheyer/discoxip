@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import * as matSystem from './materials.js';
+import { DerivedModel, cloneState, makeBuffer } from './derived.js';
+import { DevicePipeline, describeGeometry } from './pipeline.js';
 
 // ============================================================================
 // XAP Runtime — Full-parity Three.js recreation of Xbox Dashboard
@@ -24,6 +25,8 @@ class XAPRuntime {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setClearColor(0x000000);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    // The dashboard draws in scene order, which the derived device state depends on.
+    this.renderer.sortObjects = false;
     document.body.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -38,8 +41,11 @@ class XAPRuntime {
     this.meshManifest = {};
     this.meshCache = {};       // key → Promise<THREE.BufferGeometry>
     this.textureCache = {};    // name → THREE.Texture
-    this.materialCache = {};   // name → THREE.Material
-    this.namedMaterials = [];  // [{threeMat, matName}] for per-frame color updates
+    this.derived = null;       // DerivedModel interpreting the executable's draw paths
+    this.pipeline = null;      // DevicePipeline mapping device state onto materials
+    this.device = null;        // D3D device state persisting across draws
+    this.proceduralTextures = {}; // 'texture:VA' → THREE.Texture
+    this.drawTarget = null;    // shape being drawn by the derived path this instant
     this.sceneData = {};       // sceneName → parsed JSON
     this.nodes = {};           // global DEF name → XAPNode
     this._viewpointSet = false;   // only apply the first Viewpoint to camera
@@ -99,18 +105,20 @@ class XAPRuntime {
       this.meshManifest = await manifestResp.json();
       _log(`[XAP] ${Object.keys(this.meshManifest).length} meshes in manifest`);
 
-      // Load material definitions from XBE extraction
-      const matResp = await fetch(`${DATA_BASE}/materials.json`);
-      const matJSON = await matResp.json();
-      const matCount = matSystem.loadFromJSON(matJSON);
-      _log(`[XBE] ${matCount} materials loaded`);
-
-      // Material textures (indices 1/2/3) — THESE ARE COMBINER TEXTURES FROM THE GPU
-      // DO NOT UNDER ANY CIRCUMSTANCES ATTEMPT TO WRITE YOUR OWN GRADIENT INTERPRETATION
-      // OF THE XBE VTABLE DERIVED MATERIAL TEXTURE. YOU FUCKING EXPORT THE TEXTURE ALGO
-      // DIRECTLY FROM THE FUCKING XBE
-      // The materials use NV2A register combiners directly — no COLOROP/ALPHAOP through D3D
-      // texture stages. The combiner program is the key
+      // Load the render model derived from the executable
+      const renderResp = await fetch(`${DATA_BASE}/render.json`);
+      const renderModel = await renderResp.json();
+      this.derived = new DerivedModel(renderModel);
+      this.pipeline = new DevicePipeline(THREE, renderModel, { resolve: (h) => this.resolveTextureHandle(h) });
+      this.device = cloneState(this.derived.defaults);
+      this.derived.onDraw = (state) => this.onDerivedDraw(state);
+      // Text geometry is drawn by the vector font renderer with the state the appearance leaves.
+      this.derived.hook(this.derived.drawSlotFunction('Text'), (obj, args, state) => { this.onDerivedTextDraw(state); return 0; });
+      for (const t of renderModel.textures) {
+        const key = 'texture:' + (t.va >>> 0).toString(16).toUpperCase().padStart(8, '0');
+        this.proceduralTextures[key] = this.loadTexture(`proc_${key.slice(8)}.png`);
+      }
+      _log(`[XBE] ${renderModel.materials.length} materials, ${Object.keys(renderModel.programs).length} vertex programs, ${renderModel.textures.length} procedural textures`);
 
       // Load XTF vector fonts
       await this.loadFonts();
@@ -289,8 +297,7 @@ class XAPRuntime {
       const text = f.text || f.string || '';
       const fontName = f.font || 'Body';
       const justify = f.justify || 'left';
-      const mat = this.createMaterial(appData);
-      const tr = new TextRenderer(String(text), String(fontName), this.fonts, mat, String(justify));
+      const tr = new TextRenderer(String(text), String(fontName), this.fonts, this.pipeline.createMaterial(), String(justify));
       group.add(tr.mesh);
       node._textRenderer = tr;
     }
@@ -426,33 +433,25 @@ class XAPRuntime {
   // Build geometry from a node's geometry/appearance field pair
   buildGeometry(node, group, geomData, appData, archiveName) {
     const geomFields = geomData.fields || {};
-    const material = this.createMaterial(appData);
-
-    // Register DEF for the geometry node
-    if (geomData.def) {
-      const geomNode = new XAPNode(geomData, this, archiveName);
-      this.nodes[geomData.def] = geomNode;
-      this.scriptScope[geomData.def] = geomNode.proxy;
-    }
+    const geomNode = this.nodeFor(geomData, archiveName);
+    if (appData) this.prepareAppearance(appData, archiveName);
+    const material = this.pipeline.createMaterial();
 
     // Mesh reference (url field pointing to .xm)
     if (geomFields.url && typeof geomFields.url === 'string' && geomFields.url.match(/\.xm$/i)) {
       this.loadMesh(geomFields.url, archiveName).then(geometry => {
-        if (geometry) {
-          let mat = material;
-          if (geometry.userData.hasColors) {
-            mat = material.clone();
-            mat.vertexColors = true;
-          }
-          const mesh = new THREE.Mesh(geometry, mat);
-          mesh.name = geomData.def || geomFields.url;
-          group.add(mesh);
-          node._mesh = mesh;
-          node._material = material;
-          this._meshesLoaded = (this._meshesLoaded || 0) + 1;
-          if (this._meshesLoaded % 100 === 0) {
-            _log(`[XAP] ${this._meshesLoaded} meshes loaded`);
-          }
+        if (!geometry) return;
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.name = geomData.def || geomFields.url;
+        group.add(mesh);
+        node._mesh = mesh;
+        const entry = geometry.userData.entry;
+        this.attachBuffer(geomNode, { format: entry.format, stride: entry.stride, primitiveCount: entry.indexCount / 3 });
+        node._drawMesh = mesh;
+        node._drawGeometry = geometry.userData.desc;
+        this._meshesLoaded = (this._meshesLoaded || 0) + 1;
+        if (this._meshesLoaded % 100 === 0) {
+          _log(`[XAP] ${this._meshesLoaded} meshes loaded`);
         }
       }).catch(e => {
         _warn(`[XAP] Mesh load failed: ${geomFields.url}`, e.message);
@@ -468,143 +467,139 @@ class XAPRuntime {
       const tr = new TextRenderer(String(text), String(fontName), this.fonts, material, String(justify));
       group.add(tr.mesh);
       node._textRenderer = tr;
-      node._material = material;
+      node._drawMesh = tr.mesh;
+      node._drawGeometry = TEXT_GEOMETRY;
       return;
     }
 
-    // Sphere geometry (has radius field)
+    // Sphere geometry (has radius field): the executable builds it with its own buffer layout
     if (geomFields.radius !== undefined) {
-      const sphere = new THREE.Mesh(
-        new THREE.SphereGeometry(asNumber(geomFields.radius), 32, 16),
-        material
-      );
+      const geometry = this.sphereGeometry(asNumber(geomFields.radius), geomFields.slices, geomFields.stacks);
+      const sphere = new THREE.Mesh(geometry, material);
       group.add(sphere);
       node._mesh = sphere;
-      node._material = material;
+      const sb = this.derived.draw.sphere;
+      this.attachBuffer(geomNode, { format: sb.format, stride: sb.stride, primitiveCount: geometry.index.count / 3 });
+      node._drawMesh = sphere;
+      node._drawGeometry = geometry.userData.desc;
       return;
     }
+    throw new Error(`geometry node ${geomData.type} has neither a mesh url, text nor a radius`);
   }
 
-  createMaterial(appData) {
-    if (!appData) {
-      return new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-    }
+  // Gives a geometry node the loaded buffer object its draw path dereferences
+  attachBuffer(geomNode, geometry) {
+    geomNode.derivedObject().slots.set(this.derived.accessor.offset, { obj: makeBuffer(this.derived.model, geometry) });
+  }
 
+  // Builds a sphere in the layout the executable stores: position, packed normal and a zero diffuse
+  sphereGeometry(radius, slices, stacks) {
+    const sb = this.derived.draw.sphere;
+    const layout = this.derived.model.fixed_function.find((ff) => ff.format === sb.format);
+    if (!layout) throw new Error(`sphere format 0x${sb.format.toString(16)} has no fixed function declaration`);
+    const decl = this.derived.model.declarations[(layout.declaration >>> 0).toString(16).toUpperCase().padStart(8, '0')];
+    const src = new THREE.SphereGeometry(radius, slices !== undefined ? asNumber(slices) : 32, stacks !== undefined ? asNumber(stacks) : 16);
+    const count = src.attributes.position.count;
+    const geometry = new THREE.BufferGeometry();
+    const attributes = [];
+    for (const el of decl.elements) {
+      const semantic = this.derived.model.vertex_semantics[String(el.register)];
+      let data;
+      if (semantic === 'position') data = src.attributes.position.array;
+      else if (semantic === 'normal') data = src.attributes.normal.array;
+      // D3DX fills the vertex components the source mesh lacks with zero when it clones it.
+      else if (semantic === 'diffuse') data = new Float32Array(count * el.comps);
+      else throw new Error(`sphere declaration element ${semantic} is not produced by the runtime`);
+      geometry.setAttribute('a_' + el.offset, new THREE.BufferAttribute(data, el.comps));
+      attributes.push({ register: el.register, semantic, type: el.type, offset: el.offset, comps: el.comps });
+    }
+    geometry.setIndex(src.index);
+    geometry.userData.desc = describeGeometry({ format: sb.format, stride: sb.stride, attributes });
+    return geometry;
+  }
+
+  // Registers the appearance, material and texture nodes a shape draws through
+  prepareAppearance(appData, archiveName) {
+    const appNode = this.nodeFor(appData, archiveName);
     const matData = extractNode(getFieldRaw(appData, 'material'));
+    if (matData) this.nodeFor(matData, archiveName);
     const texData = extractNode(getFieldRaw(appData, 'texture'));
-    const matName = matData ? getField(matData, 'name') : '';
-    const texUrl = texData ? getField(texData, 'url') : '';
-    const texAlpha = texData ? getField(texData, 'alpha') : false;
-
-    const cacheKey = (matName || '') + '|' + (texUrl || '');
-    const cachedMat = this.materialCache[cacheKey];
-
-    // Register DEF'd material/appearance nodes globally so scripts can find them.
-    // DEF'd nodes that share a material name (e.g. MemoryTextMaterial and
-    // MusicTextMaterial both using "NavType") need independent Three.js material
-    // instances so scripts can change one without affecting the other.
-    const needsOwnInstance = !!(matData && matData.def) || !!(appData && appData.def);
-
-    if (matData && matData.def) {
-      const matNode = new XAPNode(matData, this, '');
-      matNode._material = null; // set below after creation/clone
-      this.nodes[matData.def] = matNode;
-      this.scriptScope[matData.def] = matNode.proxy;
-      matData._xapNode = matNode;
-    }
-    if (appData && appData.def) {
-      const appNode = new XAPNode(appData, this, '');
-      appNode._material = null;
-      this.nodes[appData.def] = appNode;
-      this.scriptScope[appData.def] = appNode.proxy;
-      appData._xapNode = appNode;
-    }
-
-    // If cache has this material and no DEF needs its own instance, reuse it
-    if (cachedMat && !needsOwnInstance) return cachedMat;
-
-    const params = { side: THREE.DoubleSide };
-
-    // Apply material color and D3D state from XBE material system
-    if (matName) {
-      const color = matSystem.applyMaterial(matName);
-      if (color) {
-        params.color = new THREE.Color().setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
-        if (color.a < 255) {
-          params.transparent = true;
-          params.opacity = color.a / 255;
-        }
-      }
-
-      // Apply D3D blend state extracted from XBE Apply method trace
-      const d3d = matSystem.getD3DState(matName);
-      if (d3d) {
-        if (d3d.alpha_blend_enable) {
-          params.transparent = true;
-          params.blending = THREE.CustomBlending;
-          params.blendSrc = _xboxBlendToThree(d3d.src_blend);
-          params.blendDst = _xboxBlendToThree(d3d.dst_blend);
-        }
-        if (d3d.z_write_enable === false) {
-          params.depthWrite = false;
-        }
-      }
-
-      // Load material texture (index 2=steel, 3=cellwall) from extracted files
-      const texFile = matSystem.getTextureFile(matName);
-      if (texFile && !texUrl) {
-        const matTex = this.loadTexture(texFile);
-        if (matTex) {
-          params.map = matTex;
-        }
+    if (texData) {
+      const texNode = this.nodeFor(texData, archiveName);
+      const url = getField(texData, 'url');
+      if (url) {
+        const tex = this.loadTexture(url);
+        texNode.derivedObject().slots.set(this.derived.draw.texture_field, { xapTexture: tex });
       }
     }
-
-    // XAP inline material properties (Material nodes with diffuseColor)
-    if (!params.color && matData) {
-      const diffuse = getFieldVec(matData, 'diffuseColor', 3);
-      if (diffuse) params.color = new THREE.Color(diffuse[0], diffuse[1], diffuse[2]);
-
-      const transparency = getFieldNum(matData, 'transparency', 0);
-      if (transparency > 0) {
-        params.transparent = true;
-        params.opacity = 1.0 - transparency;
-      }
-    }
-
-    if (texUrl) {
-      const tex = this.loadTexture(texUrl);
-      if (tex) {
-        params.map = tex;
-        if (texAlpha) {
-          params.transparent = true;
-          params.alphaTest = 0.01;
-        }
-      }
-    }
-
-    let material;
-    if (cachedMat && needsOwnInstance) {
-      material = cachedMat.clone();
-      material.name = matName || '';
-    } else {
-      material = new THREE.MeshBasicMaterial(params);
-      material.name = matName || '';
-      this.materialCache[cacheKey] = material;
-    }
-
-    // Track named materials for per-frame color updates (animated materials)
-    if (matName) {
-      this.namedMaterials.push({ threeMat: material, matName });
-    }
-
-    // Update _material on any DEF'd nodes we registered above
-    if (matData && matData._xapNode) matData._xapNode._material = material;
-    if (appData && appData._xapNode) appData._xapNode._material = material;
-
-    return material;
+    return appNode;
   }
 
+  // Returns the runtime node for a scene node object, creating and registering it once
+  nodeFor(data, archiveName) {
+    if (data._xapNode) return data._xapNode;
+    const node = new XAPNode(data, this, archiveName || '');
+    data._xapNode = node;
+    if (data.def) {
+      this.nodes[data.def] = node;
+      this.scriptScope[data.def] = node.proxy;
+    }
+    return node;
+  }
+
+  // Resolves a texture handle the derived paths bound at a stage
+  resolveTextureHandle(handle) {
+    if (handle && handle.texture !== undefined) {
+      const tex = this.proceduralTextures[handle.texture];
+      if (!tex) throw new Error(`procedural ${handle.texture} was not exported`);
+      return tex;
+    }
+    if (handle && handle.xapTexture !== undefined) return handle.xapTexture;
+    throw new Error(`texture handle ${JSON.stringify(handle)} has no runtime texture`);
+  }
+
+  // Applies the device state at an indexed draw to the shape being drawn
+  onDerivedDraw(state) {
+    const t = this.drawTarget;
+    if (!t) throw new Error('derived draw without a shape');
+    this.pipeline.update(t.node._drawMesh.material, state, t.node._drawGeometry, t.matrices);
+  }
+
+  onDerivedTextDraw(state) {
+    const t = this.drawTarget;
+    if (!t) throw new Error('derived text draw without a shape');
+    this.pipeline.update(t.node._textRenderer.material, state, TEXT_GEOMETRY, t.matrices, true);
+  }
+
+  // Runs the executable's draw paths over the scene in draw order, updating every mesh material
+  updateDerivedDraws() {
+    const d = this.derived;
+    d.clock = this.clock.elapsedTime;
+    this.scene.updateMatrixWorld(true);
+    this.camera.updateMatrixWorld();
+    const view = new Float32Array(this.camera.matrixWorldInverse.elements);
+    const projection = new Float32Array(this.camera.projectionMatrix.elements);
+    const alphaField = Object.entries(d.types.Transform.fields).find(([, f]) => f.name === 'alpha');
+    if (!alphaField) throw new Error('Transform has no alpha field in the executable');
+    const alphaOff = Number(alphaField[0]);
+    const visit = (obj, alpha) => {
+      if (!obj.visible) return;
+      const node = obj.userData.xapNode;
+      if (node && node.data.type === 'Transform') {
+        alpha *= floatFromBits(d.readField(node.derivedObject(), alphaOff, 4));
+      }
+      if (node && node.data.type === 'Shape' && node._drawMesh) {
+        const matrices = { world: new Float32Array(obj.matrixWorld.elements), view, projection };
+        d.hierarchyAlpha = alpha;
+        d.nodeSetup(this.device, matrices);
+        this.drawTarget = { node, matrices };
+        d.drawShape(node.derivedObject(), this.device, matrices);
+        this.drawTarget = null;
+      }
+      for (const child of obj.children) visit(child, alpha);
+    };
+    visit(this.rootGroup, 1);
+  }
 
   loadTexture(url) {
     let base = String(url);
@@ -650,24 +645,18 @@ class XAPRuntime {
       const buffer = await resp.arrayBuffer();
       const vc = entry.vertexCount, ic = entry.indexCount;
 
+      // Attributes are stored in declaration order as float arrays, then the indices.
       let offset = 0;
-      const positions = new Float32Array(buffer, offset, vc * 3); offset += vc * 12;
-      const normals = new Float32Array(buffer, offset, vc * 3); offset += vc * 12;
-      const uvs = new Float32Array(buffer, offset, vc * 2); offset += vc * 8;
-
-      let colors = null;
-      if (entry.hasColors) {
-        colors = new Float32Array(buffer, offset, vc * 4); offset += vc * 16;
+      const geometry = new THREE.BufferGeometry();
+      for (const a of entry.attributes) {
+        const data = new Float32Array(buffer, offset, vc * a.comps);
+        offset += vc * a.comps * 4;
+        geometry.setAttribute('a_' + a.offset, new THREE.BufferAttribute(data, a.comps));
       }
       const indices = new Uint16Array(buffer, offset, ic);
-
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-      geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-      if (colors) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 4));
       geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-      geometry.userData.hasColors = !!colors;
+      geometry.userData.entry = entry;
+      geometry.userData.desc = describeGeometry(entry);
       return geometry;
     })();
 
@@ -1028,14 +1017,10 @@ class XAPRuntime {
   animate() {
     requestAnimationFrame(() => this.animate());
     const dt = this.clock.getDelta();
-    const elapsed = this.clock.elapsedTime;
-
-    // Update material system time for animated materials (eggpulse, eggglow, etc.)
-    matSystem.updateTime(elapsed);
-    this.updateMaterialColors();
 
     this.updateAnimations(dt);
     this.pollGamepad();
+    this.updateDerivedDraws();
 
     this.renderer.render(this.scene, this.camera);
   }
@@ -1058,22 +1043,6 @@ class XAPRuntime {
     }
     _log(`[XAP] Camera: fov=${vp.fov.toFixed(2)} pos=[${vp.position}]`);
   }
-
-  updateMaterialColors() {
-    for (const entry of this.namedMaterials) {
-      const currentName = entry.threeMat.name || entry.matName;
-      const color = matSystem.applyMaterial(currentName);
-      if (!color) continue;
-      entry.threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
-
-      if (color.a < 255) {
-        entry.threeMat.transparent = true;
-        entry.threeMat.opacity = color.a / 255;
-      } else if (entry.threeMat.opacity < 1) {
-        entry.threeMat.opacity = 1;
-      }
-    }
-  }
 }
 
 // ============================================================================
@@ -1087,7 +1056,6 @@ class XAPNode {
     this.archiveName = archiveName;
     this.threeObj = null;
     this._mesh = null;
-    this._material = null;
     this._textRenderer = null;
     this._fadeDuration = 0; // transition duration in seconds, NOT opacity
     this._isBound = false;
@@ -1102,6 +1070,9 @@ class XAPNode {
     this._systemMethods = null;
     this._onLoadFired = false;
     this._xapChildren = []; // ordered list of XAPNodes from children[] and buildScene
+    this._drawMesh = null;
+    this._drawGeometry = null;
+    this._derivedObject = null;
 
     // Store original field values
     if (data.fields) {
@@ -1215,13 +1186,8 @@ class XAPNode {
           return true;
         }
         if (s === 'name') {
-          // Material name change — re-derive color from XBE material system
-          const newName = String(value);
-          target._fields.name = newName;
-          if (target._material) {
-            target._material.name = newName;
-            _applyMaterialColor(target._material, newName);
-          }
+          // The derived material lookup reads the field on the next draw.
+          target._fields.name = String(value);
           return true;
         }
         if (s === 'param') {
@@ -1282,60 +1248,39 @@ class XAPNode {
     return null;
   }
 
-  _getAppearanceProxy() {
-    // Look for appearance data in this node's Shape
-    if (this._mesh && this._material) {
-      return new Proxy({}, {
-        get: (_, prop) => {
-          if (prop === 'material') return this._getMaterialProxy();
-          if (prop === 'texture') return this._getTextureProxy();
-          return undefined;
-        },
-        set: () => true,
-      });
-    }
-    return undefined;
+  // Scripts reach the appearance, material and texture nodes a shape draws through
+  _fieldNodeProxy(name) {
+    const data = extractNode(this._fields[name]);
+    return data ? this.runtime.nodeFor(data, this.archiveName).proxy : undefined;
   }
 
-  _getMaterialProxy() {
-    if (this._material) {
-      const mat = this._material;
-      const self = this;
-      return new Proxy({}, {
-        get: (_, prop) => {
-          if (prop === 'name') return mat.name;
-          if (prop === 'param') return self._fields.param || 0;
-          return undefined;
-        },
-        set: (_, prop, value) => {
-          if (prop === 'name') {
-            const newName = String(value);
-            mat.name = newName;
-            _applyMaterialColor(mat, newName);
-            return true;
-          }
-          if (prop === 'param') { self._fields.param = Number(value); return true; }
-          return true;
-        }
-      });
-    }
-    return undefined;
-  }
+  _getAppearanceProxy() { return this._fieldNodeProxy('appearance'); }
+  _getMaterialProxy() { return this._fieldNodeProxy('material'); }
+  _getTextureProxy() { return this._fieldNodeProxy('texture'); }
+  _getGeometryProxy() { return this._fieldNodeProxy('geometry'); }
 
-  _getTextureProxy() { return undefined; }
-  _getGeometryProxy() { return undefined; }
-
+  // The transform's alpha field scales the hierarchy alpha the materials read
   _setAlpha(value) {
-    const v = Number(value);
-    if (this.threeObj) {
-      this.threeObj.traverse((child) => {
-        if (child.material) {
-          child.material.transparent = v < 1;
-          child.material.opacity = v;
-          child.material.needsUpdate = true;
-        }
-      });
+    this._fields.alpha = Number(value);
+  }
+
+  // The executable's object for this node, read by the derived draw paths
+  derivedObject() {
+    if (!this._derivedObject) this._derivedObject = this.runtime.derived.newObject(this.data.type, this);
+    return this._derivedObject;
+  }
+
+  // Reads a scene field the way the executable's field table types it
+  derivedField(name, type) {
+    const v = this._fields[name];
+    if (v === undefined) return undefined;
+    if (type === 9) {
+      const data = extractNode(v);
+      return data ? { obj: this.runtime.nodeFor(data, this.archiveName).derivedObject() } : 0;
     }
+    if (type === 10) return String(Array.isArray(v) ? v[0] : v);
+    if (type === 2) return !!v;
+    return asNumber(v);
   }
 
   _setTranslation(x, y, z) {
@@ -1616,7 +1561,7 @@ class TextRenderer {
     }
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(allPositions, 3));
+    geometry.setAttribute('a_0', new THREE.Float32BufferAttribute(allPositions, 3));
     geometry.setIndex(allIndices);
 
     const textMesh = new THREE.Mesh(geometry, this.material);
@@ -1628,42 +1573,13 @@ class TextRenderer {
 // Helper functions
 // ============================================================================
 
-// Map Xbox D3D blend factor (OpenGL-style) to Three.js blend constant.
-// Values from cxbx-reloaded/src/core/hle/D3D8/XbConvert.cpp.
-function _xboxBlendToThree(xboxBlend) {
-  switch (xboxBlend) {
-    case 0x000: return THREE.ZeroFactor;
-    case 0x001: return THREE.OneFactor;
-    case 0x300: return THREE.SrcColorFactor;
-    case 0x301: return THREE.OneMinusSrcColorFactor;
-    case 0x302: return THREE.SrcAlphaFactor;
-    case 0x303: return THREE.OneMinusSrcAlphaFactor;
-    case 0x304: return THREE.DstAlphaFactor;
-    case 0x305: return THREE.OneMinusDstAlphaFactor;
-    case 0x306: return THREE.DstColorFactor;
-    case 0x307: return THREE.OneMinusDstColorFactor;
-    case 0x308: return THREE.SrcAlphaSaturateFactor;
-    // Deferred blend values use small integers (0=ZERO, 1=ONE)
-    case 0: return THREE.ZeroFactor;
-    case 1: return THREE.OneFactor;
-    default: return THREE.OneFactor;
-  }
-}
+// Text glyph geometry carries positions only, drawn through the fixed function path
+const TEXT_GEOMETRY = describeGeometry({ format: 0, stride: 12, attributes: [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3 }] });
 
-// Re-derive a Three.js material's color/opacity from the XBE material system
-// when a script changes the material name at runtime.
-function _applyMaterialColor(threeMat, matName) {
-  const color = matSystem.applyMaterial(matName);
-  if (!color) return;
-  threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
-  if (color.a < 255) {
-    threeMat.transparent = true;
-    threeMat.opacity = color.a / 255;
-  } else {
-    threeMat.transparent = false;
-    threeMat.opacity = 1;
-  }
-  threeMat.needsUpdate = true;
+const floatBuf = new DataView(new ArrayBuffer(4));
+function floatFromBits(bits) {
+  floatBuf.setUint32(0, bits >>> 0, true);
+  return floatBuf.getFloat32(0, true);
 }
 
 function asNumber(v) {
@@ -1708,18 +1624,6 @@ function getFieldRaw(nodeData, key) {
   return nodeData.fields[key];
 }
 
-function getFieldNum(nodeData, key, def) {
-  const v = getField(nodeData, key);
-  if (v === undefined) return def;
-  return asNumber(v);
-}
-
-function getFieldVec(nodeData, key, len) {
-  const v = getField(nodeData, key);
-  if (!Array.isArray(v) || v.length < len) return null;
-  return v.map(Number);
-}
-
 function extractArchivePrefix(sceneName) {
   const idx = sceneName.lastIndexOf('_');
   return idx >= 0 ? sceneName.substring(0, idx) : sceneName;
@@ -1730,4 +1634,5 @@ function extractArchivePrefix(sceneName) {
 // ============================================================================
 
 const runtime = new XAPRuntime();
+window.xapRuntime = runtime;
 runtime.start();

@@ -1,6 +1,7 @@
 package xbe
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -18,6 +19,7 @@ type Instruction struct {
 type Function struct {
 	EntryVA      uint32
 	Name         string // resolved name (kernel import, symbol, or auto-generated)
+	Symbol       *Symbol
 	Instructions []Instruction
 	CallTargets  []uint32 // VAs of functions this function calls
 	CalledBy     []uint32 // VAs of functions that call this one
@@ -29,6 +31,7 @@ type Disassembly struct {
 	Image     *Image
 	Functions map[uint32]*Function // entry VA → Function
 	Imports   map[uint32]string    // thunk VA → kernel export name
+	Symbols   []Symbol             // library functions identified by signature
 
 	// All instructions indexed by VA for fast lookup
 	InsnByVA map[uint32]*Instruction
@@ -60,8 +63,10 @@ func Disassemble(img *Image) (*Disassembly, error) {
 	// Step 3: Discover function boundaries across all code.
 	d.discoverFunctions()
 
-	// Step 4: Identify and name known D3D8 functions.
-	d.IdentifyD3DFunctions()
+	// Step 4: Name XDK library functions by signature.
+	if _, err := d.IdentifyLibraryFunctions(); err != nil {
+		return nil, err
+	}
 
 	return d, nil
 }
@@ -141,6 +146,10 @@ func (d *Disassembly) discoverFunctions() {
 		}
 	}
 
+	for _, va := range d.pointerTargets() {
+		entries[va] = true
+	}
+
 	// Sort entries.
 	sortedEntries := make([]uint32, 0, len(entries))
 	for va := range entries {
@@ -148,51 +157,15 @@ func (d *Disassembly) discoverFunctions() {
 	}
 	sort.Slice(sortedEntries, func(i, j int) bool { return sortedEntries[i] < sortedEntries[j] })
 
-	// Build functions: each spans from entry to next entry or RET.
-	for i, entry := range sortedEntries {
-		var endVA uint32
-		if i+1 < len(sortedEntries) {
-			endVA = sortedEntries[i+1]
-		} else {
-			endVA = entry + 0x10000 // cap at 64KB max
+	// Build functions by following control flow from each entry.
+	for _, entry := range sortedEntries {
+		fn := d.buildFunction(entry, entries)
+		if fn != nil {
+			d.Functions[entry] = fn
 		}
-
-		fn := &Function{EntryVA: entry}
-		var callTargets []uint32
-
-		for va := entry; va < endVA; {
-			insn, ok := d.InsnByVA[va]
-			if !ok {
-				va++
-				continue
-			}
-
-			fn.Instructions = append(fn.Instructions, *insn)
-
-			if insn.Inst.Op == x86asm.CALL {
-				target := resolveTarget(insn)
-				if target != 0 {
-					callTargets = append(callTargets, target)
-				}
-			}
-
-			if insn.Inst.Op == x86asm.RET {
-				va += uint32(insn.Inst.Len)
-				break
-			}
-
-			va += uint32(insn.Inst.Len)
-		}
-
-		if len(fn.Instructions) == 0 {
-			continue
-		}
-
-		fn.CallTargets = callTargets
-		last := fn.Instructions[len(fn.Instructions)-1]
-		fn.Size = int(last.VA - entry + uint32(last.Inst.Len))
-		d.Functions[entry] = fn
 	}
+
+	d.recoverGaps(entries)
 
 	// Build CalledBy cross-references.
 	for callerVA, fn := range d.Functions {
@@ -202,6 +175,173 @@ func (d *Disassembly) discoverFunctions() {
 			}
 		}
 	}
+}
+
+// Treats code left between discovered functions as further function entries
+func (d *Disassembly) recoverGaps(entries map[uint32]bool) {
+	for i := range d.Image.Sections {
+		sec := &d.Image.Sections[i]
+		if sec.Flags&0x4 == 0 {
+			continue
+		}
+		covered := make(map[uint32]bool)
+		for _, fn := range d.Functions {
+			for _, insn := range fn.Instructions {
+				for b := uint32(0); b < uint32(insn.Inst.Len); b++ {
+					covered[insn.VA+b] = true
+				}
+			}
+		}
+		for va := sec.VirtualAddr; va < sec.VirtualAddr+sec.VirtualSize; {
+			insn, ok := d.InsnByVA[va]
+			if covered[va] || !ok || insn.Inst.Op == x86asm.INT || insn.Inst.Op == x86asm.NOP || insn.Inst.Len == 0 {
+				va++
+				continue
+			}
+			if _, exists := d.Functions[va]; exists {
+				va++
+				continue
+			}
+			fn := d.buildFunction(va, entries)
+			if fn == nil {
+				va++
+				continue
+			}
+			entries[va] = true
+			d.Functions[va] = fn
+			for _, in := range fn.Instructions {
+				for b := uint32(0); b < uint32(in.Inst.Len); b++ {
+					covered[in.VA+b] = true
+				}
+			}
+		}
+	}
+}
+
+// Collects every instruction reachable from entry through jumps and fallthrough
+func (d *Disassembly) buildFunction(entry uint32, entries map[uint32]bool) *Function {
+	sec := d.sectionOf(entry)
+	if sec == nil {
+		return nil
+	}
+	seen := make(map[uint32]bool)
+	work := []uint32{entry}
+	var callTargets []uint32
+	for len(work) > 0 {
+		va := work[len(work)-1]
+		work = work[:len(work)-1]
+		for {
+			if seen[va] || va < sec.VirtualAddr || va >= sec.VirtualAddr+sec.VirtualSize {
+				break
+			}
+			insn, ok := d.InsnByVA[va]
+			if !ok {
+				break
+			}
+			seen[va] = true
+			next := va + uint32(insn.Inst.Len)
+			op := insn.Inst.Op
+			if op == x86asm.CALL {
+				if t := resolveTarget(insn); t != 0 {
+					callTargets = append(callTargets, t)
+				}
+			}
+			if op == x86asm.RET || op == x86asm.INT || op == x86asm.HLT {
+				break
+			}
+			if isJump(op) {
+				t := resolveTarget(insn)
+				if t == 0 {
+					for _, jt := range d.jumpTableTargets(insn, sec) {
+						work = append(work, jt)
+					}
+				} else if t != entry && !(entries[t] && op == x86asm.JMP) {
+					work = append(work, t)
+				}
+				if isUnconditionalJump(op) {
+					break
+				}
+			}
+			va = next
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	fn := &Function{EntryVA: entry, CallTargets: callTargets}
+	vas := make([]uint32, 0, len(seen))
+	for va := range seen {
+		vas = append(vas, va)
+	}
+	sort.Slice(vas, func(i, j int) bool { return vas[i] < vas[j] })
+	for _, va := range vas {
+		fn.Instructions = append(fn.Instructions, *d.InsnByVA[va])
+	}
+	last := fn.Instructions[len(fn.Instructions)-1]
+	fn.Size = int(last.VA - entry + uint32(last.Inst.Len))
+	return fn
+}
+
+// Reads consecutive code pointers from an indirect jump's table until one leaves the section
+func (d *Disassembly) jumpTableTargets(insn *Instruction, sec *Section) []uint32 {
+	mem, ok := insn.Inst.Args[0].(x86asm.Mem)
+	if !ok || mem.Scale != 4 || mem.Index == 0 || mem.Disp == 0 {
+		return nil
+	}
+	var out []uint32
+	for i := 0; i < 512; i++ {
+		t, ok := d.Image.ReadU32(uint32(mem.Disp) + uint32(i)*4)
+		if !ok || t < sec.VirtualAddr || t >= sec.VirtualAddr+sec.VirtualSize || d.InsnByVA[t] == nil {
+			break
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// Returns the section containing a virtual address or nil
+func (d *Disassembly) sectionOf(va uint32) *Section {
+	for i := range d.Image.Sections {
+		s := &d.Image.Sections[i]
+		if va >= s.VirtualAddr && va < s.VirtualAddr+s.VirtualSize {
+			return s
+		}
+	}
+	return nil
+}
+
+// Collects code addresses stored as data pointers that sit on a function boundary
+func (d *Disassembly) pointerTargets() []uint32 {
+	endsAt := make(map[uint32]*Instruction, len(d.InsnByVA))
+	for _, insn := range d.InsnByVA {
+		endsAt[insn.VA+uint32(insn.Inst.Len)] = insn
+	}
+	var out []uint32
+	for i := range d.Image.Sections {
+		sec := &d.Image.Sections[i]
+		for off := 0; off+4 <= int(sec.RawSize); off += 4 {
+			va := binary.LittleEndian.Uint32(sec.Data[off:])
+			insn, ok := d.InsnByVA[va]
+			if !ok || insn.Inst.Op == x86asm.INT || insn.Inst.Op == x86asm.NOP {
+				continue
+			}
+			prev, hasPrev := endsAt[va]
+			if hasPrev && !isBoundaryOp(prev.Inst.Op) {
+				continue
+			}
+			out = append(out, va)
+		}
+	}
+	return out
+}
+
+// Reports whether an instruction ending at an address lets a function start there
+func isBoundaryOp(op x86asm.Op) bool {
+	switch op {
+	case x86asm.RET, x86asm.JMP, x86asm.INT, x86asm.NOP, x86asm.HLT:
+		return true
+	}
+	return false
 }
 
 // resolveTarget extracts the absolute target address from a CALL or JMP instruction.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/xbe"
@@ -41,8 +42,24 @@ func init() {
 		RunE:  runXBEDisasm,
 	}
 	disasmCmd.Flags().StringVarP(&xbeDisasmOutput, "output", "o", "", "output file (default: input with .c extension)")
+	matsCmd.Flags().BoolVarP(&xbeMaterialsVerbose, "verbose", "v", false, "print every apply path")
 
-	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd)
+	symbolsCmd := &cobra.Command{
+		Use:   "symbols <file.xbe>",
+		Short: "List XDK library functions identified by signature",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runXBESymbols,
+	}
+
+	renderCmd := &cobra.Command{
+		Use:   "render <file.xbe>",
+		Short: "Derive the render model and write it as JSON",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runXBERender,
+	}
+	renderCmd.Flags().StringVarP(&xbeRenderOutput, "output", "o", "", "output file (default: stdout)")
+
+	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, symbolsCmd, renderCmd)
 	rootCmd.AddCommand(xbeCmd)
 }
 
@@ -67,17 +84,58 @@ func runXBEInfo(cmd *cobra.Command, args []string) error {
 }
 
 func runXBEMaterials(cmd *cobra.Command, args []string) error {
-	materials, err := xbe.ExtractMaterialsFromXBE(args[0])
+	img, err := xbe.Open(args[0])
 	if err != nil {
 		return err
 	}
-
-	fmt.Fprintf(os.Stderr, "Extracted %d materials\n", len(materials))
-
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(materials)
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+	ms, err := xbe.DeriveMaterials(d)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("factory %08X allocator %08X constructors %d materials %d\n", ms.FactoryVA, ms.AllocatorVA, len(ms.Ctors), len(ms.Materials))
+	for _, m := range ms.Materials {
+		fmt.Printf("\n== %s (%s) ctor %08X vtable %08X apply %08X paths %d\n", m.Name, m.Object, m.CtorVA, m.VtableVA, m.ApplyVA, len(m.Apply))
+		offs := make([]int, 0, len(m.Fields))
+		for off := range m.Fields {
+			offs = append(offs, int(off))
+		}
+		sort.Ints(offs)
+		var parts []string
+		for _, off := range offs {
+			parts = append(parts, fmt.Sprintf("+%X=%02X", off, m.Fields[int32(off)]))
+		}
+		fmt.Printf("   fields: %s\n", strings.Join(parts, " "))
+		fmt.Printf("   inputs: %s\n", strings.Join(m.Inputs, " "))
+		if xbeMaterialsVerbose {
+			for i, p := range m.Paths {
+				var guards []string
+				for _, g := range p.Guards {
+					guards = append(guards, xbe.ExprString(g))
+				}
+				fmt.Printf("   path %d guards: %s\n", i, strings.Join(guards, " && "))
+				for _, e := range p.Effects {
+					if e.Kind == "call" {
+						var args []string
+						for _, a := range e.Args {
+							args = append(args, xbe.ExprString(a))
+						}
+						fmt.Printf("      %08X call %s(%s)\n", e.VA, e.Fn, strings.Join(args, ", "))
+					} else {
+						fmt.Printf("      %08X %s+%X.%d = %s\n", e.VA, e.Base, e.Off, e.Size, xbe.ExprString(e.Value))
+					}
+				}
+				fmt.Printf("      return %s\n", xbe.ExprString(p.Return))
+			}
+		}
+	}
+	return nil
 }
+
+var xbeMaterialsVerbose bool
 
 func runXBEDisasm(cmd *cobra.Command, args []string) error {
 	img, err := xbe.Open(args[0])
@@ -134,4 +192,57 @@ func runXBEDisasm(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "  Written to %s\n", outPath)
 	return nil
+}
+
+func runXBESymbols(cmd *cobra.Command, args []string) error {
+	img, err := xbe.Open(args[0])
+	if err != nil {
+		return err
+	}
+	for _, l := range img.Libs {
+		fmt.Fprintf(os.Stderr, "  %-8s %d.%d.%d\n", l.Name, l.Major, l.Minor, l.Build)
+	}
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+	for _, s := range d.Symbols {
+		fmt.Printf("%08X %-9s %4d %3d %s\n", s.VA, s.Lib, s.Version, s.ArgBytes, s.Name)
+	}
+	fmt.Fprintf(os.Stderr, "%d symbols\n", len(d.Symbols))
+	return nil
+}
+
+var xbeRenderOutput string
+
+func runXBERender(cmd *cobra.Command, args []string) error {
+	img, err := xbe.Open(args[0])
+	if err != nil {
+		return err
+	}
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+	rm, err := xbe.DeriveRender(d)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "xdk %d materials %d programs %d declarations %d formats %X\n", rm.XDK, len(rm.Materials), len(rm.Programs), len(rm.Declarations), rm.Formats)
+	fmt.Fprintf(os.Stderr, "transforms %v clock %+v hierarchy alpha %08X accessor %+v wrapper %08X\n", rm.Transforms, rm.Clock, rm.HierarchyAlpha, rm.Accessor, rm.Wrapper)
+	fmt.Fprintf(os.Stderr, "fixed function %+v\n", rm.FixedFunction)
+	fmt.Fprintf(os.Stderr, "state names %v\n", rm.StateNames)
+	fmt.Fprintf(os.Stderr, "defaults paths %d node constant paths %d\n", len(rm.Defaults), len(rm.NodeConstants))
+	data, err := json.MarshalIndent(rm, "", " ")
+	if err != nil {
+		return err
+	}
+	if xbeRenderOutput == "" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(xbeRenderOutput), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(xbeRenderOutput, data, 0o644)
 }

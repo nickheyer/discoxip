@@ -146,7 +146,7 @@ func ExportGLB(w io.Writer, s *Scene) error {
 
 	hasGeometry := false
 	for _, md := range s.Meshes {
-		if len(md.Vertices) > 0 {
+		if md.Count > 0 {
 			hasGeometry = true
 			break
 		}
@@ -366,7 +366,7 @@ func (b *glbBuilder) ensureMeshWithMaterial(url, name string, matNode *xap.Node,
 	}
 
 	md, ok := b.scene.Meshes[url]
-	if !ok || len(md.Vertices) == 0 {
+	if !ok || md.Count == 0 {
 		return -1
 	}
 
@@ -387,35 +387,23 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 	if name == "" {
 		name = md.Name
 	}
+	verts, err := md.Vertices(b.scene.Layouts)
+	if err != nil {
+		b.scene.Warnings = append(b.scene.Warnings, err.Error())
+		return -1
+	}
 
 	posOffset := len(b.binBuf)
-	posData := encodePositions(md.Vertices)
+	posData := encodePositions(verts)
 	b.binBuf = append(b.binBuf, posData...)
 
 	normOffset := len(b.binBuf)
-	normData := encodeNormals(md.Vertices)
+	normData := encodeNormals(verts)
 	b.binBuf = append(b.binBuf, normData...)
 
 	uvOffset := len(b.binBuf)
-	uvData := encodeUVs(md.Vertices)
+	uvData := encodeUVs(verts)
 	b.binBuf = append(b.binBuf, uvData...)
-
-	// Check if any vertices have color data
-	hasColors := false
-	for _, v := range md.Vertices {
-		if v.HasColor {
-			hasColors = true
-			break
-		}
-	}
-
-	var colorOffset int
-	var colorData []byte
-	if hasColors {
-		colorOffset = len(b.binBuf)
-		colorData = encodeColors(md.Vertices)
-		b.binBuf = append(b.binBuf, colorData...)
-	}
 
 	idxOffset := len(b.binBuf)
 	idxData := encodeIndices(md.Indices)
@@ -425,7 +413,7 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 		b.binBuf = append(b.binBuf, 0)
 	}
 
-	minPos, maxPos := computeBounds(md.Vertices)
+	minPos, maxPos := computeBounds(verts)
 
 	bvBase := len(b.root.BufferViews)
 	b.root.BufferViews = append(b.root.BufferViews,
@@ -433,12 +421,6 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 		gltfBufferView{Buffer: 0, ByteOffset: normOffset, ByteLength: len(normData), Target: 34962},
 		gltfBufferView{Buffer: 0, ByteOffset: uvOffset, ByteLength: len(uvData), Target: 34962},
 	)
-
-	if hasColors {
-		b.root.BufferViews = append(b.root.BufferViews,
-			gltfBufferView{Buffer: 0, ByteOffset: colorOffset, ByteLength: len(colorData), Target: 34962},
-		)
-	}
 
 	idxBVIdx := len(b.root.BufferViews)
 	b.root.BufferViews = append(b.root.BufferViews,
@@ -448,12 +430,12 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 	accBase := len(b.root.Accessors)
 	b.root.Accessors = append(b.root.Accessors,
 		gltfAccessor{
-			BufferView: bvBase, ComponentType: 5126, Count: len(md.Vertices), Type: "VEC3",
+			BufferView: bvBase, ComponentType: 5126, Count: len(verts), Type: "VEC3",
 			Min: []float64{float64(minPos[0]), float64(minPos[1]), float64(minPos[2])},
 			Max: []float64{float64(maxPos[0]), float64(maxPos[1]), float64(maxPos[2])},
 		},
-		gltfAccessor{BufferView: bvBase + 1, ComponentType: 5126, Count: len(md.Vertices), Type: "VEC3"},
-		gltfAccessor{BufferView: bvBase + 2, ComponentType: 5126, Count: len(md.Vertices), Type: "VEC2"},
+		gltfAccessor{BufferView: bvBase + 1, ComponentType: 5126, Count: len(verts), Type: "VEC3"},
+		gltfAccessor{BufferView: bvBase + 2, ComponentType: 5126, Count: len(verts), Type: "VEC2"},
 	)
 
 	attrs := map[string]int{
@@ -463,13 +445,6 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 	}
 
 	nextAcc := accBase + 3
-	if hasColors {
-		b.root.Accessors = append(b.root.Accessors,
-			gltfAccessor{BufferView: bvBase + 3, ComponentType: 5126, Count: len(md.Vertices), Type: "VEC4"},
-		)
-		attrs["COLOR_0"] = nextAcc
-		nextAcc++
-	}
 
 	b.root.Accessors = append(b.root.Accessors,
 		gltfAccessor{BufferView: idxBVIdx, ComponentType: 5123, Count: len(md.Indices), Type: "SCALAR"},
@@ -726,17 +701,6 @@ func encodeUVs(verts []buffer.Vertex) []byte {
 	for i, v := range verts {
 		binary.LittleEndian.PutUint32(buf[i*8:], math.Float32bits(v.UV[0]))
 		binary.LittleEndian.PutUint32(buf[i*8+4:], math.Float32bits(v.UV[1]))
-	}
-	return buf
-}
-
-func encodeColors(verts []buffer.Vertex) []byte {
-	buf := make([]byte, len(verts)*16)
-	for i, v := range verts {
-		binary.LittleEndian.PutUint32(buf[i*16:], math.Float32bits(v.Color[0]))
-		binary.LittleEndian.PutUint32(buf[i*16+4:], math.Float32bits(v.Color[1]))
-		binary.LittleEndian.PutUint32(buf[i*16+8:], math.Float32bits(v.Color[2]))
-		binary.LittleEndian.PutUint32(buf[i*16+12:], math.Float32bits(v.Color[3]))
 	}
 	return buf
 }

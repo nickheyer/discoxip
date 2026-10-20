@@ -66,21 +66,10 @@ func runMeshInfo(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Type: %s\n", m.Type)
 		fmt.Printf("  Size: %d bytes\n", m.Size)
 
-		switch m.Type {
-		case mesh.ContentText:
-			if m.Text != nil {
-				fmt.Printf("  Nodes: %d\n", len(m.Text.NodeNames))
-				if len(m.Text.MeshRefs) > 0 {
-					fmt.Printf("  Mesh refs: %v\n", m.Text.MeshRefs)
-				}
-			}
-		case mesh.ContentBinary:
-			if m.Binary != nil {
-				if len(m.Binary.VertexColors) > 0 {
-					fmt.Printf("  Vertex colors: %d\n", len(m.Binary.VertexColors))
-				} else {
-					fmt.Printf("  Color entries: %d (all zero / no color data)\n", m.Binary.ColorCount)
-				}
+		if m.Type == mesh.ContentText && m.Text != nil {
+			fmt.Printf("  Nodes: %d\n", len(m.Text.NodeNames))
+			if len(m.Text.MeshRefs) > 0 {
+				fmt.Printf("  Mesh refs: %v\n", m.Text.MeshRefs)
 			}
 		}
 

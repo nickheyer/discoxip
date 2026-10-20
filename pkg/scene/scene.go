@@ -3,6 +3,7 @@ package scene
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"os"
@@ -11,24 +12,35 @@ import (
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/buffer"
-	"github.com/nickheyer/discoxip/pkg/mesh"
 	"github.com/nickheyer/discoxip/pkg/texture"
 	"github.com/nickheyer/discoxip/pkg/xap"
 )
 
-// MeshData holds resolved vertex and index data for a mesh reference.
+// errMeshMissing marks a mesh URL that no extracted archive packs
+var errMeshMissing = errors.New("packed in no extracted archive")
+
+// Layout is the vertex declaration the executable binds to a vertex buffer format code.
+type Layout struct {
+	Stride    int
+	Elements  []buffer.Element
+	Semantics map[int]string // register to fixed function meaning
+}
+
+// MeshData holds resolved vertex attributes and indices for a mesh reference.
 type MeshData struct {
-	Name     string
-	Vertices []buffer.Vertex
-	Indices  []uint16
+	Name       string
+	Format     uint32
+	Count      int
+	Attributes []buffer.Attribute
+	Indices    []uint16
 }
 
 // BufferPool is a named VB/IB pair discovered in the scene directory.
 type BufferPool struct {
-	Name     string
-	VB       *buffer.VBReader
-	IB       *buffer.IBReader
-	MeshData *MeshData // resolved geometry (nil if VB format unknown)
+	Name       string
+	VB         *buffer.VBReader
+	IB         *buffer.IBReader
+	Attributes []buffer.Attribute
 }
 
 // meshManifestEntry mirrors extract.MeshManifestEntry for JSON decoding.
@@ -51,99 +63,73 @@ type TextureData struct {
 type Scene struct {
 	XAP      *xap.Scene
 	Pools    []*BufferPool        // all discovered VB/IB pools
-	Meshes   map[string]*MeshData // mesh URL → resolved geometry
+	Meshes   map[string]*MeshData // mesh URL to resolved geometry
 	Textures []*TextureData       // all discovered and decoded textures
 	Dir      string               // base directory for resolving paths
+	Layouts  map[uint32]Layout
+	Missing  []string // mesh URLs no extracted archive contains
 	Warnings []string
 }
 
-// Load parses a XAP scene file and resolves mesh references from the same directory.
-func Load(xapPath string) (*Scene, error) {
+// Load parses a XAP scene file and resolves every mesh reference through the manifest.
+func Load(xapPath string, layouts map[uint32]Layout) (*Scene, error) {
 	ast, err := xap.ParseFile(xapPath)
 	if err != nil {
 		return nil, fmt.Errorf("scene: parsing XAP: %w", err)
 	}
-
 	dir := filepath.Dir(xapPath)
-	s := &Scene{
-		XAP:    ast,
-		Meshes: make(map[string]*MeshData),
-		Dir:    dir,
-	}
-
-	// Propagate parser warnings
+	s := &Scene{XAP: ast, Meshes: make(map[string]*MeshData), Dir: dir, Layouts: layouts}
 	s.Warnings = append(s.Warnings, ast.Warnings...)
 
-	// Discover all VB/IB pools
-	s.Pools = discoverPools(dir)
-	for _, pool := range s.Pools {
-		if pool.VB.Vertices != nil && pool.IB != nil {
-			pool.MeshData = &MeshData{
-				Name:     pool.Name,
-				Vertices: pool.VB.Vertices,
-				Indices:  pool.IB.Indices,
-			}
-		}
+	pools, err := discoverPools(dir, layouts)
+	if err != nil {
+		return nil, err
 	}
-
-	// Discover and decode textures
+	s.Pools = pools
 	s.Textures = discoverTextures(dir, &s.Warnings)
 
-	// Load mesh manifest (written by extract) for correct pool/sub-range mapping
-	manifest := loadManifest(dir)
-
-	// Detect archive name from XAP filename.
-	// Multi-archive extraction prefixes XAPs: "mainmenu5_default.xap" → archive "mainmenu5".
-	// Manifest keys are then "mainmenu5:meshname.xm".
+	manifest, err := loadManifest(dir)
+	if err != nil {
+		return nil, err
+	}
 	archiveName := detectArchiveName(xapPath, manifest)
-
-	// Resolve mesh references from the XAP scene graph.
-	meshRefs := ast.MeshRefs()
-	for _, url := range meshRefs {
+	for _, url := range ast.MeshRefs() {
 		if _, ok := s.Meshes[url]; ok {
 			continue
 		}
-		s.Meshes[url] = s.resolveMesh(url, manifest, archiveName)
+		md, err := s.resolveMesh(url, manifest, archiveName)
+		if err != nil {
+			if errors.Is(err, errMeshMissing) {
+				s.Missing = append(s.Missing, url)
+				continue
+			}
+			return nil, err
+		}
+		s.Meshes[url] = md
 	}
-
-	// Apply vertex colors from .xm files to resolved meshes
-	s.applyVertexColors()
-
 	return s, nil
 }
 
-// detectArchiveName tries to determine which archive a XAP came from by
-// checking if the manifest has entries prefixed with "archiveName:".
-// Returns empty string if no archive prefix is detected (single-archive mode).
+// detectArchiveName determines which archive a XAP came from by matching manifest prefixes.
 func detectArchiveName(xapPath string, manifest map[string]meshManifestEntry) string {
 	base := filepath.Base(xapPath)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-
-	// Try splitting "mainmenu5_default" → archiveName="mainmenu5"
-	// Look for the longest prefix that matches manifest archive names.
+	name := strings.TrimSuffix(base, filepath.Ext(base))
 	for i := len(name) - 1; i > 0; i-- {
-		if name[i] == '_' {
-			candidate := name[:i]
-			prefix := candidate + ":"
-			for k := range manifest {
-				if strings.HasPrefix(k, prefix) {
-					return candidate
-				}
+		if name[i] != '_' {
+			continue
+		}
+		prefix := name[:i] + ":"
+		for k := range manifest {
+			if strings.HasPrefix(k, prefix) {
+				return name[:i]
 			}
 		}
 	}
-
-	// No prefix — check if manifest uses unprefixed keys (single-archive mode)
 	return ""
 }
 
-// resolveMesh attempts to find geometry for a mesh URL.
-func (s *Scene) resolveMesh(url string, manifest map[string]meshManifestEntry, archiveName string) *MeshData {
-	md := &MeshData{Name: url}
-
-	// Strategy 1: Use mesh manifest (from XIP extraction) for exact pool/range mapping.
-	// Try archive-prefixed key first, then plain key.
+// resolveMesh finds the pool sub range the manifest recorded for a mesh URL.
+func (s *Scene) resolveMesh(url string, manifest map[string]meshManifestEntry, archiveName string) (*MeshData, error) {
 	entry, ok := meshManifestEntry{}, false
 	if archiveName != "" {
 		entry, ok = manifest[archiveName+":"+url]
@@ -151,94 +137,39 @@ func (s *Scene) resolveMesh(url string, manifest map[string]meshManifestEntry, a
 	if !ok {
 		entry, ok = manifest[url]
 	}
-	if ok {
-		poolName := entry.Pool
-		pool := s.findPool(poolName)
-		if pool != nil && pool.VB.Vertices != nil && pool.IB != nil {
-			indexCount := entry.TriCount * 3
-			indexEnd := entry.IndexStart + indexCount
-			if indexEnd <= len(pool.IB.Indices) {
-				subIndices := pool.IB.Indices[entry.IndexStart:indexEnd]
-				md.Vertices, md.Indices = extractSubMesh(pool.VB.Vertices, subIndices)
-				return md
+	if !ok {
+		// Scenes reference meshes packed in other archives by the same relative URL.
+		var matches []string
+		for k := range manifest {
+			if strings.HasSuffix(k, ":"+url) {
+				matches = append(matches, k)
 			}
-			s.Warnings = append(s.Warnings,
-				fmt.Sprintf("mesh %q: index range [%d,%d) exceeds pool %q IB (%d indices)",
-					url, entry.IndexStart, indexEnd, poolName, len(pool.IB.Indices)))
-		} else {
-			s.Warnings = append(s.Warnings,
-				fmt.Sprintf("mesh %q: manifest references pool %q but pool not found or not decoded", url, poolName))
+		}
+		sort.Strings(matches)
+		switch len(matches) {
+		case 0:
+			return nil, fmt.Errorf("scene: mesh %q: %w", url, errMeshMissing)
+		case 1:
+			entry = manifest[matches[0]]
+		default:
+			return nil, fmt.Errorf("scene: mesh %q is packed in several archives: %v", url, matches)
 		}
 	}
-
-	// Strategy 2 (fallback): Direct name match
-	base := strings.TrimSuffix(url, filepath.Ext(url))
-	for _, pool := range s.Pools {
-		if pool.Name == base && pool.MeshData != nil {
-			md.Vertices = pool.MeshData.Vertices
-			md.Indices = pool.MeshData.Indices
-			return md
-		}
+	pool := s.findPool(entry.Pool)
+	if pool == nil {
+		return nil, fmt.Errorf("scene: mesh %q references pool %q which was not extracted", url, entry.Pool)
 	}
-
-	// Strategy 3 (fallback): Single pool
-	var resolvedPools []*BufferPool
-	for _, pool := range s.Pools {
-		if pool.MeshData != nil {
-			resolvedPools = append(resolvedPools, pool)
-		}
+	if pool.IB == nil || pool.Attributes == nil {
+		return nil, fmt.Errorf("scene: mesh %q references pool %q which has no decoded geometry", url, entry.Pool)
 	}
-	if len(resolvedPools) == 1 {
-		pool := resolvedPools[0]
-		md.Vertices = pool.MeshData.Vertices
-		md.Indices = pool.MeshData.Indices
-		return md
+	indexCount := entry.TriCount * 3
+	indexEnd := entry.IndexStart + indexCount
+	if indexEnd > len(pool.IB.Indices) {
+		return nil, fmt.Errorf("scene: mesh %q index range [%d,%d) exceeds pool %q with %d indices", url, entry.IndexStart, indexEnd, entry.Pool, len(pool.IB.Indices))
 	}
-
-	// No match found — return empty geometry rather than guessing wrong
-	s.Warnings = append(s.Warnings,
-		fmt.Sprintf("mesh %q: no matching pool found (%d pools available)", url, len(resolvedPools)))
-	return md
-}
-
-// applyVertexColors loads .xm files from the scene directory and
-// merges their RGBA vertex colors into the corresponding resolved meshes.
-func (s *Scene) applyVertexColors() {
-	for url, md := range s.Meshes {
-		if len(md.Vertices) == 0 {
-			continue
-		}
-
-		// Look for a matching .xm file in the scene directory
-		xmPath := filepath.Join(s.Dir, url)
-		xm, err := mesh.Open(xmPath)
-		if err != nil {
-			continue // no .xm file or unreadable — not an error
-		}
-
-		if xm.Binary == nil || len(xm.Binary.VertexColors) == 0 {
-			continue
-		}
-
-		colors := xm.Binary.VertexColors
-		if len(colors) < len(md.Vertices) {
-			s.Warnings = append(s.Warnings,
-				fmt.Sprintf("mesh %q: .xm has %d vertex colors but mesh has %d vertices",
-					url, len(colors), len(md.Vertices)))
-			continue
-		}
-
-		for i := range md.Vertices {
-			c := colors[i]
-			md.Vertices[i].Color = [4]float32{
-				float32(c.R) / 255.0,
-				float32(c.G) / 255.0,
-				float32(c.B) / 255.0,
-				float32(c.A) / 255.0,
-			}
-			md.Vertices[i].HasColor = true
-		}
-	}
+	md := &MeshData{Name: url, Format: pool.VB.Header.FormatCode}
+	md.Attributes, md.Indices, md.Count = extractSubMesh(pool, pool.IB.Indices[entry.IndexStart:indexEnd])
+	return md, nil
 }
 
 // findPool returns the pool with the given name, or nil.
@@ -251,14 +182,11 @@ func (s *Scene) findPool(name string) *BufferPool {
 	return nil
 }
 
-// extractSubMesh extracts vertices referenced by a sub-range of indices,
-// returning compacted vertices and remapped indices.
-func extractSubMesh(poolVerts []buffer.Vertex, indices []uint16) ([]buffer.Vertex, []uint16) {
+// extractSubMesh copies the vertex range an index sub range touches and remaps the indices
+func extractSubMesh(pool *BufferPool, indices []uint16) ([]buffer.Attribute, []uint16, int) {
 	if len(indices) == 0 {
-		return nil, nil
+		return nil, nil, 0
 	}
-
-	// Find min/max to check if vertices are contiguous
 	minIdx, maxIdx := indices[0], indices[0]
 	for _, idx := range indices[1:] {
 		if idx < minIdx {
@@ -268,137 +196,139 @@ func extractSubMesh(poolVerts []buffer.Vertex, indices []uint16) ([]buffer.Verte
 			maxIdx = idx
 		}
 	}
-
-	// Bounds check
-	if int(maxIdx) >= len(poolVerts) {
-		return nil, nil
+	count := int(maxIdx-minIdx) + 1
+	attrs := make([]buffer.Attribute, len(pool.Attributes))
+	for i, a := range pool.Attributes {
+		c := a.Element.Comps
+		attrs[i] = buffer.Attribute{Element: a.Element, Data: append([]float32(nil), a.Data[int(minIdx)*c:(int(maxIdx)+1)*c]...)}
 	}
-
-	// Extract the contiguous vertex range and remap indices
-	verts := make([]buffer.Vertex, maxIdx-minIdx+1)
-	copy(verts, poolVerts[minIdx:maxIdx+1])
-
 	remapped := make([]uint16, len(indices))
 	for i, idx := range indices {
 		remapped[i] = idx - minIdx
 	}
+	return attrs, remapped, count
+}
 
-	return verts, remapped
+// Attribute returns the decoded attribute bound to a fixed function meaning or nil
+func (md *MeshData) Attribute(layouts map[uint32]Layout, semantic string) *buffer.Attribute {
+	layout, ok := layouts[md.Format]
+	if !ok {
+		return nil
+	}
+	for i := range md.Attributes {
+		if layout.Semantics[md.Attributes[i].Element.Register] == semantic {
+			return &md.Attributes[i]
+		}
+	}
+	return nil
+}
+
+// Vertices expands the fixed function position, normal and texcoord attributes
+func (md *MeshData) Vertices(layouts map[uint32]Layout) ([]buffer.Vertex, error) {
+	pos := md.Attribute(layouts, "position")
+	if pos == nil {
+		return nil, fmt.Errorf("scene: mesh %q has no position attribute", md.Name)
+	}
+	norm := md.Attribute(layouts, "normal")
+	uv := md.Attribute(layouts, "texcoord0")
+	verts := make([]buffer.Vertex, md.Count)
+	for i := range verts {
+		copy(verts[i].Pos[:], pos.Data[i*pos.Element.Comps:])
+		if norm != nil {
+			copy(verts[i].Normal[:], norm.Data[i*norm.Element.Comps:])
+		}
+		if uv != nil {
+			copy(verts[i].UV[:], uv.Data[i*uv.Element.Comps:])
+		}
+	}
+	return verts, nil
 }
 
 // loadManifest reads _meshes.json from the scene directory.
-// Returns nil map if not found.
-func loadManifest(dir string) map[string]meshManifestEntry {
+func loadManifest(dir string) (map[string]meshManifestEntry, error) {
 	path := filepath.Join(dir, "_meshes.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("scene: reading mesh manifest: %w", err)
 	}
-
 	var manifest map[string]meshManifestEntry
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil
+		return nil, fmt.Errorf("scene: parsing mesh manifest: %w", err)
 	}
-	return manifest
+	return manifest, nil
 }
 
-// discoverTextures finds and decodes .xbx texture files in the directory.
+// discoverTextures finds all .xbx files in the directory and decodes them to PNG.
 func discoverTextures(dir string, warnings *[]string) []*TextureData {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-
 	var textures []*TextureData
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if strings.ToLower(filepath.Ext(e.Name())) != ".xbx" {
+		name := e.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".xbx" {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		tex, err := texture.OpenXPR(path)
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		tex, err := texture.OpenXPR(filepath.Join(dir, name))
 		if err != nil {
-			*warnings = append(*warnings, fmt.Sprintf("texture %q: %v", e.Name(), err))
+			*warnings = append(*warnings, fmt.Sprintf("texture %s: %v", name, err))
 			continue
 		}
-
-		img, err := texture.Decode(tex)
-		if err != nil {
-			*warnings = append(*warnings, fmt.Sprintf("texture %q: decode: %v", e.Name(), err))
-			continue
-		}
-
 		var buf bytes.Buffer
-		if err := png.Encode(&buf, img); err != nil {
-			*warnings = append(*warnings, fmt.Sprintf("texture %q: png encode: %v", e.Name(), err))
+		if err := texture.ExportPNG(&buf, tex); err != nil {
+			*warnings = append(*warnings, fmt.Sprintf("texture %s: encoding PNG: %v", name, err))
 			continue
 		}
-
-		baseName := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-		textures = append(textures, &TextureData{
-			Name:    baseName,
-			PNGData: buf.Bytes(),
-			Width:   tex.Info.Width,
-			Height:  tex.Info.Height,
-		})
+		cfg, err := png.DecodeConfig(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			*warnings = append(*warnings, fmt.Sprintf("texture %s: reading PNG header: %v", name, err))
+			continue
+		}
+		textures = append(textures, &TextureData{Name: base, PNGData: buf.Bytes(), Width: cfg.Width, Height: cfg.Height})
 	}
-
-	sort.Slice(textures, func(i, j int) bool {
-		return textures[i].Name < textures[j].Name
-	})
-
+	sort.Slice(textures, func(i, j int) bool { return textures[i].Name < textures[j].Name })
 	return textures
 }
 
-// discoverPools finds VB/IB file pairs in the directory.
-// Files are paired by base name (e.g., "~0.vb" + "~0.ib" = pool "~0").
-func discoverPools(dir string) []*BufferPool {
-	vbs := make(map[string]*buffer.VBReader)
-	ibs := make(map[string]*buffer.IBReader)
-
+// discoverPools finds every VB/IB pair and decodes the vertices through the executable's layout
+func discoverPools(dir string, layouts map[uint32]Layout) ([]*BufferPool, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-
+	var pools []*BufferPool
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || strings.ToLower(filepath.Ext(e.Name())) != ".vb" {
 			continue
 		}
-		ext := filepath.Ext(e.Name())
-		baseName := strings.TrimSuffix(e.Name(), ext)
-		path := filepath.Join(dir, e.Name())
-
-		switch ext {
-		case ".vb":
-			vb, err := buffer.OpenVB(path)
-			if err == nil {
-				vbs[baseName] = vb
-			}
-		case ".ib":
-			ib, err := buffer.OpenIB(path)
-			if err == nil {
-				ibs[baseName] = ib
-			}
+		base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		vb, err := buffer.OpenVB(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("scene: %s: %w", e.Name(), err)
 		}
-	}
-
-	// Match VB/IB pairs by base name
-	var pools []*BufferPool
-	for name, vb := range vbs {
-		pool := &BufferPool{Name: name, VB: vb}
-		if ib, ok := ibs[name]; ok {
+		pool := &BufferPool{Name: base, VB: vb}
+		if ib, err := buffer.OpenIB(filepath.Join(dir, base+".ib")); err == nil {
 			pool.IB = ib
+		}
+		if vb.Header.VertexCount > 0 {
+			layout, ok := layouts[vb.Header.FormatCode]
+			if !ok {
+				return nil, fmt.Errorf("scene: %s uses vertex format %08X which the executable never declares", e.Name(), vb.Header.FormatCode)
+			}
+			attrs, err := vb.Decode(layout.Elements, layout.Stride)
+			if err != nil {
+				return nil, fmt.Errorf("scene: %s: %w", e.Name(), err)
+			}
+			pool.Attributes = attrs
 		}
 		pools = append(pools, pool)
 	}
-
-	// Sort by name for deterministic ordering
-	sort.Slice(pools, func(i, j int) bool {
-		return pools[i].Name < pools[j].Name
-	})
-
-	return pools
+	sort.Slice(pools, func(i, j int) bool { return pools[i].Name < pools[j].Name })
+	return pools, nil
 }

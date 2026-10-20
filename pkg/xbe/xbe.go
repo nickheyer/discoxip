@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // XOR keys for unscrambling the entry point and kernel thunk address.
@@ -84,13 +85,32 @@ type Section struct {
 	Data        []byte // loaded into virtual size (zero-padded)
 }
 
+// LibVersion is one entry of the XBE library version table.
+type LibVersion struct {
+	Name  string
+	Major uint16
+	Minor uint16
+	Build uint16
+}
+
 // Image is a parsed XBE image with sections mapped by virtual address.
 type Image struct {
 	BaseAddr   uint32
 	EntryPoint uint32 // unscrambled
 	KernThunk  uint32 // unscrambled
 	Sections   []Section
+	Libs       []LibVersion
 	raw        []byte // entire file contents for random access
+}
+
+// Returns the XDK build number of the named library or 0 when absent
+func (img *Image) LibBuild(name string) uint16 {
+	for _, l := range img.Libs {
+		if strings.EqualFold(l.Name, name) {
+			return l.Build
+		}
+	}
+	return 0
 }
 
 // Open reads and parses an XBE file from disk.
@@ -180,6 +200,21 @@ func Parse(data []byte) (*Image, error) {
 			RawSize:     sh.RawSize,
 			Flags:       sh.Flags,
 			Data:        secData,
+		})
+	}
+
+	// Read the library version table.
+	libOff := int(h.LibVersionsAddr - h.BaseAddr)
+	for i := 0; i < int(h.LibVersionsCount); i++ {
+		off := libOff + i*16
+		if off < 0 || off+16 > len(data) {
+			break
+		}
+		img.Libs = append(img.Libs, LibVersion{
+			Name:  readCString(data[off:off+8], 0),
+			Major: binary.LittleEndian.Uint16(data[off+8:]),
+			Minor: binary.LittleEndian.Uint16(data[off+10:]),
+			Build: binary.LittleEndian.Uint16(data[off+12:]),
 		})
 	}
 
