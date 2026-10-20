@@ -6,75 +6,34 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// D3D8 render state and texture stage state enumerations.
-// These are the Xbox D3D8 SDK constants used by the dashboard.
-
-// D3DRENDERSTATETYPE — values passed to SetRenderState
+// Xbox D3D8 render state enumeration (X_D3DRENDERSTATETYPE).
+// Derived from cxbx-reloaded/src/core/hle/D3D8/XbD3D8Types.h.
+// The Xbox enum is organized: pixel-shader (0-56), simple (57-91),
+// deferred (92-135), complex (136+). XDK-version-dependent gaps shift
+// the complex state indices. Values below are empirically verified
+// against the xboxdash.xbe Apply method traces.
 var D3DRenderStates = map[uint32]string{
-	7:   "D3DRS_ZENABLE",
-	8:   "D3DRS_FILLMODE",
-	9:   "D3DRS_SHADEMODE",
-	14:  "D3DRS_ZWRITEENABLE",
-	15:  "D3DRS_ALPHATESTENABLE",
-	19:  "D3DRS_SRCBLEND",
-	20:  "D3DRS_DESTBLEND",
-	22:  "D3DRS_CULLMODE",
-	23:  "D3DRS_ZFUNC",
-	24:  "D3DRS_ALPHAREF",
-	25:  "D3DRS_ALPHAFUNC",
-	26:  "D3DRS_DITHERENABLE",
-	27:  "D3DRS_ALPHABLENDENABLE",
-	28:  "D3DRS_FOGENABLE",
-	29:  "D3DRS_SPECULARENABLE",
-	34:  "D3DRS_FOGCOLOR",
-	35:  "D3DRS_FOGTABLEMODE",
-	36:  "D3DRS_FOGSTART",
-	37:  "D3DRS_FOGEND",
-	38:  "D3DRS_FOGDENSITY",
-	48:  "D3DRS_RANGEFOGENABLE",
-	52:  "D3DRS_STENCILENABLE",
-	53:  "D3DRS_STENCILFAIL",
-	54:  "D3DRS_STENCILZFAIL",
-	55:  "D3DRS_STENCILPASS",
-	56:  "D3DRS_STENCILFUNC",
-	57:  "D3DRS_STENCILREF",
-	58:  "D3DRS_STENCILMASK",
-	59:  "D3DRS_STENCILWRITEMASK",
-	60:  "D3DRS_TEXTUREFACTOR",
-	128: "D3DRS_TEXTUREFACTOR", // Xbox-specific alias
-	131: "D3DRS_SRCBLEND",      // Xbox-specific mapping
-	132: "D3DRS_DESTBLEND",     // Xbox-specific mapping
-	134: "D3DRS_BLENDOP",
-	137: "D3DRS_COLORWRITEENABLE",
-	154: "D3DRS_LIGHTING",
-	155: "D3DRS_AMBIENT",
-	171: "D3DRS_DIFFUSEMATERIALSOURCE",
-	172: "D3DRS_SPECULARMATERIALSOURCE",
-	173: "D3DRS_AMBIENTMATERIALSOURCE",
-	174: "D3DRS_EMISSIVEMATERIALSOURCE",
-	// Xbox-specific render states (D3DRS values above 128 are Xbox extensions)
-	127: "D3DRS_MULTISAMPLEANTIALIAS",
-	129: "D3DRS_EDGEANTIALIAS",
-	130: "D3DRS_MULTISAMPLETYPE",
-	133: "D3DRS_ZBIAS",
-	135: "D3DRS_LOGICOP",
-	136: "D3DRS_MULTISAMPLEMASK",
-	138: "D3DRS_SWATHWIDTH",
-	139: "D3DRS_POLYGONOFFSETZSLOPESCALE",
-	140: "D3DRS_POLYGONOFFSETZOFFSET",
-	141: "D3DRS_POINTOFFSETENABLE",
-	142: "D3DRS_WIREFRAMEOFFSETENABLE",
-	143: "D3DRS_SOLIDOFFSETENABLE",
-	144: "D3DRS_DEPTHCLIPCONTROL",
-	145: "D3DRS_STIPPLEENABLE",
-	146: "D3DRS_SIMPLE_UNUSED8",
-	147: "D3DRS_SIMPLE_UNUSED7",
-	148: "D3DRS_SIMPLE_UNUSED6",
-	149: "D3DRS_SIMPLE_UNUSED5",
-	150: "D3DRS_SIMPLE_UNUSED4",
-	151: "D3DRS_SIMPLE_UNUSED3",
-	152: "D3DRS_SIMPLE_UNUSED2",
-	153: "D3DRS_SIMPLE_UNUSED1",
+	// Simple render states (applied immediately)
+	57: "X_D3DRS_ZFUNC",
+	58: "X_D3DRS_ALPHAFUNC",
+	59: "X_D3DRS_ALPHABLENDENABLE",
+	60: "X_D3DRS_ALPHATESTENABLE",
+	61: "X_D3DRS_ALPHAREF",
+	62: "X_D3DRS_SRCBLEND",
+	63: "X_D3DRS_DESTBLEND",
+	64: "X_D3DRS_ZWRITEENABLE",
+	65: "X_D3DRS_DITHERENABLE",
+	66: "X_D3DRS_SHADEMODE",
+	67: "X_D3DRS_COLORWRITEENABLE",
+	74: "X_D3DRS_BLENDOP",
+	75: "X_D3DRS_BLENDCOLOR",
+	// Complex render states (XDK-version-dependent indices).
+	// These are empirically verified from xboxdash.xbe Apply method traces.
+	// The exact CXBX enum mapping depends on XDK version gap shifts.
+	127: "X_D3DRS_MULTISAMPLEANTIALIAS",
+	128: "X_D3DRS_TEXTUREFACTOR",
+	131: "X_D3DRS_SRCBLEND",
+	132: "X_D3DRS_DESTBLEND",
 }
 
 // D3DTEXTURESTAGESTATETYPE — Xbox D3D8 SDK values (from cxbx XbD3D8Types.h).
@@ -165,19 +124,22 @@ const (
 	D3DTA_ALPHAREPLICATE  = 0x20 // replicate alpha to all channels
 )
 
-// D3DBLEND — blend factor values
+// D3DBLEND — Xbox blend factor values (OpenGL-style constants).
+// Derived from cxbx-reloaded/src/core/hle/D3D8/XbConvert.cpp EmuXB2PC_D3DBLEND.
 var D3DBlendFactors = map[uint32]string{
-	0:  "D3DBLEND_ZERO",
-	1:  "D3DBLEND_ONE",
-	2:  "D3DBLEND_SRCCOLOR",
-	3:  "D3DBLEND_INVSRCCOLOR",
-	4:  "D3DBLEND_SRCALPHA",
-	5:  "D3DBLEND_INVSRCALPHA",
-	6:  "D3DBLEND_DESTALPHA",
-	7:  "D3DBLEND_INVDESTALPHA",
-	8:  "D3DBLEND_DESTCOLOR",
-	9:  "D3DBLEND_INVDESTCOLOR",
-	10: "D3DBLEND_SRCALPHASAT",
+	0x000:  "D3DBLEND_ZERO",
+	0x001:  "D3DBLEND_ONE",
+	0x300:  "D3DBLEND_SRCCOLOR",
+	0x301:  "D3DBLEND_INVSRCCOLOR",
+	0x302:  "D3DBLEND_SRCALPHA",
+	0x303:  "D3DBLEND_INVSRCALPHA",
+	0x304:  "D3DBLEND_DESTALPHA",
+	0x305:  "D3DBLEND_INVDESTALPHA",
+	0x306:  "D3DBLEND_DESTCOLOR",
+	0x307:  "D3DBLEND_INVDESTCOLOR",
+	0x308:  "D3DBLEND_SRCALPHASAT",
+	0x8001: "D3DBLEND_CONSTANTCOLOR",
+	0x8002: "D3DBLEND_INVCONSTANTCOLOR",
 }
 
 // NamedD3DFunc maps known Xbox D3D8 function addresses to their names.
@@ -269,6 +231,8 @@ func (d *Disassembly) IdentifyD3DFunctions() {
 		0x00046660: "LookupTexture",
 		0x00046912: "SetRegisterCombinerConstants",
 		0x000460D5: "GetD3DDevice",
+		// Dashboard utility wrappers
+		0x0002989C: "CMaxMaterial::SetRenderState",
 	}
 
 	for va, name := range knownFuncs {

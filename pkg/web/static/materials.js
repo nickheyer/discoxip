@@ -1,5 +1,6 @@
 // Xbox Dashboard Material System
 // Derived from xboxdash.xbe CMaxMaterial class hierarchy
+// Material definitions loaded from materials.json (extracted from XBE binary)
 
 // Material object memory layout:
 //   +0x00: vtable index (determines Apply method)
@@ -52,131 +53,6 @@ class CMaxMaterial {
   }
 }
 
-// --- Constructors (from decompiled xboxdash.xbe) ---
-
-function createFlatcolor(name, r, g, b, a, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'flatcolor';
-  m.colorBytes = [r & 0xFF, g & 0xFF, b & 0xFF, a & 0xFF];
-  return m;
-}
-
-function createCombiner(name, color1, color2, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'combiner';
-  m.color1 = color1 >>> 0;
-  m.color2 = color2 >>> 0;
-  m.textureIndex = 1;
-  return m;
-}
-
-function createWireframe(name, color1, color2, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'wireframe';
-  m.color1 = color1 >>> 0;
-  m.color2 = color2 >>> 0;
-  m.textureIndex = 3;
-  return m;
-}
-
-function createChrome(name, color1, color2, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'chrome';
-  m.color1 = color1 >>> 0;
-  m.color2 = color2 >>> 0;
-  m.textureIndex = 2;
-  return m;
-}
-
-function createInnerwall(name, color1, color2, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'innerwall';
-  m.color1 = color1 >>> 0;
-  m.color2 = color2 >>> 0;
-  m.textureIndex = 3;
-  return m;
-}
-
-function createPanel(name, r, g, b, a, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'panel';
-  m.colorBytes = [r & 0xFF, g & 0xFF, b & 0xFF, a & 0xFF];
-  return m;
-}
-
-function createBacking(name, r, g, b, a, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'backing';
-  m.colorBytes = [r & 0xFF, g & 0xFF, b & 0xFF, a & 0xFF];
-  return m;
-}
-
-function createOrb(name, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'orb';
-  return m;
-}
-
-function createReflect(name) {
-  const m = new CMaxMaterial(name, 0);
-  m.vtable = 'reflect';
-  m.color1 = 4;  // this+0x0C = 4 (from decompiled code)
-  return m;
-}
-
-function createEggpulse(name) {
-  // Inherits from combiner with color1=0, color2=0
-  const m = new CMaxMaterial(name, 0);
-  m.vtable = 'eggpulse';
-  m.color1 = 0;
-  m.color2 = 0;
-  m.textureIndex = 1;
-  return m;
-}
-
-function createEggglow(name, color1, color2, shaderCfg) {
-  // Inherits from combiner
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'eggglow';
-  m.color1 = color1 >>> 0;
-  m.color2 = color2 >>> 0;
-  m.textureIndex = 1;
-  return m;
-}
-
-function createKey(name, mode1, mode2) {
-  // Inherits from combiner with color1=0, color2=0
-  const m = new CMaxMaterial(name, 0);
-  m.vtable = 'key';
-  m.color1 = 0;
-  m.color2 = 0;
-  m.textureIndex = 1;
-  m.keyMode1 = mode1 & 0xFF;
-  m.keyMode2 = mode2 & 0xFF;
-  return m;
-}
-
-function createIcon(name, texIdx1, texIdx2, c, d, e) {
-  const m = new CMaxMaterial(name, 0);
-  m.vtable = 'icon';
-  m.colorBytes = [c & 0xFF, d & 0xFF, e & 0xFF, 0];
-  m.color1 = texIdx1;
-  m.color2 = texIdx2;
-  return m;
-}
-
-function createNumbered(name) {
-  const m = new CMaxMaterial(name, 0);
-  m.vtable = 'numbered';
-  return m;
-}
-
-function createBase(name, shaderCfg) {
-  const m = new CMaxMaterial(name, shaderCfg);
-  m.vtable = 'base';
-  return m;
-}
-
 // --- Apply methods (from decompiled xboxdash.xbe Apply_* functions) ---
 // These compute the effective color each frame. For animated materials
 // (eggpulse, eggglow, key), the color changes over time.
@@ -194,16 +70,12 @@ export function updateTime(t) {
 
 // Apply methods return { r, g, b, a } for the material's current color.
 //
-// The NV2A register combiner blends color1, color2, and texture:
-//   - color1: primary combiner constant (ARGB)
-//   - color2: secondary combiner constant (ARGB)
-//   - The combiner interpolates between them using the texture as a factor
-//   - shaderCfg & 2: alpha blending enabled (SrcAlpha/InvSrcAlpha)
-//   - shaderCfg == 0: opaque (alpha modulates RGB intensity)
-//
-// For shapes WITH textures, Three.js multiplies material.color × texture.
-// We return a blended color from color1 and color2 so the texture modulation
-// produces dark-to-bright variation matching the Xbox register combiner output.
+// NV2A register combiner formula (derived from XBE binary at VA 0x00046912):
+//   C0 = color1.rgb, C1 = (color2 - color1).rgb
+//   result.rgb = C0 + C1 * T = lerp(color1, color2, T)
+// where T is the texture sample (0 = color1, 1 = color2).
+//   shaderCfg & 2: alpha blending via lerp(color1.a, color2.a, T)
+//   shaderCfg == 0: opaque (alpha = 255)
 
 function _unpackARGB(packed) {
   const c = packed >>> 0;
@@ -215,77 +87,53 @@ function _unpackARGB(packed) {
   };
 }
 
-// NV2A register combiner output formula, derived from x86 emulator trace of
-// SetRegisterCombinerConstants (VA 0x46912). The function writes two constants
-// to the NV2A push buffer:
-//   c0 = (color1.r/255, color1.g/255, color1.b/255, color1.a/255)
-//   c1 = (-(1 - color2.r/255), -(1 - color2.g/255), -(1 - color2.b/255), -(color1.a/255))
+// NV2A register combiner equation derived from x86 binary at VA 0x00046912
+// (SetRegisterCombinerConstants in xboxdash.xbe).
 //
-// The register combiner computes: output = c0 * texture + c1
-// With texture = 1.0 (white, the default when no material texture is bound):
-//   output = c0 + c1 = color1/255 - (1 - color2/255) = (color1 + color2 - 255) / 255
+// The function unpacks color1 and color2 as float4, then writes:
+//   C0 = {color1.R, color1.G, color1.B, globalScale * color1.A}
+//   C1 = {color2.R - color1.R, color2.G - color1.G, color2.B - color1.B,
+//          (color2.A - color1.A) * globalScale}
 //
-// Values are clamped to [0, 1]. This produces the characteristic dark green of
-// the Xbox dashboard from bright color1 (yellow-green) and dark color2 (green).
+// Raw x86 at 0x4694D: FSUB DWORD [ESI] (d8 26), NOT FSUB ST0,ST0.
+// ESI = color1 ptr, EAX = color2 ptr. C1 = color2 - color1.
+//
+// The NV2A combiner computes: result = C0 + C1 * T
+//   = color1 + (color2 - color1) * T = lerp(color1, color2, T)
+//
+// Where T is the per-pixel texture sample from the bound material texture
+// (index 1=gradient, 2=chrome, 3=cellwall).
 function _applyCombiner(m) {
   const c1 = _unpackARGB(m.color1);
   const c2 = _unpackARGB(m.color2);
 
-  // From x86 emulator trace of SetRegisterCombinerConstants (VA 0x46912):
-  //   c0.rgb = color1.rgb / 255
-  //   c0.a   = globalScale(1.0) * color1.a / 255
-  //   c1     = color2 / 255 - color1 / 255
-  //
-  // NV2A combiner: output = c0.rgb * texture + c1
-  //              = lerp(color2/255, color1/255, texture)
-  //
-  // The material texture (8x256 SG8SB8 gradient, textureIndex) provides
-  // per-pixel brightness. color1.alpha encodes the overall brightness level
-  // that the texture maps to. Using c0.alpha as the uniform texture value:
-  //   output = c0.rgb * c0.alpha + c1
-  // output = c0.rgb * c0.alpha + c1.rgb
-  //        = (color1.rgb/255) * (color1.a/255) + (color2.rgb/255 - color1.rgb/255)
-  // Simplified in 0-255: output_i = color1_i * color1_a / 65025 + (color2_i - color1_i) / 255
-  // Multiply through by 255: output_i_byte = color1_i * color1_a / 255 + color2_i - color1_i
-  const t = c1.a / 255;
-  const R = Math.max(0, Math.min(255, Math.round(c1.r * t + c2.r - c1.r)));
-  const G = Math.max(0, Math.min(255, Math.round(c1.g * t + c2.g - c1.g)));
-  const B = Math.max(0, Math.min(255, Math.round(c1.b * t + c2.b - c1.b)));
+  // T = texture sample from bound material texture (index 1=gradient, 2=chrome,
+  // 3=cellwall). Blocked on GAPS.md #6 — textures not loaded yet.
+  const t = 0.5;
 
-  // shaderCfg & 2: ApplyAlpha enables SrcAlpha/InvSrcAlpha blending.
-  // Combiner alpha output = c0.a * texture + c1.a
-  //   = (color1.a/255) * texture + (color2.a/255 - color1.a/255)
-  // At texture = t: alpha = t^2 + (color2.a - color1.a) / 255
-  // This produces near-zero alpha for most materials → nearly transparent.
-  if (m.shaderCfg & 2) {
-    const outAlpha = Math.max(0, Math.min(1, t * t + (c2.a - c1.a) / 255));
-    return { r: R, g: G, b: B, a: Math.round(outAlpha * 255) };
-  }
-  return { r: R, g: G, b: B, a: 255 };
+  const r = Math.round(c1.r + (c2.r - c1.r) * t);
+  const g = Math.round(c1.g + (c2.g - c1.g) * t);
+  const b = Math.round(c1.b + (c2.b - c1.b) * t);
+  const a = Math.round(c1.a + (c2.a - c1.a) * t);
+
+  return { r: Math.max(0, Math.min(255, r)),
+           g: Math.max(0, Math.min(255, g)),
+           b: Math.max(0, Math.min(255, b)),
+           a: Math.max(0, Math.min(255, a)) };
 }
 
 const applyMethods = {
   flatcolor(m) {
-    // Apply_flatcolor: packs R,G,B into TEXTUREFACTOR with alpha squared.
-    // The squared alpha modulates the RGB intensity.
+    // Apply_flatcolor: sub_00055B8C packs raw R,G,B into D3D TEXTUREFACTOR
+    // with alpha^2 in the alpha channel. The 6 SetTextureStageState calls
+    // configure COLORARG1=TEXTUREFACTOR, COLOROP=SELECTARG1, so the output
+    // RGB IS the raw material color. Alpha^2 is used only for blending.
     const [r, g, b, a] = m.colorBytes;
-    const alphaF = (a / 255);
-    const intensity = alphaF * alphaF;
-    // shaderCfg & 2: alpha blending enabled
     if (m.shaderCfg & 2) {
-      return {
-        r: Math.round(r * intensity),
-        g: Math.round(g * intensity),
-        b: Math.round(b * intensity),
-        a
-      };
+      const alphaSq = Math.round(a * a / 255);
+      return { r, g, b, a: alphaSq };
     }
-    return {
-      r: Math.round(r * intensity),
-      g: Math.round(g * intensity),
-      b: Math.round(b * intensity),
-      a: 255
-    };
+    return { r, g, b, a: 255 };
   },
 
   combiner(m) {
@@ -305,24 +153,14 @@ const applyMethods = {
   },
 
   panel(m) {
-    // Apply_panel: same structure as flatcolor — alpha squared modulates RGB
+    // Apply_panel: same D3D TEXTUREFACTOR path as flatcolor — raw RGB output,
+    // alpha^2 in alpha channel for blending only.
     const [r, g, b, a] = m.colorBytes;
-    const alphaF = (a / 255);
-    const intensity = alphaF * alphaF;
     if (m.shaderCfg & 2) {
-      return {
-        r: Math.round(r * intensity),
-        g: Math.round(g * intensity),
-        b: Math.round(b * intensity),
-        a
-      };
+      const alphaSq = Math.round(a * a / 255);
+      return { r, g, b, a: alphaSq };
     }
-    return {
-      r: Math.round(r * intensity),
-      g: Math.round(g * intensity),
-      b: Math.round(b * intensity),
-      a: 255
-    };
+    return { r, g, b, a: 255 };
   },
 
   backing(m) {
@@ -331,37 +169,42 @@ const applyMethods = {
   },
 
   orb(m) {
-    // Apply_orb: green glow sphere
-    return { r: 0xB2, g: 0xD0, b: 0x00, a: 255 };
+    return _applyCombiner(m);
   },
 
   reflect(m) {
-    return { r: 0xE5, g: 0xE5, b: 0xE5, a: 0xFF };
+    return _applyCombiner(m);
   },
 
   eggpulse(m) {
-    // Animated: color1 = 0x00B2D000, alpha pulsates via sin(t^2)
+    // Animated: alpha pulsates via sin(t²). The base color RGB comes from
+    // the Apply method's init_writes (MOV [this+0xC], imm).
     const t = _time * 0.5;
     const alpha = Math.abs(Math.sin(t * t));
-    m.color1 = (Math.round(alpha * 255) << 24) | 0x00B2D000;
+    const base = m._initColor1 || 0;
+    m.color1 = (Math.round(alpha * 255) << 24) | (base & 0x00FFFFFF);
     return _applyCombiner(m);
   },
 
   eggglow(m) {
-    // Animated: fades from transparent to opaque over time
+    // Animated: fades from transparent to opaque over time. The base color2
+    // RGB comes from the Apply method's init_writes (OR imm).
     const fade = Math.min(1.0, _time * 0.2);
     const alpha = Math.round((1.0 - fade) * 255);
-    m.color2 = (alpha << 24) | 0x00FEFFBC;
+    const base = m._initMask || 0;
+    m.color2 = (alpha << 24) | (base & 0x00FFFFFF);
     return _applyCombiner(m);
   },
 
   key(m) {
-    if (!m.keyMode1) {
-      m.color1 = 0xFFB2D000;
-      m.color2 = 0xBEB2D000;
-    } else {
-      m.color1 = 0xFFF3FF6B;
-      m.color2 = 0x2219E100;
+    // Mode-based color selection. The color pairs come from the Apply
+    // method's init_writes (alternating MOV [this+0xC/0x10], imm pairs).
+    if (m._colorPairs) {
+      const pair = m._colorPairs[m.keyMode1 ? 1 : 0];
+      if (pair) {
+        m.color1 = pair[0];
+        m.color2 = pair[1];
+      }
     }
     return _applyCombiner(m);
   },
@@ -408,132 +251,101 @@ export function getTextureIndex(name) {
   return m ? m.textureIndex : 0;
 }
 
+
 export function getMaterialCount() {
   return materialList.length;
 }
 
-// --- CreateAllMaterials (from decompiled xboxdash.xbe 0x00043B30) ---
-// Each call below is a direct translation of the transpiled constructor calls
-// with their arguments read from the decompiled function.
+// Get the resolved D3D blend state for a material.
+// Returns { alphaBlendEnable, srcBlend, dstBlend, zWriteEnable,
+//           usesCombiner, usesTextureFactor, textureFile }
+export function getD3DState(name) {
+  const m = materials[name];
+  return m ? m._d3dState : null;
+}
 
-export function createAllMaterials() {
-  // The arguments below are read from the decompiled CreateAllMaterials function.
-  // Push order in x86: last pushed = first stack arg.
-  // For combiner: createCombiner(name, color1, color2, shaderCfg)
-  // For flatcolor: createFlatcolor(name, R, G, B, A, shaderCfg)
+// Get the texture filename for a material's texture index.
+// Index 2 = steel.png, 3 = cellwall.png, 1 = GPU gradient (no file).
+const _textureFiles = { 2: 'steel', 3: 'cellwall' };
+export function getTextureFile(name) {
+  const m = materials[name];
+  if (!m || !m.textureIndex) return null;
+  return _textureFiles[m.textureIndex] || null;
+}
 
-  createInnerwall("InnerWall_01", 0xFFF3FF6B, 0x1428D414, 0);
-  createCombiner("InnerWall_02", 0xFFF3FF6B, 0x1414C000, 2);
-  createBase("MetaInfo_Text", 1);
-  createBase("NamePanel_Text", 1);
-  createBase("GameNameText_01", 1);
-  createBase("GameNameText_02", 1);
-  createBase("GameNameText_03", 1);
-  createBase("GameIcon_01", 1);
-  createBase("GameIcon_03", 1);
-  createBase("Material #132", 1);
-  createBase("u2 info", 1);
-  createFlatcolor("Material #1334", 11, 32, 0, 192, 0);
-  createFlatcolor("XBOXgreendark", 6, 33, 0, 255, 0);
-  createFlatcolor("XBOXgreen", 140, 201, 25, 255, 0);
-  createFlatcolor("XBoxGreen2", 139, 200, 24, 255, 0);
-  createFlatcolor("GameHilite33", 221, 208, 120, 178, 0);
-  createFlatcolor("Nothing", 128, 128, 128, 255, 0);
-  createFlatcolor("NavType", 190, 250, 94, 178, 0);
-  createFlatcolor("RedType", 200, 30, 30, 255, 0);
-  createFlatcolor("XBoxGreen", 139, 200, 24, 255, 0);
-  createFlatcolor("Type", 100, 200, 25, 255, 0);
-  createFlatcolor("Typesdsafsda", 255, 255, 255, 179, 0);
-  createFlatcolor("Material #133", 0, 0, 0, 192, 0);
-  createFlatcolor("Material #1335", 76, 162, 0, 200, 0);
-  createFlatcolor("Material #133511", 41, 87, 0, 255, 0);
-  createFlatcolor("Material #1336", 0, 0, 0, 128, 0);
-  createFlatcolor("HilightedType", 3, 44, 0, 255, 0);
-  createFlatcolor("XBoxGreenq", 139, 200, 24, 255, 0);
-  createFlatcolor("Black80", 0, 0, 0, 204, 0);
-  createFlatcolor("CellEgg/Partsw", 77, 224, 57, 166, 2);
-  createFlatcolor("CellEgg/Partsz", 170, 170, 170, 255, 2);
-  createFlatcolor("Material #108", 160, 252, 0, 255, 2);
-  createFlatcolor("ItemsType", 182, 245, 96, 255, 2);
-  createFlatcolor("GameHiliteMemory", 178, 208, 0, 255, 0);
-  createFlatcolor("red", 255, 0, 0, 255, 0);
-  createCombiner("FlatSurfaces", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("DarkSurfaces", 0x5ACBCD55, 0x0014C000, 0);
-  createCombiner("DarkSurfaces2", 0x5ACBCD55, 0x000A6000, 0);
-  createCombiner("FlatSurfacesSelected", 0xC0F3FF6B, 0x8014C000, 0);
-  createCombiner("FlatSurfacesMemory", 0xC0F3FF6B, 0x8014C000, 0);
-  createCombiner("FlatSurfaces2sided", 0xC0F3FF6B, 0x0014C000, 2);
-  createCombiner("DetailLegSkin_Inner", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("Screen", 0xC0F3FF6B, 0x0014C000, 2);
-  createCombiner("Spout", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("NavType34", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("MetaFlatSurfaces", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("SC_SavedGame_Row01", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("HK_SavedGame_Row01", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("SavedEgg_Selected", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("FlatUnselected", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("Mem_InnerWall_Outer", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("SavedGameEgg", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("GameMenuEgg", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("Shell", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("Material #133sdsfdsf", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("IconParts", 0xC0F3FF6B, 0x0014C000, 2);
-  createCombiner("IconParts1", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("MU1Pod_HL", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("MU1Pod", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("GamePodb", 0xC0F3FF6B, 0x0014C000, 2);
-  createCombiner("GamePod", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("JwlSrfc01/InfoPnls", 0xC0F3FF6B, 0x0014C000, 0);
-  createCombiner("MenuCell", 0xC0F3FF6B, 0x0014C000, 0);
-  createWireframe("Wireframe", 0xC0F3FF6B, 0x007DD222, 0);
-  createCombiner("Tubes", 0xD7F2FA99, 0x25076800, 2);
-  createCombiner("JewelSurface02/PodMesh", 0xD7F2FA99, 0x25076800, 0);
-  createCombiner("TubesFade", 0xD7F2FA99, 0x25076800, 2);
-  createCombiner("TubesQ", 0xD7F2FA99, 0x25076800, 0);
-  createCombiner("EmptyMU", 0xD7F2FA99, 0x25076800, 0);
-  createCombiner("Tube", 0xD7F2FA99, 0x25076800, 0);
-  createCombiner("MemoryHeader", 0x7A3CC643, 0x25076800, 2);
-  createEggglow("EggGlow", 0x00FCFF00, 0xE4FEFFBC, 0);
-  createCombiner("ButtonGlow", 0x00FCFF00, 0xE4FEFFBC, 0);
-  createCombiner("gradient", 0x33BFFF6B, 0x0000FF12, 0);
-  createCombiner("CellWallStructure", 0x33BFFF6B, 0x0000FF12, 0);
-  createCombiner("FlatSrfc/PodParts", 0x33BFFF6B, 0x0000FF12, 0);
-  createCombiner("Cell_Light", 0x33BFFF6B, 0x0000FF12, 0);
-  createCombiner("Cell_Light/LegSkin", 0x33BFFF6B, 0x0000FF12, 0);
-  createCombiner("CellEgg/Parts", 0xB2F3FF6B, 0x001EFF00, 0);
-  createCombiner("GameEgg", 0xB2F3FF6B, 0x001EFF00, 0);
-  createCombiner("FlatSurfaces2sided3", 0xFFFD1E00, 0x00F24800, 2);
-  createCombiner("console_hilite", 0xFFFFAD6B, 0x00F8A100, 0);
-  createIcon("TitleIcon", 128, 128, 0, 0, 0);
-  createIcon("TitleSoundtrackIcon", 128, 128, 0, 1, 0);
-  createIcon("SavedGameIcon", 2031360, 2031360, 0, 0, 1);
-  createIcon("SoundtrackIcon", 2031360, 2031360, 0, 1, 1);
-  createIcon("SelectedIcon", 128, 128, 1, 0, 0);
-  createKey("Key", 0, 0);
-  createKey("BrightKey", 0, 1);
-  createKey("KeyText", 1, 0);
-  createEggpulse("EggGlowPulse");
-  createChrome("Metal_Chrome", 0x00E5E5E5, 0xFFE5E5E5, 0);
-  createChrome("Tvbox", 0x00E5E5E5, 0xFFE5E5E5, 0);
-  createChrome("AudioCD", 0x28FFFFFF, 0xB4FFFFFF, 0);
-  createBacking("PanelBacking_01", 255, 0, 20, 0, 0);
-  createBacking("PanelBacking_02", 255, 0, 0, 0, 0);
-  createBacking("PanelBacking_03", 240, 0, 20, 0, 0);
-  createBacking("PanelBacking_04", 255, 7, 46, 14, 0);
-  createBacking("NameBacking", 255, 0, 8, 1, 0);
-  createBacking("ModeBacking", 255, 0, 8, 1, 0);
-  createBacking("SavedGameBacking", 255, 10, 18, 11, 0);
-  createBacking("MemManMetaBacking", 255, 0, 25, 0, 0);
-  createBacking("TextBacking", 255, 0, 0, 0, 6);
-  createBacking("DarkenBacking", 255, 0, 50, 0, 10);
-  createBacking("MetaBacking", 255, 0, 50, 0, 6);
-  createBacking("DarkenBackingDark", 255, 0, 8, 1, 6);
-  createPanel("GameHilite", 255, 255, 255, 255, 2);
-  createOrb("equalizer", 32);
-  createOrb("MainMenuOrb", 2031360);
-  createReflect("ReflectSurface");
-  createPanel("PanelBacking", 255, 0, 20, 0, 2);
-  createNumbered("Material #10822");
+// --- Load materials from extracted JSON (materials.json) ---
 
+// Maps materials.json fields to CMaxMaterial objects. The JSON is produced
+// by matparse.go which extracts constructor args and Apply method traces
+// directly from the XBE binary.
+export function loadFromJSON(jsonArray) {
+  for (const entry of jsonArray) {
+    const m = new CMaxMaterial(entry.name, entry.shader_cfg || 0);
+    m.vtable = entry.type || 'base';
+    m.color1 = (entry.color1 || 0) >>> 0;
+    m.color2 = (entry.color2 || 0) >>> 0;
+    m.textureIndex = entry.texture_index || 0;
+    m.keyMode1 = entry.key_mode1 || 0;
+    m.keyMode2 = entry.key_mode2 || 0;
+    m.colorBytes = [entry.r, entry.g, entry.b, entry.a];
+
+    // Extract constants from Apply method init_writes.
+    // init_writes captures all MOV [this+offset], imm instructions from the
+    // Apply function. Offset 12 (0x0C) = color1, offset 16 (0x10) = color2,
+    // offset -1 = OR immediate (used for color masks).
+    const iw = entry.init_writes;
+    if (iw && iw.length > 0) {
+      for (const w of iw) {
+        if (w.offset === 12 && !m._initColor1) m._initColor1 = w.value >>> 0;
+        else if (w.offset === 16 && !m._initColor2) m._initColor2 = w.value >>> 0;
+        else if (w.offset === -1 && !m._initMask) m._initMask = w.value >>> 0;
+      }
+      // Collect all (offset=12, offset=16) pairs for mode-switching materials
+      const pairs = [];
+      let cur = null;
+      for (const w of iw) {
+        if (w.offset === 12) { cur = w.value >>> 0; }
+        else if (w.offset === 16 && cur !== null) {
+          pairs.push([cur, w.value >>> 0]);
+          cur = null;
+        }
+      }
+      if (pairs.length >= 2) m._colorPairs = pairs;
+    }
+
+    // Resolve D3D blend state from Apply trace.
+    // SetRenderState calls have args = [Value, State] (reversed push order).
+    // Xbox render state IDs (from cxbx XbD3D8Types.h):
+    //   59=ALPHABLENDENABLE, 62/131=SRCBLEND, 63/132=DESTBLEND,
+    //   64=ZWRITEENABLE, 128=TEXTUREFACTOR
+    // Xbox blend factors (OpenGL-style): 0=ZERO, 1=ONE, 0x302=SRCALPHA,
+    //   0x303=INVSRCALPHA
+    if (entry.d3d_state) {
+      // New format: pre-resolved by Go
+      m._d3dState = entry.d3d_state;
+    } else {
+      // Resolve from raw Apply trace
+      const d3d = {
+        alphaBlendEnable: false, srcBlend: 0, dstBlend: 0,
+        zWriteEnable: null, usesCombiner: false, usesTextureFactor: false,
+      };
+      const apply = entry.apply || [];
+      for (const call of apply) {
+        if (call.fn === 'SetRegisterCombinerConstants') {
+          d3d.usesCombiner = true;
+        }
+        if (call.fn && (call.fn.includes('SetRenderState') || call.fn === 'sub_0002989C' || call.fn === 'CMaxMaterial::SetRenderState') && call.args) {
+          const state = call.args[call.args.length - 1];
+          const value = call.args.length >= 2 ? call.args[0] : 0;
+          if (state === 59) d3d.alphaBlendEnable = value !== 0;
+          if (state === 62 || state === 131) d3d.srcBlend = value;
+          if (state === 63 || state === 132) d3d.dstBlend = value;
+          if (state === 64) d3d.zWriteEnable = value !== 0;
+          if (state === 128) d3d.usesTextureFactor = true;
+        }
+      }
+      m._d3dState = d3d;
+    }
+  }
   return materialList.length;
 }

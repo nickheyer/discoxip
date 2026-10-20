@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/nickheyer/discoxip/pkg/font"
 	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/nickheyer/discoxip/pkg/xap"
 	"github.com/nickheyer/discoxip/pkg/xbe"
@@ -137,6 +138,12 @@ func Export(inputDir, outputDir string) error {
 	audioCount := copyAudio(inputDir, filepath.Join(outputDir, "data"))
 	if audioCount > 0 {
 		fmt.Fprintf(os.Stderr, "  Copied %d audio files\n", audioCount)
+	}
+
+	// Export fonts
+	fontCount := exportFonts(inputDir, filepath.Join(outputDir, "data", "fonts"))
+	if fontCount > 0 {
+		fmt.Fprintf(os.Stderr, "  Exported %d fonts\n", fontCount)
 	}
 
 	// Write config
@@ -476,7 +483,187 @@ func copyTextures(srcDir, dstDir string) int {
 	return count
 }
 
-// --- Audio copy ---
+// --- Audio copy (Xbox ADPCM → PCM16 conversion) ---
+
+// IMA ADPCM step table
+var imaStepTable = [89]int16{
+	7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+	19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+	50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+	130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+	337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+	876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+	2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+	5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+	15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+}
+
+var imaIndexTable = [16]int{
+	-1, -1, -1, -1, 2, 4, 6, 8,
+	-1, -1, -1, -1, 2, 4, 6, 8,
+}
+
+func clampIndex(idx int) int {
+	if idx < 0 {
+		return 0
+	}
+	if idx > 88 {
+		return 88
+	}
+	return idx
+}
+
+func clampSample(s int32) int16 {
+	if s > 32767 {
+		return 32767
+	}
+	if s < -32768 {
+		return -32768
+	}
+	return int16(s)
+}
+
+// decodeXboxADPCM converts Xbox ADPCM (format 0x0069) WAV data to PCM16 WAV.
+//
+// Xbox ADPCM block layout (e.g. stereo, blockAlign=72):
+//   [ch0 header 4B][ch1 header 4B][interleaved nibble data 64B]
+// Header: int16 predictor, uint8 stepIndex, uint8 reserved
+// Data: groups of (channels × 4 bytes), each 4 bytes = 8 nibbles = 8 samples.
+// The predictor seeds the decoder but is NOT emitted as an output sample.
+func decodeXboxADPCM(data []byte) ([]byte, error) {
+	if len(data) < 44 || string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("not a WAV file")
+	}
+
+	// Find fmt and data chunks
+	pos := 12
+	var fmtChunk, dataChunk []byte
+	for pos+8 <= len(data) {
+		id := string(data[pos : pos+4])
+		size := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
+		switch id {
+		case "fmt ":
+			fmtChunk = data[pos+8 : pos+8+size]
+		case "data":
+			dataChunk = data[pos+8 : pos+8+size]
+		}
+		pos += 8 + size
+		if pos%2 != 0 {
+			pos++
+		}
+	}
+	if fmtChunk == nil || dataChunk == nil {
+		return nil, fmt.Errorf("missing fmt or data chunk")
+	}
+
+	format := binary.LittleEndian.Uint16(fmtChunk[0:2])
+	if format != 0x0069 {
+		return data, nil // not Xbox ADPCM, pass through
+	}
+
+	channels := int(binary.LittleEndian.Uint16(fmtChunk[2:4]))
+	sampleRate := binary.LittleEndian.Uint32(fmtChunk[4:8])
+	blockAlign := int(binary.LittleEndian.Uint16(fmtChunk[12:14]))
+	if channels == 0 || blockAlign == 0 {
+		return nil, fmt.Errorf("invalid ADPCM params: ch=%d blockAlign=%d", channels, blockAlign)
+	}
+
+	headerSize := channels * 4
+	dataPerBlock := blockAlign - headerSize
+	samplesPerBlock := dataPerBlock / channels / 4 * 8 // 8 samples per 4-byte group
+
+	numBlocks := len(dataChunk) / blockAlign
+	pcmSamples := make([]int16, 0, numBlocks*samplesPerBlock*channels)
+
+	predictors := make([]int32, channels)
+	stepIdxs := make([]int, channels)
+	chBuf := make([][]int16, channels)
+
+	decodeNibble := func(ch int, nibble byte) int16 {
+		step := int32(imaStepTable[stepIdxs[ch]])
+		diff := step >> 3
+		if nibble&4 != 0 {
+			diff += step
+		}
+		if nibble&2 != 0 {
+			diff += step >> 1
+		}
+		if nibble&1 != 0 {
+			diff += step >> 2
+		}
+		if nibble&8 != 0 {
+			predictors[ch] -= diff
+		} else {
+			predictors[ch] += diff
+		}
+		predictors[ch] = int32(clampSample(predictors[ch]))
+		stepIdxs[ch] = clampIndex(stepIdxs[ch] + imaIndexTable[nibble])
+		return int16(predictors[ch])
+	}
+
+	for off := 0; off+blockAlign <= len(dataChunk); off += blockAlign {
+		block := dataChunk[off : off+blockAlign]
+
+		// Read per-channel headers
+		for ch := range channels {
+			hdr := block[ch*4 : ch*4+4]
+			predictors[ch] = int32(int16(binary.LittleEndian.Uint16(hdr[0:2])))
+			stepIdxs[ch] = clampIndex(int(hdr[2]))
+			if chBuf[ch] == nil {
+				chBuf[ch] = make([]int16, 0, samplesPerBlock)
+			} else {
+				chBuf[ch] = chBuf[ch][:0]
+			}
+		}
+
+		// Decode interleaved data: groups of (channels × 4 bytes)
+		dataStart := headerSize
+		numGroups := dataPerBlock / (channels * 4)
+		for g := range numGroups {
+			for ch := range channels {
+				groupOff := dataStart + (g*channels+ch)*4
+				for i := range 4 {
+					b := block[groupOff+i]
+					chBuf[ch] = append(chBuf[ch], decodeNibble(ch, b&0x0F))
+					chBuf[ch] = append(chBuf[ch], decodeNibble(ch, (b>>4)&0x0F))
+				}
+			}
+		}
+
+		// Interleave into output
+		n := len(chBuf[0])
+		for i := range n {
+			for ch := range channels {
+				pcmSamples = append(pcmSamples, chBuf[ch][i])
+			}
+		}
+	}
+
+	// Build PCM16 WAV
+	pcmDataSize := len(pcmSamples) * 2
+	wavSize := 44 + pcmDataSize
+	out := make([]byte, wavSize)
+
+	copy(out[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(out[4:8], uint32(wavSize-8))
+	copy(out[8:12], "WAVE")
+	copy(out[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(out[16:20], 16)
+	binary.LittleEndian.PutUint16(out[20:22], 1) // PCM
+	binary.LittleEndian.PutUint16(out[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(out[24:28], sampleRate)
+	binary.LittleEndian.PutUint32(out[28:32], sampleRate*uint32(channels)*2)
+	binary.LittleEndian.PutUint16(out[32:34], uint16(channels*2))
+	binary.LittleEndian.PutUint16(out[34:36], 16)
+	copy(out[36:40], "data")
+	binary.LittleEndian.PutUint32(out[40:44], uint32(pcmDataSize))
+
+	for i, s := range pcmSamples {
+		binary.LittleEndian.PutUint16(out[44+i*2:44+i*2+2], uint16(s))
+	}
+
+	return out, nil
+}
 
 func copyAudio(srcDir, dstDir string) int {
 	audioDir := filepath.Join(srcDir, "Audio")
@@ -493,7 +680,6 @@ func copyAudio(srcDir, dstDir string) int {
 			return nil
 		}
 
-		// Preserve relative path: Audio/SubDir/file.wav → data/Audio/SubDir/file.wav
 		rel, err := filepath.Rel(srcDir, path)
 		if err != nil {
 			return nil
@@ -506,12 +692,61 @@ func copyAudio(srcDir, dstDir string) int {
 		if err != nil {
 			return nil
 		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
+
+		// Convert Xbox ADPCM to PCM16 for browser compatibility
+		pcm, err := decodeXboxADPCM(data)
+		if err != nil {
+			// Not ADPCM or decode failed — copy as-is
+			pcm = data
+		}
+
+		if err := os.WriteFile(dst, pcm, 0o644); err != nil {
 			return nil
 		}
 		count++
 		return nil
 	})
+	return count
+}
+
+// --- Font export ---
+
+func exportFonts(srcDir, dstDir string) int {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".xtf") {
+			continue
+		}
+
+		f, err := font.Open(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    warning: font %s: %v\n", e.Name(), err)
+			continue
+		}
+
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return count
+		}
+
+		baseName := sanitizeFilename(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+		jsonPath := filepath.Join(dstDir, baseName+".json")
+
+		out, err := os.Create(jsonPath)
+		if err != nil {
+			continue
+		}
+		if err := font.ExportJSON(out, f, 0x024F); err != nil {
+			out.Close()
+			continue
+		}
+		out.Close()
+		count++
+	}
 	return count
 }
 

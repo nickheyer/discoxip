@@ -51,6 +51,9 @@ class XAPRuntime {
     this.scriptScope = {};     // global scope for script execution
     this.pendingScripts = [];
 
+    // Fonts
+    this.fonts = {}; // fontName → parsed font JSON
+
     // Audio
     this.audioCtx = null;
     this.audioBuffers = {};
@@ -70,6 +73,19 @@ class XAPRuntime {
     window.addEventListener('resize', () => this.onResize());
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
     window.addEventListener('keyup', (e) => this.onKeyUp(e));
+
+    // Create AudioContext eagerly (starts suspended until user gesture).
+    // Play() calls during init will buffer; they start when the context resumes.
+    try { this.audioCtx = new AudioContext(); } catch (_) {}
+    const resumeAudio = () => {
+      if (this.audioCtx && this.audioCtx.state === 'suspended') {
+        this.audioCtx.resume();
+      }
+    };
+    for (const evt of ['click', 'keydown', 'touchstart']) {
+      window.addEventListener(evt, resumeAudio, { once: false });
+    }
+
   }
 
   async start() {
@@ -83,9 +99,21 @@ class XAPRuntime {
       this.meshManifest = await manifestResp.json();
       _log(`[XAP] ${Object.keys(this.meshManifest).length} meshes in manifest`);
 
-      // Initialize material system (transpiled from XBE CMaxMaterial)
-      const matCount = matSystem.createAllMaterials();
-      _log(`[XBE] ${matCount} materials created`);
+      // Load material definitions from XBE extraction
+      const matResp = await fetch(`${DATA_BASE}/materials.json`);
+      const matJSON = await matResp.json();
+      const matCount = matSystem.loadFromJSON(matJSON);
+      _log(`[XBE] ${matCount} materials loaded`);
+
+      // Material textures (indices 1/2/3) — THESE ARE COMBINER TEXTURES FROM THE GPU
+      // DO NOT UNDER ANY CIRCUMSTANCES ATTEMPT TO WRITE YOUR OWN GRADIENT INTERPRETATION
+      // OF THE XBE VTABLE DERIVED MATERIAL TEXTURE. YOU FUCKING EXPORT THE TEXTURE ALGO
+      // DIRECTLY FROM THE FUCKING XBE
+      // The materials use NV2A register combiners directly — no COLOROP/ALPHAOP through D3D
+      // texture stages. The combiner program is the key
+
+      // Load XTF vector fonts
+      await this.loadFonts();
 
       // Load ALL scene data FIRST (Level/Inline nodes need sub-scene data during build)
       const loadPromises = this.config.scenes.map(name => this.loadSceneData(name));
@@ -114,6 +142,24 @@ class XAPRuntime {
     } catch (err) {
       _error('Runtime start failed:', err);
       document.getElementById('loading').textContent = 'Error: ' + err.message;
+    }
+  }
+
+  async loadFonts() {
+    const fontFiles = [
+      { file: 'Xbox', role: 'heading' },
+      { file: 'XBox_Book', role: 'body' },
+    ];
+    for (const { file, role } of fontFiles) {
+      try {
+        const resp = await fetch(`${DATA_BASE}/fonts/${file}.json`);
+        if (!resp.ok) continue;
+        const fontData = await resp.json();
+        this.fonts[role] = fontData;
+        _log(`[XTF] Loaded font "${fontData.name}" as ${role}`);
+      } catch (e) {
+        _warn(`[XTF] Failed to load font ${file}: ${e.message}`);
+      }
     }
   }
 
@@ -236,12 +282,15 @@ class XAPRuntime {
     }
 
     // --- Text: if node has font field, render text ---
+    // (All dashboard text lives inside Shape geometry with an Appearance parent,
+    // so buildGeometry handles it. This path handles any bare Text node that has
+    // appearance data on a parent.)
     if (f.font !== undefined) {
       const text = f.text || f.string || '';
-      const font = f.font || 'Body';
-      const width = Math.abs(asNumber(f.width || 10));
+      const fontName = f.font || 'Body';
       const justify = f.justify || 'left';
-      const tr = new TextRenderer(String(text), String(font), width, String(justify));
+      const mat = this.createMaterial(appData);
+      const tr = new TextRenderer(String(text), String(fontName), this.fonts, mat, String(justify));
       group.add(tr.mesh);
       node._textRenderer = tr;
     }
@@ -390,7 +439,12 @@ class XAPRuntime {
     if (geomFields.url && typeof geomFields.url === 'string' && geomFields.url.match(/\.xm$/i)) {
       this.loadMesh(geomFields.url, archiveName).then(geometry => {
         if (geometry) {
-          const mesh = new THREE.Mesh(geometry, material);
+          let mat = material;
+          if (geometry.userData.hasColors) {
+            mat = material.clone();
+            mat.vertexColors = true;
+          }
+          const mesh = new THREE.Mesh(geometry, mat);
           mesh.name = geomData.def || geomFields.url;
           group.add(mesh);
           node._mesh = mesh;
@@ -409,12 +463,12 @@ class XAPRuntime {
     // Text geometry (has font field)
     if (geomFields.font !== undefined) {
       const text = geomFields.text || geomFields.string || '';
-      const font = geomFields.font || 'Body';
-      const width = Math.abs(asNumber(geomFields.width || 10));
+      const fontName = geomFields.font || 'Body';
       const justify = geomFields.justify || 'left';
-      const tr = new TextRenderer(String(text), String(font), width, String(justify));
+      const tr = new TextRenderer(String(text), String(fontName), this.fonts, material, String(justify));
       group.add(tr.mesh);
       node._textRenderer = tr;
+      node._material = material;
       return;
     }
 
@@ -446,40 +500,65 @@ class XAPRuntime {
     const cachedMat = this.materialCache[cacheKey];
 
     // Register DEF'd material/appearance nodes globally so scripts can find them.
-    // This must happen even for cached materials — different Shapes may DEF the
-    // same material under different names (e.g. MemoryPanelMaterial, MusicPanelMaterial
-    // both using material name "GameHilite").
+    // DEF'd nodes that share a material name (e.g. MemoryTextMaterial and
+    // MusicTextMaterial both using "NavType") need independent Three.js material
+    // instances so scripts can change one without affecting the other.
+    const needsOwnInstance = !!(matData && matData.def) || !!(appData && appData.def);
+
     if (matData && matData.def) {
       const matNode = new XAPNode(matData, this, '');
-      matNode._material = cachedMat || null; // will be set below if not cached
+      matNode._material = null; // set below after creation/clone
       this.nodes[matData.def] = matNode;
       this.scriptScope[matData.def] = matNode.proxy;
-      // Store ref so we can update _material after creation
       matData._xapNode = matNode;
     }
     if (appData && appData.def) {
       const appNode = new XAPNode(appData, this, '');
-      appNode._material = cachedMat || null;
+      appNode._material = null;
       this.nodes[appData.def] = appNode;
       this.scriptScope[appData.def] = appNode.proxy;
       appData._xapNode = appNode;
     }
 
-    if (cachedMat) return cachedMat;
+    // If cache has this material and no DEF needs its own instance, reuse it
+    if (cachedMat && !needsOwnInstance) return cachedMat;
 
     const params = { side: THREE.DoubleSide };
 
-    // Apply material color from transpiled XBE material system
+    // Apply material color and D3D state from XBE material system
     if (matName) {
       const color = matSystem.applyMaterial(matName);
       if (color) {
-        // Xbox D3DCOLOR bytes are SRGB — must tell Three.js to convert to linear
         params.color = new THREE.Color().setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
-        // Backing materials use alpha bytes for D3D blend state config, not opacity.
-        const vtable = matSystem.getVtable(matName);
-        if (vtable !== 'backing' && color.a < 255) {
+        if (color.a < 255) {
           params.transparent = true;
           params.opacity = color.a / 255;
+        }
+      }
+
+      // Apply D3D blend state extracted from XBE Apply method trace
+      const d3d = matSystem.getD3DState(matName);
+      if (d3d) {
+        if (d3d.alphaBlendEnable || d3d.alpha_blend_enable) {
+          params.transparent = true;
+          params.blending = THREE.CustomBlending;
+          const src = d3d.srcBlend || d3d.src_blend || 0;
+          const dst = d3d.dstBlend || d3d.dst_blend || 0;
+          params.blendSrc = _xboxBlendToThree(src);
+          params.blendDst = _xboxBlendToThree(dst);
+        }
+        const zw = d3d.zWriteEnable ?? d3d.z_write_enable;
+        if (zw === false) {
+          params.depthWrite = false;
+        }
+      }
+
+      // Load material texture (index 2=steel, 3=cellwall) from extracted files
+      const texFile = matSystem.getTextureFile(matName);
+      if (texFile && !texUrl) {
+        const matTex = this.loadTexture(texFile);
+        if (matTex) {
+          params.map = matTex;
         }
       }
     }
@@ -507,14 +586,19 @@ class XAPRuntime {
       }
     }
 
-    const material = new THREE.MeshBasicMaterial(params);
-    material.name = matName || '';
-    this.materialCache[cacheKey] = material;
+    let material;
+    if (cachedMat && needsOwnInstance) {
+      material = cachedMat.clone();
+      material.name = matName || '';
+    } else {
+      material = new THREE.MeshBasicMaterial(params);
+      material.name = matName || '';
+      this.materialCache[cacheKey] = material;
+    }
 
     // Track named materials for per-frame color updates (animated materials)
     if (matName) {
-      const vtable = matSystem.getVtable(matName);
-      this.namedMaterials.push({ threeMat: material, matName, vtable });
+      this.namedMaterials.push({ threeMat: material, matName });
     }
 
     // Update _material on any DEF'd nodes we registered above
@@ -586,6 +670,7 @@ class XAPRuntime {
       geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
       if (colors) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 4));
       geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+      geometry.userData.hasColors = !!colors;
       return geometry;
     })();
 
@@ -761,6 +846,12 @@ class XAPRuntime {
         SetWidescreen: (b) => {},
         GetLetterbox: () => false,
         SetLetterbox: (b) => {},
+        GetMoviePCFlags: () => 0,
+        SetMoviePCFlags: (n) => {},
+        GetMovieRating: () => 0,
+        SetMovieRating: (n) => {},
+        GetMachineAccount: () => '',
+        SetMachineAccount: (s) => {},
       },
       'Translator': {
         SetLanguage: (n) => {},
@@ -776,6 +867,9 @@ class XAPRuntime {
       'MemoryMonitor': {
         HaveDeviceTop: (n) => 0,
         HaveDeviceBottom: (n) => 0,
+        FormatDeviceName: (n) => '',
+        GetDeviceSize: (n) => 0,
+        GetDeviceFreeSize: (n) => 0,
       },
       'Recovery': {
         GetRecoveryKey: () => '',
@@ -995,17 +1089,17 @@ class XAPRuntime {
   }
 
   updateMaterialColors() {
-    for (const { threeMat, matName, vtable } of this.namedMaterials) {
-      const color = matSystem.applyMaterial(matName);
+    for (const entry of this.namedMaterials) {
+      const currentName = entry.threeMat.name || entry.matName;
+      const color = matSystem.applyMaterial(currentName);
       if (!color) continue;
-      threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
-      // Backing materials use alpha for D3D blend config, not opacity
-      if (vtable === 'backing') continue;
+      entry.threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
+
       if (color.a < 255) {
-        threeMat.transparent = true;
-        threeMat.opacity = color.a / 255;
-      } else if (threeMat.opacity < 1) {
-        threeMat.opacity = 1;
+        entry.threeMat.transparent = true;
+        entry.threeMat.opacity = color.a / 255;
+      } else if (entry.threeMat.opacity < 1) {
+        entry.threeMat.opacity = 1;
       }
     }
   }
@@ -1150,10 +1244,12 @@ class XAPNode {
           return true;
         }
         if (s === 'name') {
-          // Material name change
-          target._fields.name = value;
+          // Material name change — re-derive color from XBE material system
+          const newName = String(value);
+          target._fields.name = newName;
           if (target._material) {
-            target._material.name = String(value);
+            target._material.name = newName;
+            _applyMaterialColor(target._material, newName);
           }
           return true;
         }
@@ -1241,7 +1337,12 @@ class XAPNode {
           return undefined;
         },
         set: (_, prop, value) => {
-          if (prop === 'name') { mat.name = String(value); return true; }
+          if (prop === 'name') {
+            const newName = String(value);
+            mat.name = newName;
+            _applyMaterialColor(mat, newName);
+            return true;
+          }
           if (prop === 'param') { self._fields.param = Number(value); return true; }
           return true;
         }
@@ -1293,9 +1394,7 @@ class XAPNode {
     this._isPlaying = true;
 
     const rt = this.runtime;
-    if (!rt.audioCtx) {
-      try { rt.audioCtx = new AudioContext(); } catch (e) { return; }
-    }
+    if (!rt.audioCtx) return;
 
     const url = `${DATA_BASE}/${this._audioUrl}`;
     const cacheKey = this._audioUrl;
@@ -1365,6 +1464,9 @@ class XAPNode {
     // Bind the joystick control for this level
     this._bindLevelControl();
 
+    // Fire onLoad handlers on descendant nodes (Inline children etc.)
+    this._fireDescendantOnLoad();
+
     _log(`[Level] GoTo: ${this.data.def}`);
   }
 
@@ -1382,6 +1484,9 @@ class XAPNode {
 
     // Bind the joystick control for this level
     this._bindLevelControl();
+
+    // Fire onLoad handlers on descendant nodes
+    this._fireDescendantOnLoad();
 
     _log(`[Level] GoBackTo: ${this.data.def}`);
   }
@@ -1402,15 +1507,62 @@ class XAPNode {
     }
   }
 
+  _fireDescendantOnLoad() {
+    const fire = (xapNode) => {
+      if (xapNode._eventHandlers && !xapNode._onLoadFired) {
+        const handler = xapNode._eventHandlers['onLoad'];
+        if (handler) {
+          xapNode._onLoadFired = true;
+          try {
+            (0, eval)(handler);
+            if (typeof window.onLoad === 'function') {
+              window.onLoad();
+              delete window.onLoad;
+            }
+          } catch (e) {
+            _warn(`[XAP] onLoad error for ${xapNode.data.def}:`, e.message);
+          }
+        }
+      }
+      for (const child of xapNode._xapChildren) {
+        fire(child);
+      }
+    };
+    for (const child of this._xapChildren) {
+      fire(child);
+    }
+  }
+
   _bindLevelControl() {
     // Unbind all joysticks, then bind this level's control joystick
     for (const node of Object.values(this.runtime.nodes)) {
       if (node._eventHandlers) node._isBound = false;
     }
+
     // Find control node (Joystick) for this level
-    if (this._controlNode) {
-      this._controlNode._isBound = true;
-      _log(`[Level] Bound joystick: ${this._controlNode.data.def || 'unnamed'}`);
+    let ctrl = this._controlNode;
+
+    // If this level has no explicit control, search descendants for a joystick
+    if (!ctrl) {
+      const findJoystick = (xapNode) => {
+        if (xapNode._eventHandlers && Object.keys(xapNode._eventHandlers).some(
+          k => k.startsWith('On') && k !== 'onLoad')) {
+          return xapNode;
+        }
+        for (const child of xapNode._xapChildren) {
+          const found = findJoystick(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      ctrl = findJoystick(this);
+    }
+
+    if (ctrl) {
+      ctrl._isBound = true;
+      _log(`[Level] Bound joystick: ${ctrl.data.def || 'unnamed'}`);
+    } else {
+      _warn(`[Level] No joystick found for ${this.data.def}`);
     }
   }
 }
@@ -1420,68 +1572,128 @@ class XAPNode {
 // ============================================================================
 
 class TextRenderer {
-  constructor(text, font, width, justify) {
+  constructor(text, fontName, fontCache, material, justify) {
     this.text = text;
-    this.font = font;
-    this.width = width;
+    this.fontName = fontName;
+    this.fontCache = fontCache;
+    this.material = material;
     this.justify = justify;
 
-    this.canvas = document.createElement('canvas');
-    this.ctx = this.canvas.getContext('2d');
-
-    // Create mesh
-    const geometry = new THREE.PlaneGeometry(width * 0.1, width * 0.04);
-    this.texture = new THREE.CanvasTexture(this.canvas);
-    this.texture.colorSpace = THREE.SRGBColorSpace;
-    const material = new THREE.MeshBasicMaterial({
-      map: this.texture,
-      transparent: true,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    this.mesh = new THREE.Mesh(geometry, material);
+    this.mesh = new THREE.Group();
     this.mesh.name = 'Text';
 
-    this.render();
+    this.rebuild();
   }
 
   setText(text) {
     this.text = text;
-    this.render();
+    this.rebuild();
   }
 
-  render() {
-    const dpr = 2;
-    const w = Math.max(256, this.width * 25);
-    const h = 64;
-    this.canvas.width = w * dpr;
-    this.canvas.height = h * dpr;
-    const ctx = this.ctx;
-    ctx.scale(dpr, dpr);
-
-    ctx.clearRect(0, 0, w, h);
-
-    const fontSize = this.font === 'Heading' ? 24 : 16;
-    ctx.font = `${fontSize}px "Segoe UI", Arial, sans-serif`;
-    ctx.fillStyle = '#ffffff';
-
-    let x = 4;
-    if (this.justify === 'middle' || this.justify === 'center') {
-      ctx.textAlign = 'center';
-      x = w / 2;
-    } else {
-      ctx.textAlign = 'left';
+  rebuild() {
+    // Clear previous geometry
+    while (this.mesh.children.length > 0) {
+      const c = this.mesh.children[0];
+      this.mesh.remove(c);
+      if (c.geometry) c.geometry.dispose();
     }
-    ctx.textBaseline = 'middle';
-    ctx.fillText(String(this.text), x, h / 2);
 
-    this.texture.needsUpdate = true;
+    const role = this.fontName.toLowerCase().includes('heading') ? 'heading' : 'body';
+    const fontData = this.fontCache[role];
+    if (!fontData || !this.text) return;
+
+    // Merge all glyph triangles into a single geometry
+    const allPositions = [];
+    const allIndices = [];
+    let cursorX = 0;
+    let vertexOffset = 0;
+
+    for (const ch of this.text) {
+      const glyph = fontData.glyphs[ch];
+      if (!glyph) {
+        // Use space advance for unknown characters
+        const space = fontData.glyphs[' '];
+        cursorX += space ? space.adv : 0.2;
+        continue;
+      }
+
+      if (glyph.verts && glyph.idx && glyph.idx.length > 0) {
+        for (let i = 0; i < glyph.verts.length; i += 2) {
+          allPositions.push(glyph.verts[i] + cursorX, glyph.verts[i + 1], 0);
+        }
+        for (let i = 0; i < glyph.idx.length; i++) {
+          allIndices.push(glyph.idx[i] + vertexOffset);
+        }
+        vertexOffset += glyph.verts.length / 2;
+      }
+
+      cursorX += glyph.adv;
+    }
+
+    if (allPositions.length === 0) return;
+
+    // Apply justify offset
+    const totalWidth = cursorX;
+    let xShift = 0;
+    if (this.justify === 'middle' || this.justify === 'center') {
+      xShift = -totalWidth / 2;
+    }
+    if (xShift !== 0) {
+      for (let i = 0; i < allPositions.length; i += 3) {
+        allPositions[i] += xShift;
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(allPositions, 3));
+    geometry.setIndex(allIndices);
+
+    const textMesh = new THREE.Mesh(geometry, this.material);
+    this.mesh.add(textMesh);
   }
 }
 
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+// Map Xbox D3D blend factor (OpenGL-style) to Three.js blend constant.
+// Values from cxbx-reloaded/src/core/hle/D3D8/XbConvert.cpp.
+function _xboxBlendToThree(xboxBlend) {
+  switch (xboxBlend) {
+    case 0x000: return THREE.ZeroFactor;
+    case 0x001: return THREE.OneFactor;
+    case 0x300: return THREE.SrcColorFactor;
+    case 0x301: return THREE.OneMinusSrcColorFactor;
+    case 0x302: return THREE.SrcAlphaFactor;
+    case 0x303: return THREE.OneMinusSrcAlphaFactor;
+    case 0x304: return THREE.DstAlphaFactor;
+    case 0x305: return THREE.OneMinusDstAlphaFactor;
+    case 0x306: return THREE.DstColorFactor;
+    case 0x307: return THREE.OneMinusDstColorFactor;
+    case 0x308: return THREE.SrcAlphaSaturateFactor;
+    // Deferred blend values use small integers (0=ZERO, 1=ONE)
+    case 0: return THREE.ZeroFactor;
+    case 1: return THREE.OneFactor;
+    default: return THREE.OneFactor;
+  }
+}
+
+// Re-derive a Three.js material's color/opacity from the XBE material system
+// when a script changes the material name at runtime.
+function _applyMaterialColor(threeMat, matName) {
+  const color = matSystem.applyMaterial(matName);
+  if (!color) return;
+  threeMat.color.setRGB(color.r / 255, color.g / 255, color.b / 255, THREE.SRGBColorSpace);
+  if (color.a < 255) {
+    threeMat.transparent = true;
+    threeMat.opacity = color.a / 255;
+  } else {
+    threeMat.transparent = false;
+    threeMat.opacity = 1;
+  }
+  threeMat.needsUpdate = true;
+}
 
 function asNumber(v) {
   if (typeof v === 'number') return v;

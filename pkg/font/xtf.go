@@ -4,10 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 )
-
-var xtfMagic = [4]byte{'X', 'T', 'F', '1'}
 
 // GlyphRange describes a contiguous range of Unicode codepoints.
 type GlyphRange struct {
@@ -15,29 +14,59 @@ type GlyphRange struct {
 	Count uint16
 }
 
-// GlyphMetric holds per-glyph layout information.
-type GlyphMetric struct {
-	Width        int    // glyph bitmap width in pixels
-	Height       int    // glyph bitmap height in pixels
-	XOffset      int    // horizontal bearing (signed)
-	YOffset      int    // vertical bearing (signed)
-	Advance      int    // horizontal advance width
-	BitmapOffset int    // byte offset into bitmap data for this glyph
+// GlyphMetrics holds GLYPHMETRICSFLOAT data for a glyph.
+type GlyphMetrics struct {
+	BlackBoxX float32 // width of bounding box
+	BlackBoxY float32 // height of bounding box
+	OriginX   float32 // x origin
+	OriginY   float32 // y origin
+	AdvanceX  float32 // horizontal advance
+	AdvanceY  float32 // vertical advance (usually 0)
 }
 
-// Font holds parsed XTF font metadata.
+// GlyphMesh holds the pre-triangulated outline for a glyph.
+type GlyphMesh struct {
+	Indices  []uint16
+	Vertices [][2]float32
+}
+
+// Glyph combines metrics and mesh data for a single glyph.
+type Glyph struct {
+	Metrics  GlyphMetrics
+	Mesh     GlyphMesh
+	meshOff  uint32 // absolute file offset to mesh data (internal)
+}
+
+// Font holds a parsed XTF vector font.
 type Font struct {
-	Name         string
-	GlyphCount   int
-	Ranges       []GlyphRange
-	Glyphs       []GlyphMetric // per-glyph metrics (len == TotalGlyphs from ranges)
-	MaxHeight    int
-	BitmapOffset int
-	FileSize     int64
-	RawData      []byte
+	Name       string
+	Height     int // cell height in pixels (from header 0x04)
+	GlyphCount int // total supported glyphs
+	RangeCount int
+	Ranges     []GlyphRange
+	Glyphs     []Glyph
+	FileSize   int64
 }
 
-// ReadXTF parses an XTF font file from r with given size.
+// ReadXTF parses an XTF vector font file.
+//
+// XTF layout:
+//
+//	0x00  magic "XTF0"
+//	0x04  uint32 name buffer size (always 32)
+//	0x08  char[32] font name (null-terminated)
+//	0x28  GLYPHSET:
+//	  0x28  uint32 cbThis       (size of serialized GLYPHSET)
+//	  0x2C  uint32 flAccel      (flags)
+//	  0x30  uint32 cGlyphsSupported
+//	  0x34  uint32 cRanges
+//	  0x38  WCRANGE[cRanges]    (uint16 wcLow, uint16 cGlyphs each)
+//	After GLYPHSET: per-glyph table (cGlyphsSupported entries)
+//	  each: GLYPHMETRICSFLOAT (6 float32) + uint32 mesh offset
+//	Mesh data at absolute offsets:
+//	  uint16 indexCount, uint16 vertexCount
+//	  uint16[indexCount] indices (triangle list)
+//	  float32[vertexCount*2] vertices (x,y pairs)
 func ReadXTF(r io.Reader, size int64) (*Font, error) {
 	if size < 0x38 {
 		return nil, ErrTruncatedFile
@@ -48,124 +77,109 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		return nil, fmt.Errorf("font: reading: %w", err)
 	}
 
-	// Check magic
-	if data[0] != 'X' || data[1] != 'T' || data[2] != 'F' || data[3] != '1' {
+	if data[0] != 'X' || data[1] != 'T' || data[2] != 'F' || data[3] != '0' {
 		return nil, ErrInvalidMagic
 	}
 
-	// Parse font name (null-terminated, starting at offset 8)
+	height := int(binary.LittleEndian.Uint32(data[0x04:]))
+
 	nameEnd := 8
 	for nameEnd < 0x28 && data[nameEnd] != 0 {
 		nameEnd++
 	}
 	name := string(data[8:nameEnd])
 
-	// Glyph count at 0x28
-	glyphCount := int(binary.LittleEndian.Uint32(data[0x28:]))
+	// GLYPHSET at 0x28
+	glyphCount := int(binary.LittleEndian.Uint32(data[0x30:]))
+	rangeCount := int(binary.LittleEndian.Uint32(data[0x34:]))
 
-	// Bitmap data offset at 0x30
-	bitmapOffset := int(binary.LittleEndian.Uint32(data[0x30:]))
+	if rangeCount < 0 || rangeCount > 100000 {
+		return nil, fmt.Errorf("font: invalid range count %d", rangeCount)
+	}
 
-	// Max glyph height at 0x34
-	maxHeight := int(binary.LittleEndian.Uint32(data[0x34:]))
-
-	// Parse glyph ranges starting at 0x38
-	var ranges []GlyphRange
-	totalGlyphs := 0
+	// Parse ranges at 0x38
+	ranges := make([]GlyphRange, rangeCount)
 	off := 0x38
-	for off+4 <= len(data) {
-		start := binary.LittleEndian.Uint16(data[off:])
-		count := binary.LittleEndian.Uint16(data[off+2:])
-		if start == 0 && count == 0 {
-			break
+	totalFromRanges := 0
+	for i := range rangeCount {
+		if off+4 > len(data) {
+			return nil, ErrTruncatedFile
 		}
-		if count == 0 || (start == 0 && totalGlyphs > 0) {
-			break
-		}
-		ranges = append(ranges, GlyphRange{Start: start, Count: count})
-		totalGlyphs += int(count)
+		ranges[i].Start = binary.LittleEndian.Uint16(data[off:])
+		ranges[i].Count = binary.LittleEndian.Uint16(data[off+2:])
+		totalFromRanges += int(ranges[i].Count)
 		off += 4
-
-		if len(ranges) > 256 {
-			break
-		}
 	}
 
-	// Skip the terminating 0,0 pair if present
-	if off+4 <= len(data) {
-		termStart := binary.LittleEndian.Uint16(data[off:])
-		termCount := binary.LittleEndian.Uint16(data[off+2:])
-		if termStart == 0 && termCount == 0 {
-			off += 4
-		}
+	if totalFromRanges != glyphCount {
+		return nil, fmt.Errorf("font: range glyph sum %d != header count %d", totalFromRanges, glyphCount)
 	}
 
-	// Parse per-glyph metric records between range table and bitmap data.
-	// Auto-detect record size from the available space.
-	var glyphs []GlyphMetric
-	if totalGlyphs > 0 && bitmapOffset > off && bitmapOffset <= len(data) {
-		metricSpace := bitmapOffset - off
-		recordSize := metricSpace / totalGlyphs
+	// Per-glyph table starts right after ranges
+	glyphTableOff := off
+	const recordSize = 28 // 6 floats (GLYPHMETRICSFLOAT) + 1 uint32 (mesh offset)
+	glyphTableEnd := glyphTableOff + glyphCount*recordSize
+	if glyphTableEnd > len(data) {
+		return nil, ErrTruncatedFile
+	}
 
-		if recordSize >= 8 && metricSpace%totalGlyphs == 0 {
-			glyphs = parseGlyphMetrics(data[off:bitmapOffset], totalGlyphs, recordSize)
+	glyphs := make([]Glyph, glyphCount)
+	for i := range glyphCount {
+		rec := data[glyphTableOff+i*recordSize:]
+		glyphs[i].Metrics.BlackBoxX = math.Float32frombits(binary.LittleEndian.Uint32(rec[0:]))
+		glyphs[i].Metrics.BlackBoxY = math.Float32frombits(binary.LittleEndian.Uint32(rec[4:]))
+		glyphs[i].Metrics.OriginX = math.Float32frombits(binary.LittleEndian.Uint32(rec[8:]))
+		glyphs[i].Metrics.OriginY = math.Float32frombits(binary.LittleEndian.Uint32(rec[12:]))
+		glyphs[i].Metrics.AdvanceX = math.Float32frombits(binary.LittleEndian.Uint32(rec[16:]))
+		glyphs[i].Metrics.AdvanceY = math.Float32frombits(binary.LittleEndian.Uint32(rec[20:]))
+		glyphs[i].meshOff = binary.LittleEndian.Uint32(rec[24:])
+	}
+
+	// Parse mesh data for each glyph
+	for i := range glyphs {
+		moff := int(glyphs[i].meshOff)
+		if moff == 0 || moff+4 > len(data) {
+			continue
 		}
+		icount := int(binary.LittleEndian.Uint16(data[moff:]))
+		vcount := int(binary.LittleEndian.Uint16(data[moff+2:]))
+		if icount == 0 || vcount == 0 {
+			continue
+		}
+
+		idxStart := moff + 4
+		idxEnd := idxStart + icount*2
+		vertStart := idxEnd
+		vertEnd := vertStart + vcount*8
+		if vertEnd > len(data) {
+			continue
+		}
+
+		indices := make([]uint16, icount)
+		for j := range icount {
+			indices[j] = binary.LittleEndian.Uint16(data[idxStart+j*2:])
+		}
+
+		vertices := make([][2]float32, vcount)
+		for j := range vcount {
+			voff := vertStart + j*8
+			vertices[j][0] = math.Float32frombits(binary.LittleEndian.Uint32(data[voff:]))
+			vertices[j][1] = math.Float32frombits(binary.LittleEndian.Uint32(data[voff+4:]))
+		}
+
+		glyphs[i].Mesh.Indices = indices
+		glyphs[i].Mesh.Vertices = vertices
 	}
 
 	return &Font{
-		Name:         name,
-		GlyphCount:   glyphCount,
-		Ranges:       ranges,
-		Glyphs:       glyphs,
-		MaxHeight:    maxHeight,
-		BitmapOffset: bitmapOffset,
-		FileSize:     size,
-		RawData:      data,
+		Name:       name,
+		Height:     height,
+		GlyphCount: glyphCount,
+		RangeCount: rangeCount,
+		Ranges:     ranges,
+		Glyphs:     glyphs,
+		FileSize:   size,
 	}, nil
-}
-
-// parseGlyphMetrics extracts per-glyph records of the given size.
-func parseGlyphMetrics(data []byte, count, recordSize int) []GlyphMetric {
-	glyphs := make([]GlyphMetric, count)
-
-	for i := range count {
-		off := i * recordSize
-		if off+recordSize > len(data) {
-			break
-		}
-		rec := data[off : off+recordSize]
-
-		switch {
-		case recordSize >= 12:
-			// 12+ byte records: width(2) + height(2) + xoff(2) + yoff(2) + advance(2) + padding(2+)
-			glyphs[i].Width = int(binary.LittleEndian.Uint16(rec[0:]))
-			glyphs[i].Height = int(binary.LittleEndian.Uint16(rec[2:]))
-			glyphs[i].XOffset = int(int16(binary.LittleEndian.Uint16(rec[4:])))
-			glyphs[i].YOffset = int(int16(binary.LittleEndian.Uint16(rec[6:])))
-			glyphs[i].Advance = int(binary.LittleEndian.Uint16(rec[8:]))
-			if recordSize >= 14 {
-				glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint32(rec[10:]))
-			}
-		case recordSize >= 10:
-			// 10 byte records: width(2) + height(2) + xoff(1) + yoff(1) + advance(2) + bitmapOff(2)
-			glyphs[i].Width = int(binary.LittleEndian.Uint16(rec[0:]))
-			glyphs[i].Height = int(binary.LittleEndian.Uint16(rec[2:]))
-			glyphs[i].XOffset = int(int8(rec[4]))
-			glyphs[i].YOffset = int(int8(rec[5]))
-			glyphs[i].Advance = int(binary.LittleEndian.Uint16(rec[6:]))
-			glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint16(rec[8:]))
-		case recordSize >= 8:
-			// 8 byte records: width(1) + height(1) + xoff(1) + yoff(1) + advance(1) + pad(1) + bitmapOff(2)
-			glyphs[i].Width = int(rec[0])
-			glyphs[i].Height = int(rec[1])
-			glyphs[i].XOffset = int(int8(rec[2]))
-			glyphs[i].YOffset = int(int8(rec[3]))
-			glyphs[i].Advance = int(rec[4])
-			glyphs[i].BitmapOffset = int(binary.LittleEndian.Uint16(rec[6:]))
-		}
-	}
-
-	return glyphs
 }
 
 // Open reads an XTF font file from disk.
@@ -184,13 +198,19 @@ func Open(path string) (*Font, error) {
 	return ReadXTF(f, fi.Size())
 }
 
-// TotalGlyphs returns the total glyph count from ranges.
-func (f *Font) TotalGlyphs() int {
-	total := 0
+// GlyphIndex returns the glyph table index for a Unicode codepoint,
+// or -1 if the codepoint is not covered.
+func (f *Font) GlyphIndex(cp rune) int {
+	idx := 0
 	for _, r := range f.Ranges {
-		total += int(r.Count)
+		start := rune(r.Start)
+		count := int(r.Count)
+		if cp >= start && cp < start+rune(count) {
+			return idx + int(cp-start)
+		}
+		idx += count
 	}
-	return total
+	return -1
 }
 
 // UnicodeBlocks returns a summary of which Unicode blocks are covered.

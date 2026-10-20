@@ -14,20 +14,41 @@ import (
 // The resolved values are computed by the Go decompiler from the binary —
 // the JavaScript runtime just reads them directly.
 type DecodedMaterial struct {
-	Name       string       `json:"name"`
-	Type       string       `json:"type"`                // constructor variant name
-	R          uint8        `json:"r"`                   // resolved diffuse red (0-255)
-	G          uint8        `json:"g"`                   // resolved diffuse green (0-255)
-	B          uint8        `json:"b"`                   // resolved diffuse blue (0-255)
-	A          uint8        `json:"a"`                   // resolved alpha (0-255)
-	Color1     uint32       `json:"color1"`              // primary packed ARGB (from ctor or Apply writes)
-	Color2     uint32       `json:"color2"`              // secondary packed ARGB
-	CtorVA     uint32       `json:"ctor_va"`             // constructor address
-	VtableVA   uint32       `json:"vtable_va"`           // vtable pointer set by constructor
-	ApplyVA    uint32       `json:"apply_va"`            // Apply method address (vtable slot 0)
-	CtorArgs   []uint32     `json:"ctor_args,omitempty"` // raw constructor arguments
-	Apply      []D3DCall    `json:"apply"`               // D3D calls made by Apply method
-	InitWrites []MemWrite   `json:"init_writes,omitempty"` // immediate writes to this+offset in Apply
+	Name         string       `json:"name"`
+	Type         string       `json:"type"`                  // constructor variant name
+	ShaderCfg    uint32       `json:"shader_cfg"`            // shader configuration flags
+	R            uint8        `json:"r"`                     // resolved diffuse red (0-255)
+	G            uint8        `json:"g"`                     // resolved diffuse green (0-255)
+	B            uint8        `json:"b"`                     // resolved diffuse blue (0-255)
+	A            uint8        `json:"a"`                     // resolved alpha (0-255)
+	Color1       uint32       `json:"color1"`                // primary packed ARGB (from ctor or Apply writes)
+	Color2       uint32       `json:"color2"`                // secondary packed ARGB
+	TextureIndex uint32       `json:"texture_index"`         // material texture (0=none, 1=gradient, 2=chrome, 3=cellwall)
+	TextureFile  string       `json:"texture_file,omitempty"` // resolved texture filename (e.g. "steel.png")
+	KeyMode1     uint8        `json:"key_mode1,omitempty"`   // key mode byte 1 (this+0x220)
+	KeyMode2     uint8        `json:"key_mode2,omitempty"`   // key mode byte 2 (this+0x221)
+	CtorVA       uint32       `json:"ctor_va"`               // constructor address
+	VtableVA     uint32       `json:"vtable_va"`             // vtable pointer set by constructor
+	ApplyVA      uint32       `json:"apply_va"`              // Apply method address (vtable slot 0)
+	CtorArgs     []uint32     `json:"ctor_args,omitempty"`   // raw constructor arguments (reversed push order)
+	Apply        []D3DCall    `json:"apply"`                 // D3D calls made by Apply method
+	InitWrites   []MemWrite   `json:"init_writes,omitempty"` // immediate writes to this+offset in Apply
+	D3DState     *D3DState    `json:"d3d_state,omitempty"`   // resolved D3D render state from Apply trace
+}
+
+// D3DState holds the resolved D3D render state extracted from a material's
+// Apply method trace. These are derived from SetRenderState and
+// SetTextureStageState calls in the XBE binary, mapped using the Xbox D3D8
+// enum values from cxbx-reloaded.
+type D3DState struct {
+	AlphaBlendEnable bool   `json:"alpha_blend_enable"`
+	SrcBlend         uint32 `json:"src_blend"`                    // Xbox blend factor (0x000=ZERO, 0x001=ONE, 0x302=SRCALPHA, etc.)
+	DstBlend         uint32 `json:"dst_blend"`                    // Xbox blend factor
+	SrcBlendName     string `json:"src_blend_name,omitempty"`     // resolved name (e.g. "D3DBLEND_SRCALPHA")
+	DstBlendName     string `json:"dst_blend_name,omitempty"`     // resolved name
+	ZWriteEnable     *bool  `json:"z_write_enable,omitempty"`     // nil = not set by Apply
+	UsesCombiner     bool   `json:"uses_combiner"`                // true if Apply calls SetRegisterCombinerConstants
+	UsesTextureFactor bool  `json:"uses_texture_factor"`          // true if Apply sets D3DRS_TEXTUREFACTOR
 }
 
 // D3DCall is a D3D API call extracted from the Apply method.
@@ -168,6 +189,359 @@ func ParseMaterialsFromDecompiled(decompiled string) []DecodedMaterial {
 	return materials
 }
 
+// scanCtorFields extracts member initializations from a constructor's x86
+// instruction stream. It detects two patterns:
+//
+//  1. MOV [this+offset], imm — immediate member writes (vtable, textureIndex, etc.)
+//  2. MOV reg, [stack+N] then MOV [this+offset], reg — arg-to-member writes
+//
+// The byte vs dword write size determines how the value is stored (e.g. offset
+// 0x0C as a dword is Color1 but as individual bytes is R/G/B/A at 0xC-0xF).
+//
+// For arg-based writes, the function tracks ESP deltas through PUSH/POP/CALL
+// to correctly resolve stack-relative arg references in both EBP-frame and
+// ESP-relative constructors.
+//
+// When the constructor delegates to a parent CMaxMaterial constructor (e.g.
+// eggpulse→combiner), scanCtorFields resolves the pushed values and recurses
+// into the parent with the forwarded args.
+func scanCtorFields(d *Disassembly, fn *Function, mat *DecodedMaterial) {
+	// Reverse ctor_args to get source-code argument order (arg1, arg2, ...).
+	// arg0 = name is stripped from ctor_args by the parser.
+	reversed := make([]uint32, len(mat.CtorArgs))
+	for i, v := range mat.CtorArgs {
+		reversed[len(mat.CtorArgs)-1-i] = v
+	}
+	scanCtorWithArgs(d, fn, mat, reversed)
+}
+
+// scanCtorWithArgs is the core constructor scanner. args is the constructor's
+// arguments in source-code order (arg1, arg2, ..., excluding arg0/name).
+func scanCtorWithArgs(d *Disassembly, fn *Function, mat *DecodedMaterial, args []uint32) {
+	// Track which registers are potential `this` pointers.
+	thisRegs := map[x86asm.Reg]bool{x86asm.ECX: true}
+
+	// Track which registers hold which constructor arg (1-based; 0 = name, skipped).
+	type argInfo struct {
+		index  int  // 1-based arg index
+		isByte bool // loaded as 8-bit register (AL, DL, etc.)
+	}
+	argInReg := map[x86asm.Reg]argInfo{}
+
+	// Track register values for resolving PUSH reg when delegating to parent.
+	regVal := map[x86asm.Reg]uint32{}
+	regKnown := map[x86asm.Reg]bool{}
+
+	// Track pushed values for resolving parent constructor delegation.
+	// Each entry is the resolved value pushed onto the stack. pushStack[0] is
+	// the most recently pushed value (closest to CALL = leftmost arg = name).
+	var pushStack []uint32
+	var pushKnown []bool
+
+	hasEBPFrame := false
+	espDelta := int32(0)
+	insns := fn.Instructions
+
+	for i := range insns {
+		insn := &insns[i]
+
+		// Detect EBP frame: MOV EBP, ESP
+		if insn.Inst.Op == x86asm.MOV && len(insn.Inst.Args) >= 2 {
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.EBP {
+				if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok && src == x86asm.ESP {
+					hasEBPFrame = true
+				}
+			}
+		}
+
+		// Track `this` pointer copies: MOV reg, ECX
+		if insn.Inst.Op == x86asm.MOV && len(insn.Inst.Args) >= 2 {
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+				if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
+					if thisRegs[src] && !is8BitReg(dst) {
+						thisRegs[dst] = true
+					}
+				}
+			}
+		}
+
+		// Track register values for PUSH resolution
+		if insn.Inst.Op == x86asm.MOV && len(insn.Inst.Args) >= 2 {
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok && !is8BitReg(dst) {
+				full := fullReg(dst)
+				if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+					regVal[full] = uint32(imm)
+					regKnown[full] = true
+				} else if src, ok := insn.Inst.Args[1].(x86asm.Mem); ok && src.Index == 0 {
+					// Arg load — resolve to ctor_args value
+					argIdx := resolveArgIdx(src, hasEBPFrame, espDelta)
+					if argIdx > 0 && argIdx-1 < len(args) {
+						regVal[full] = args[argIdx-1]
+						regKnown[full] = true
+					}
+				}
+			}
+		}
+		if insn.Inst.Op == x86asm.XOR && len(insn.Inst.Args) >= 2 {
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+				if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok && dst == src {
+					full := fullReg(dst)
+					regVal[full] = 0
+					regKnown[full] = true
+				}
+			}
+		}
+
+		// Track ESP delta and pushed values.
+		switch insn.Inst.Op {
+		case x86asm.PUSH:
+			espDelta -= 4
+			val, known := resolvePushValue(insn, args, hasEBPFrame, espDelta+4, regVal, regKnown)
+			pushStack = append([]uint32{val}, pushStack...)
+			pushKnown = append([]bool{known}, pushKnown...)
+		case x86asm.POP:
+			espDelta += 4
+			if len(pushStack) > 0 {
+				pushStack = pushStack[1:]
+				pushKnown = pushKnown[1:]
+			}
+		case x86asm.SUB:
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.ESP {
+				if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+					espDelta -= int32(imm)
+				}
+			}
+		case x86asm.ADD:
+			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.ESP {
+				if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+					espDelta += int32(imm)
+				}
+			}
+		case x86asm.CALL:
+			target := resolveTarget(insn)
+			callee, isKnown := d.Functions[target]
+			cleanup := int32(0)
+			if isKnown {
+				cleanup = calleeCleanup(callee)
+			}
+
+			// If calling a parent CMaxMaterial constructor, resolve pushed args
+			// and recurse. The top N entries of pushStack are the parent's args.
+			if isKnown && strings.HasPrefix(callee.Name, "CMaxMaterial::CMaxMaterial_") {
+				nArgs := int(cleanup / 4)
+				var parentArgs []uint32
+				// pushStack[0] = name (closest to CALL), [1] = arg1, etc.
+				// Strip name (index 0), take the rest as parent args in source order.
+				if nArgs > 1 && len(pushStack) >= nArgs {
+					for j := 1; j < nArgs; j++ {
+						if pushKnown[j] {
+							parentArgs = append(parentArgs, pushStack[j])
+						} else {
+							parentArgs = append(parentArgs, 0)
+						}
+					}
+				}
+
+				// Save fields the child may have set directly.
+				savedVtable := mat.VtableVA
+				savedTexIdx := mat.TextureIndex
+				savedColor1 := mat.Color1
+				savedColor2 := mat.Color2
+
+				scanCtorWithArgs(d, callee, mat, parentArgs)
+
+				// Child's direct writes take precedence over parent's.
+				if savedVtable != 0 {
+					mat.VtableVA = savedVtable
+				}
+				if savedTexIdx != 0 {
+					mat.TextureIndex = savedTexIdx
+				}
+				if savedColor1 != 0 {
+					mat.Color1 = savedColor1
+				}
+				if savedColor2 != 0 {
+					mat.Color2 = savedColor2
+				}
+			}
+
+			// CALL pushes return address; callee's RET N cleans up.
+			espDelta -= 4
+			espDelta += 4 + cleanup
+			// Remove cleaned-up entries from pushStack
+			nCleaned := int(cleanup / 4)
+			if nCleaned <= len(pushStack) {
+				pushStack = pushStack[nCleaned:]
+				pushKnown = pushKnown[nCleaned:]
+			} else {
+				pushStack = nil
+				pushKnown = nil
+			}
+		}
+
+		if insn.Inst.Op != x86asm.MOV || len(insn.Inst.Args) < 2 {
+			continue
+		}
+
+		// Pattern: MOV reg, [EBP+N] or [ESP+N] — load constructor arg from stack
+		if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+			if src, ok := insn.Inst.Args[1].(x86asm.Mem); ok && src.Index == 0 {
+				argIdx := resolveArgIdx(src, hasEBPFrame, espDelta)
+				if argIdx > 0 { // >0: skip arg0 (name)
+					full := fullReg(dst)
+					argInReg[full] = argInfo{index: argIdx, isByte: is8BitReg(dst)}
+				}
+			}
+		}
+
+		// Pattern: MOV [this+offset], reg — store arg to member field
+		if mem, ok := insn.Inst.Args[0].(x86asm.Mem); ok {
+			if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
+				if !thisRegs[mem.Base] || mem.Index != 0 {
+					continue
+				}
+				full := fullReg(src)
+				if info, ok := argInReg[full]; ok && info.index > 0 {
+					ctorIdx := info.index - 1
+					if ctorIdx < len(args) {
+						applyMemberWrite(mat, mem.Disp, args[ctorIdx], info.isByte)
+					}
+				}
+			}
+
+			// Pattern: MOV [this+offset], imm — immediate member write
+			if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
+				if thisRegs[mem.Base] && mem.Index == 0 {
+					applyMemberWrite(mat, mem.Disp, uint32(imm), false)
+				}
+			}
+		}
+	}
+}
+
+// resolveArgIdx computes the constructor arg index (0-based, where 0 = name)
+// from a stack memory reference.
+func resolveArgIdx(mem x86asm.Mem, hasEBPFrame bool, espDelta int32) int {
+	switch mem.Base {
+	case x86asm.EBP:
+		if hasEBPFrame && mem.Disp >= 8 {
+			return int(mem.Disp-8) / 4
+		}
+	case x86asm.ESP:
+		entryRel := espDelta + int32(mem.Disp)
+		if entryRel >= 4 {
+			return int(entryRel-4) / 4
+		}
+	}
+	return -1
+}
+
+// resolvePushValue resolves the value being pushed onto the stack.
+// espDelta should be the delta BEFORE this push instruction decremented it.
+func resolvePushValue(insn *Instruction, args []uint32, hasEBPFrame bool, espDelta int32,
+	regVal map[x86asm.Reg]uint32, regKnown map[x86asm.Reg]bool) (uint32, bool) {
+	if len(insn.Inst.Args) == 0 {
+		return 0, false
+	}
+	switch arg := insn.Inst.Args[0].(type) {
+	case x86asm.Imm:
+		return uint32(arg), true
+	case x86asm.Reg:
+		full := fullReg(arg)
+		if regKnown[full] {
+			return regVal[full], true
+		}
+		return 0, false
+	case x86asm.Mem:
+		if arg.Index == 0 {
+			argIdx := resolveArgIdx(arg, hasEBPFrame, espDelta)
+			if argIdx > 0 && argIdx-1 < len(args) {
+				return args[argIdx-1], true
+			}
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// applyMemberWrite maps a this+offset write to the appropriate DecodedMaterial
+// field. The CMaxMaterial struct layout offsets are derived from the
+// constructor instruction patterns in the XBE binary.
+func applyMemberWrite(mat *DecodedMaterial, disp int64, value uint32, isByte bool) {
+	switch disp {
+	case 0x00:
+		mat.VtableVA = value
+	case 0x08:
+		mat.ShaderCfg = value
+	case 0x0C:
+		if isByte {
+			// D3DCOLOR 0xAARRGGBB on little-endian x86: byte at offset 0x0C = B (LSB)
+			mat.B = uint8(value)
+		} else if mat.Color1 == 0 {
+			mat.Color1 = value
+		}
+	case 0x0D:
+		mat.G = uint8(value)
+	case 0x0E:
+		// byte at offset 0x0E = R
+		mat.R = uint8(value)
+	case 0x0F:
+		mat.A = uint8(value)
+	case 0x10:
+		mat.Color2 = value
+	case 0x14:
+		mat.TextureIndex = value
+	case 0x220:
+		mat.KeyMode1 = uint8(value)
+	case 0x221:
+		mat.KeyMode2 = uint8(value)
+	}
+}
+
+// calleeCleanup returns the number of bytes a function cleans from the stack
+// on return (from RET N instruction). Returns 0 for cdecl-style functions.
+func calleeCleanup(fn *Function) int32 {
+	for i := len(fn.Instructions) - 1; i >= 0; i-- {
+		insn := fn.Instructions[i]
+		if insn.Inst.Op == x86asm.RET && len(insn.Inst.Args) > 0 {
+			if imm, ok := insn.Inst.Args[0].(x86asm.Imm); ok {
+				return int32(imm)
+			}
+		}
+	}
+	return 0
+}
+
+// fullReg maps 8-bit and 16-bit registers to their 32-bit parent.
+func fullReg(r x86asm.Reg) x86asm.Reg {
+	switch r {
+	case x86asm.AL, x86asm.AH, x86asm.AX:
+		return x86asm.EAX
+	case x86asm.BL, x86asm.BH, x86asm.BX:
+		return x86asm.EBX
+	case x86asm.CL, x86asm.CH, x86asm.CX:
+		return x86asm.ECX
+	case x86asm.DL, x86asm.DH, x86asm.DX:
+		return x86asm.EDX
+	case x86asm.SI:
+		return x86asm.ESI
+	case x86asm.DI:
+		return x86asm.EDI
+	default:
+		return r
+	}
+}
+
+// is8BitReg returns true if the register is an 8-bit register (AL, AH, etc.)
+func is8BitReg(r x86asm.Reg) bool {
+	switch r {
+	case x86asm.AL, x86asm.AH, x86asm.BL, x86asm.BH,
+		x86asm.CL, x86asm.CH, x86asm.DL, x86asm.DH:
+		return true
+	}
+	return false
+}
+
 // TraceApplyMethods resolves each material's vtable and traces its Apply
 // method to extract the D3D state programming directly from the binary.
 func TraceApplyMethods(img *Image, d *Disassembly, materials []DecodedMaterial) {
@@ -188,20 +562,13 @@ func TraceApplyMethods(img *Image, d *Disassembly, materials []DecodedMaterial) 
 		}
 		mat.CtorVA = ctorFn.EntryVA
 
-		// The constructor writes the vtable pointer via MOV [reg], imm32.
-		// Scan constructor instructions for this pattern.
-		for _, insn := range ctorFn.Instructions {
-			if insn.Inst.Op == x86asm.MOV && len(insn.Inst.Args) >= 2 {
-				if mem, ok := insn.Inst.Args[0].(x86asm.Mem); ok {
-					if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
-						// MOV [reg], imm32 where reg is this pointer and disp is 0
-						if mem.Disp == 0 && (mem.Base == x86asm.ESI || mem.Base == x86asm.EDX || mem.Base == x86asm.EAX || mem.Base == x86asm.ECX) {
-							mat.VtableVA = uint32(imm)
-						}
-					}
-				}
-			}
-		}
+		// Scan constructor instructions for MOV [reg+disp], imm32 patterns:
+		//   disp=0x00: vtable pointer
+		//   disp=0x0C: color1 (for reflect, which hardcodes this+0xC = 4)
+		//   disp=0x14: textureIndex
+		// Also follow CALL targets to parent constructors (e.g. eggpulse → combiner)
+		// to extract fields set by the parent.
+		scanCtorFields(d, ctorFn, mat)
 
 		if mat.VtableVA == 0 {
 			continue
@@ -247,59 +614,92 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 		x86asm.ECX: -1,
 		x86asm.EDX: -1,
 		x86asm.EAX: -1,
+		x86asm.ESI: -1,
+		x86asm.EDI: -1,
+		x86asm.EBX: -1,
 	}
 
-	for i, insn := range insns {
-		// Track register assignments
+	for i := range insns {
+		insn := &insns[i]
+
+		// Track register assignments (forward pass).
+		// IMPORTANT: CALL clobbering is handled AFTER extraction below,
+		// so ECX/EDX are captured at their pre-call values.
 		switch insn.Inst.Op {
 		case x86asm.MOV:
 			if len(insn.Inst.Args) >= 2 {
 				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
-					if _, tracked := regs[dst]; tracked {
-						if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
-							regs[dst] = int32(imm)
-						} else {
-							regs[dst] = -1 // unknown source
+					full := fullReg(dst)
+					if _, tracked := regs[full]; tracked {
+						switch src := insn.Inst.Args[1].(type) {
+						case x86asm.Imm:
+							regs[full] = int32(src)
+						case x86asm.Reg:
+							if v, ok2 := regs[fullReg(src)]; ok2 {
+								regs[full] = v
+							} else {
+								regs[full] = -1
+							}
+						default:
+							regs[full] = -1
 						}
 					}
 				}
 			}
 		case x86asm.XOR:
-			// XOR reg, reg → zero
 			if len(insn.Inst.Args) >= 2 {
 				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
-					if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
-						if dst == src {
-							if _, tracked := regs[dst]; tracked {
-								regs[dst] = 0
-							}
+					if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok && dst == src {
+						full := fullReg(dst)
+						if _, tracked := regs[full]; tracked {
+							regs[full] = 0
 						}
 					}
 				}
 			}
 		case x86asm.POP:
-			// POP reg — value comes from stack. Look at the most recent PUSH imm.
+			// POP reg — resolve from matching PUSH walking backward.
 			if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
-				if _, tracked := regs[dst]; tracked {
-					// Walk backwards to find the matching PUSH
-					regs[dst] = -1
+				full := fullReg(dst)
+				if _, tracked := regs[full]; tracked {
+					regs[full] = -1
 					for j := i - 1; j >= 0; j-- {
 						prev := insns[j]
 						if prev.Inst.Op == x86asm.PUSH {
 							if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok {
-								regs[dst] = int32(imm)
+								regs[full] = int32(imm)
+							} else if reg, ok := prev.Inst.Args[0].(x86asm.Reg); ok {
+								if v, ok2 := regs[fullReg(reg)]; ok2 {
+									regs[full] = v
+								}
 							}
 							break
 						}
-						// Skip non-push instructions within a push-pop pair
 						if prev.Inst.Op == x86asm.CALL || prev.Inst.Op == x86asm.RET {
 							break
 						}
 					}
 				}
 			}
+		case x86asm.INC:
+			if len(insn.Inst.Args) > 0 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					full := fullReg(dst)
+					if v, ok2 := regs[full]; ok2 && v >= 0 {
+						regs[full] = v + 1
+					}
+				}
+			}
+		case x86asm.DEC:
+			if len(insn.Inst.Args) > 0 {
+				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					full := fullReg(dst)
+					if v, ok2 := regs[full]; ok2 && v >= 0 {
+						regs[full] = v - 1
+					}
+				}
+			}
 		case x86asm.SHL:
-			// SHL reg, imm — used for stage*32 computation
 			if len(insn.Inst.Args) >= 2 {
 				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
 					if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
@@ -312,27 +712,23 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 		case x86asm.ADD:
 			if len(insn.Inst.Args) >= 2 {
 				if dst, ok := insn.Inst.Args[0].(x86asm.Reg); ok {
+					full := fullReg(dst)
 					if imm, ok := insn.Inst.Args[1].(x86asm.Imm); ok {
-						if v, ok2 := regs[dst]; ok2 && v >= 0 {
-							regs[dst] = v + int32(imm)
+						if v, ok2 := regs[full]; ok2 && v >= 0 {
+							regs[full] = v + int32(imm)
 						}
 					}
 					if src, ok := insn.Inst.Args[1].(x86asm.Reg); ok {
-						if dv, ok2 := regs[dst]; ok2 {
-							if sv, ok3 := regs[src]; ok3 && dv >= 0 && sv >= 0 {
-								regs[dst] = dv + sv
+						if dv, ok2 := regs[full]; ok2 {
+							if sv, ok3 := regs[fullReg(src)]; ok3 && dv >= 0 && sv >= 0 {
+								regs[full] = dv + sv
 							} else {
-								regs[dst] = -1
+								regs[full] = -1
 							}
 						}
 					}
 				}
 			}
-		case x86asm.CALL:
-			// After a call, EAX/ECX/EDX are clobbered
-			regs[x86asm.EAX] = -1
-			regs[x86asm.ECX] = -1
-			regs[x86asm.EDX] = -1
 		}
 
 		// Extract MOV [this+offset], imm32 writes
@@ -361,7 +757,8 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 			}
 		}
 
-		// Extract CALL instructions with stack args AND register state
+		// Extract CALL instructions with register state and stack args.
+		// Register values are captured BEFORE clobbering.
 		if insn.Inst.Op == x86asm.CALL {
 			target := resolveTarget(&insns[i])
 
@@ -375,27 +772,42 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 				}
 			}
 
-			// Collect immediate push arguments before this call
+			// Collect stack args by walking backward from the CALL.
+			// Uses PUSH/POP balancing to skip register-load pairs
+			// (PUSH imm; POP reg patterns used by the compiler to load registers).
 			var args []uint32
+			popBalance := 0 // unmatched POPs seen walking backward
 			for j := i - 1; j >= 0; j-- {
 				prev := insns[j]
-				if prev.Inst.Op == x86asm.PUSH {
-					if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok {
-						args = append([]uint32{uint32(imm)}, args...)
+				switch prev.Inst.Op {
+				case x86asm.PUSH:
+					if popBalance > 0 {
+						// This PUSH was consumed by a later POP (register load)
+						popBalance--
 						continue
 					}
-					// PUSH reg — try to resolve from tracked value
-					if reg, ok := prev.Inst.Args[0].(x86asm.Reg); ok {
-						if v, ok2 := regs[reg]; ok2 && v >= 0 {
+					// Actual stack arg — resolve its value
+					if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok {
+						args = append([]uint32{uint32(imm)}, args...)
+					} else if reg, ok := prev.Inst.Args[0].(x86asm.Reg); ok {
+						if v, ok2 := regs[fullReg(reg)]; ok2 && v >= 0 {
 							args = append([]uint32{uint32(v)}, args...)
-							continue
 						}
+						// Unknown reg value — skip (don't include garbage)
 					}
-				}
-				if prev.Inst.Op != x86asm.POP {
-					break
+					// Unknown source (memory ref) — skip
+				case x86asm.POP:
+					popBalance++
+				case x86asm.CALL, x86asm.RET:
+					// Stop at previous call boundary
+					goto argsDone
+				default:
+					// Skip register-setup instructions (MOV, XOR, INC, DEC,
+					// ADD, SUB, SHL, LEA, CMP, TEST, JCC, etc.)
+					continue
 				}
 			}
+		argsDone:
 
 			calls = append(calls, D3DCall{
 				Function: fnName,
@@ -404,10 +816,95 @@ func traceApplyFunction(d *Disassembly, fn *Function) ([]D3DCall, []MemWrite) {
 				ECX:      regs[x86asm.ECX],
 				EDX:      regs[x86asm.EDX],
 			})
+
+			// Clobber caller-saved registers AFTER capture
+			regs[x86asm.EAX] = -1
+			regs[x86asm.ECX] = -1
+			regs[x86asm.EDX] = -1
 		}
 	}
 
 	return calls, writes
+}
+
+// textureIndexFiles maps material texture indices to their extracted filenames.
+// Derived from the XBE's texture loading code: LookupTexture(this+0x14) binds
+// the texture at the given index. Index 1 is a GPU-generated gradient (no file).
+var textureIndexFiles = map[uint32]string{
+	2: "steel.png",
+	3: "cellwall.png",
+}
+
+// ResolveD3DState processes a material's Apply trace to extract the D3D render
+// state configuration. It decodes SetRenderState calls (sub_0002989C in the
+// original trace) using the Xbox D3D8 enum values, and detects combiner vs
+// texture-factor rendering paths.
+//
+// The calling convention for SetRenderState wrapper: args[-1]=State, args[-2]=Value
+// (reversed push order in the trace).
+func ResolveD3DState(mat *DecodedMaterial) {
+	state := &D3DState{}
+
+	for _, call := range mat.Apply {
+		switch {
+		case strings.Contains(call.Function, "SetRenderState"):
+			if len(call.Args) >= 2 {
+				// args = [Value, State] due to reversed push collection
+				value := call.Args[0]
+				stateID := call.Args[len(call.Args)-1]
+				resolveRenderState(state, stateID, value)
+			} else if len(call.Args) == 1 {
+				// Single-arg: the resolved push is the state ID (immediate),
+				// the value was in an unresolved register.
+				stateID := call.Args[0]
+				if name, ok := D3DRenderStates[stateID]; ok {
+					if name == "X_D3DRS_TEXTUREFACTOR" {
+						state.UsesTextureFactor = true
+					}
+				}
+			}
+
+		case call.Function == "SetRegisterCombinerConstants":
+			state.UsesCombiner = true
+
+		case call.Function == "LookupTexture":
+			// Texture binding — textureIndex already extracted from constructor
+		}
+	}
+
+	// Resolve texture file from index
+	if f, ok := textureIndexFiles[mat.TextureIndex]; ok {
+		mat.TextureFile = f
+	}
+
+	// Resolve blend factor names
+	if name, ok := D3DBlendFactors[state.SrcBlend]; ok {
+		state.SrcBlendName = name
+	}
+	if name, ok := D3DBlendFactors[state.DstBlend]; ok {
+		state.DstBlendName = name
+	}
+
+	mat.D3DState = state
+}
+
+// resolveRenderState maps a single SetRenderState(stateID, value) call
+// to the D3DState struct fields.
+func resolveRenderState(state *D3DState, stateID, value uint32) {
+	name := D3DRenderStates[stateID]
+	switch name {
+	case "X_D3DRS_ALPHABLENDENABLE":
+		state.AlphaBlendEnable = value != 0
+	case "X_D3DRS_SRCBLEND":
+		state.SrcBlend = value
+	case "X_D3DRS_DESTBLEND":
+		state.DstBlend = value
+	case "X_D3DRS_ZWRITEENABLE":
+		v := value != 0
+		state.ZWriteEnable = &v
+	case "X_D3DRS_TEXTUREFACTOR":
+		state.UsesTextureFactor = true
+	}
 }
 
 // ExtractMaterialsFromXBE is the high-level entry point: load XBE,
@@ -439,6 +936,11 @@ func ExtractMaterialsFromXBE(xbePath string) ([]DecodedMaterial, error) {
 
 	// Step 2: Trace each material's Apply method from the binary
 	TraceApplyMethods(img, d, materials)
+
+	// Step 3: Resolve D3D state from Apply traces
+	for i := range materials {
+		ResolveD3DState(&materials[i])
+	}
 
 	return materials, nil
 }
