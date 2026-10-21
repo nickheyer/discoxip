@@ -1,9 +1,10 @@
 import * as THREE from 'three';
-import { DerivedModel, cloneState, makeBuffer } from './derived.js';
-import { DevicePipeline, describeGeometry } from './pipeline.js';
+import { DerivedModel, cloneState, makeBuffer, matMul, SceneObject, VertexBuffer, MatrixStack, bitsFromFloat, TS_WORLD, ARCHIVE_TYPE, HEAP_TYPE } from './derived.js';
+import { DevicePipeline, describeGeometry, describeFVF, primitiveIndices } from './pipeline.js';
+import { VirtualConsole, nativeClasses, dateMembers, NATIVE_DRAW_CLASSES } from './system.js';
 
 // ============================================================================
-// XAP Runtime — Full-parity Three.js recreation of Xbox Dashboard
+// XAP Runtime — the dashboard executable's frame loop run over its scene files
 // ============================================================================
 
 const DATA_BASE = 'data';
@@ -14,6 +15,25 @@ const _console = { log: console.log, warn: console.warn, error: console.error };
 const _log = _console.log.bind(console);
 const _warn = _console.warn.bind(console);
 const _error = _console.error.bind(console);
+
+// Scene file field types as the executable's field tables number them
+const FIELD_INT = 1, FIELD_BOOL = 2, FIELD_NUMBER = 3, FIELD_VEC3 = 5, FIELD_ROTATION = 6, FIELD_COLOR = 8, FIELD_NODE = 9, FIELD_STRING = 10;
+const HOOKED_FIELD_TYPES = new Set([FIELD_INT, FIELD_BOOL, FIELD_NUMBER, FIELD_VEC3, FIELD_ROTATION, FIELD_COLOR, FIELD_NODE, FIELD_STRING]);
+
+// D3DPRESENT_PARAMETERS words the device init fills before creating the device
+const PRESENT_WIDTH = 0, PRESENT_HEIGHT = 4;
+// XGetVideoFlags bit for a widescreen display
+const VIDEO_FLAG_WIDESCREEN = 1;
+// Display shapes a console shows its frame in
+const DISPLAY_ASPECT_NORMAL = 4 / 3, DISPLAY_ASPECT_WIDE = 16 / 9;
+// D3DCLEAR flags for the color channels
+const CLEAR_TARGET = 0xF0;
+
+// The script scope object a loaded scene's post load step creates and fires initialize on
+const SCOPE_TYPE = '$scope';
+// Classes whose fields drive subsystems the runtime provides itself: audio voices, controller input, glyph layout
+// and the console hardware the natives in system.js stand in for
+const RUNTIME_FIELD_CLASSES = new Set(['AudioClip', 'Joystick', 'Text', 'Keyboard', 'DVDPlayer', 'DynamicTexture']);
 
 // ============================================================================
 // Main entry point
@@ -26,37 +46,45 @@ class XAPRuntime {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setClearColor(0x000000);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    // The dashboard draws in scene order, which the derived device state depends on.
+    this.renderer.autoClear = false;
+    // The executable's draw order is the render order.
     this.renderer.sortObjects = false;
     document.body.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 10000);
-    this.camera.position.set(0, 0, 6);
-
-    // No scene lights — the Xbox dashboard uses MeshBasicMaterial with vertex
-    // colors and textures. Lighting is baked into the assets.
+    // The derived shaders carry their own transforms, the camera only drives the render call.
+    this.camera = new THREE.Camera();
+    this.drawRoot = new THREE.Group();
+    this.scene.add(this.drawRoot);
 
     // Runtime state
     this.config = null;
     this.meshManifest = {};
     this.meshCache = {};       // key → Promise<THREE.BufferGeometry>
     this.textureCache = {};    // name → THREE.Texture
-    this.derived = null;       // DerivedModel interpreting the executable's draw paths
+    this.derived = null;       // DerivedModel interpreting the executable's paths
     this.pipeline = null;      // DevicePipeline mapping device state onto materials
     this.device = null;        // D3D device state persisting across draws
     this.proceduralTextures = {}; // 'texture:VA' → THREE.Texture
-    this.drawTarget = null;    // shape being drawn by the derived path this instant
     this.sceneData = {};       // sceneName → parsed JSON
     this.nodes = {};           // global DEF name → XAPNode
-    this._viewpointSet = false;   // only apply the first Viewpoint to camera
-    this._backgroundSet = false;  // only apply the first Background to scene
-    this.rootGroup = new THREE.Group();
-    this.scene.add(this.rootGroup);
+    this.root = null;          // the scene object the frame draws
+    this.frameDraws = [];      // meshes drawn this frame in order
+    this.quadMeshes = new Map(); // vertex buffer → mesh drawn from it
+    this.presentParams = 0;    // address of the present parameters the device was created with
+    this.tickBase = 0;
+    this.archives = new Map(); // archive path → loaded archive object
+    this.buildOwners = [];     // inline nodes whose scenes are being built, innermost last
 
     // Script engine state
     this.scriptScope = {};     // global scope for script execution
-    this.pendingScripts = [];
+    this.pendingScripts = [];  // [{scope, script}] in scene order
+    this.scopes = [];          // ScriptScope per loaded scene, parents first
+    this.console = null;       // VirtualConsole the natives read
+    this.natives = null;       // class name -> native methods and properties
+    this.inputEnabled = true;
+    this.boundJoysticks = [];  // joysticks bound by scripts, the last bound receiving input
+    this.running = true;
 
     // Fonts
     this.fonts = {}; // fontName → parsed font JSON
@@ -64,18 +92,15 @@ class XAPRuntime {
     // Audio
     this.audioCtx = null;
     this.audioBuffers = {};
+    this.playingClips = new Set();
+    this.screenSaver = null;
+    this.textRenderers = [];
 
     // Input
-    this.activeJoysticks = []; // bound joystick nodes
+    this.joysticks = [];       // every node with event handlers, DEF named or not
     this.prevButtons = {};
 
-    // Animation
-    this.animations = [];      // active animations [{target, prop, from, to, duration, elapsed}]
     this.clock = new THREE.Clock();
-
-    // Levels
-    this.levels = {};          // DEF name → { node, loaded, active }
-    this.activeLevel = null;
 
     window.addEventListener('resize', () => this.onResize());
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
@@ -92,59 +117,57 @@ class XAPRuntime {
     for (const evt of ['click', 'keydown', 'touchstart']) {
       window.addEventListener(evt, resumeAudio, { once: false });
     }
-
   }
 
   async start() {
     try {
-      // Load config
       const configResp = await fetch(`${DATA_BASE}/config.json`);
       this.config = await configResp.json();
 
-      // Load mesh manifest
       const manifestResp = await fetch(`${DATA_BASE}/meshes/manifest.json`);
       this.meshManifest = await manifestResp.json();
       _log(`[XAP] ${Object.keys(this.meshManifest).length} meshes in manifest`);
 
-      // Load the render model derived from the executable
       const renderResp = await fetch(`${DATA_BASE}/render.json`);
       const renderModel = await renderResp.json();
-      this.derived = new DerivedModel(renderModel);
+      this.console = new VirtualConsole(renderModel.system);
+      installDate(this.console);
+      this.derived = new DerivedModel(renderModel, this.deviceHost());
       this.pipeline = new DevicePipeline(THREE, renderModel, { resolve: (h) => this.resolveTextureHandle(h) });
       this.device = cloneState(this.derived.defaults);
-      this.derived.onDraw = (state) => this.onDerivedDraw(state);
-      // Text geometry is drawn by the vector font renderer with the state the appearance leaves.
-      this.derived.hook(this.derived.drawSlotFunction('Text'), (obj, args, state) => { this.onDerivedTextDraw(state); return 0; });
+      this.derived.onDraw = (state, env, quad) => this.onDerivedDraw(state, env, quad);
+      this.natives = { ...nativeClasses(this, this.console), ...this.runtimeNativeClasses() };
+      for (const cls of Object.keys(nativeClasses(this, this.console))) RUNTIME_FIELD_CLASSES.add(cls);
+      this.installHooks();
+      this.checkNatives(renderModel.system.methods);
       for (const t of renderModel.textures) {
         const key = 'texture:' + (t.va >>> 0).toString(16).toUpperCase().padStart(8, '0');
         this.proceduralTextures[key] = this.loadTexture(`proc_${key.slice(8)}.png`);
+        // The producer's pixels were captured at derivation, so the call hands back the exported texture.
+        this.derived.hook(t.va, () => ({ texture: key }));
       }
-      _log(`[XBE] ${renderModel.materials.length} materials, ${Object.keys(renderModel.programs).length} vertex programs, ${renderModel.textures.length} procedural textures`);
+      _log(`[XBE] ${renderModel.materials.length} materials, ${Object.keys(renderModel.programs).length} vertex programs, ${renderModel.textures.length} procedural textures, ${Object.keys(renderModel.draw.functions).length} routines`);
 
-      // Load XTF vector fonts
       await this.loadFonts();
 
-      // Load ALL scene data FIRST (Level/Inline nodes need sub-scene data during build)
       const loadPromises = this.config.scenes.map(name => this.loadSceneData(name));
       await Promise.allSettled(loadPromises);
       _log(`[XAP] ${Object.keys(this.sceneData).length} scenes loaded`);
 
-      // Now build the entry scene (sub-scenes will be available for Level/Inline)
+      // The device init runs on the executable's renderer object before any scene is built, then the startup
+      // creates the matrix stack the node draws compose their world matrices on.
+      this.runRenderer(this.derived.scene.init);
+      // The main load fills the caller's path buffer with the scene file it opens.
+      this.runRenderer(this.derived.scene.main_load, [{ obj: new SceneObject(HEAP_TYPE, null), off: 0 }]);
+      this.derived.memory.store(this.derived.scene.matrix_stack, 4, { matrixStack: new MatrixStack() });
+      this.rootGlobal = this.findRootGlobal();
+
       await this.loadScene(this.config.entry);
       _log(`[XAP] ${Object.keys(this.nodes).length} nodes registered`);
 
-      // Execute all pending scripts
       this.executeScripts();
-
-      // Auto-call initialize() — Xbox runtime calls this after scene loads
-      if (typeof window.initialize === 'function') {
-        try {
-          window.initialize();
-          _log('[XAP] initialize() completed');
-        } catch (e) {
-          _warn('[XAP] initialize() error:', e.message);
-        }
-      }
+      this.derived.memory.store(this.rootGlobal, 4, { obj: this.root });
+      this.runEntryInitialize();
 
       document.getElementById('loading').classList.add('hidden');
       this.animate();
@@ -154,21 +177,288 @@ class XAPRuntime {
     }
   }
 
+  // What the derived paths ask the runtime for: buffers, the console and the device surface
+  deviceHost() {
+    const runtime = this;
+    return {
+      get tickBase() { return runtime.tickBase; },
+      get device() { return runtime.device; },
+      console: this.console,
+      createVertexBuffer: (size, fvf) => new VertexBuffer(size, fvf),
+      backBufferWidth: () => this.derived.memory.load(this.presentParamsAddress(), 4),
+      backBufferHeight: () => this.derived.memory.load(this.presentParamsAddress() + PRESENT_HEIGHT, 4),
+      onClear: (state) => { this.frameClear = state.clear; },
+    };
+  }
+
+  // The present parameters are the buffer the init hands the device creation
+  presentParamsAddress() {
+    if (!this.presentParams) throw new Error('the device was created with no present parameters');
+    return this.presentParams;
+  }
+
+  // Runs a renderer routine on the executable's static renderer object
+  runRenderer(va, args = []) {
+    const sc = this.derived.scene;
+    const parent = this.derived.newEnv(null);
+    parent.state = this.device;
+    return this.derived.run(va, sc.renderer, args, this.device, parent);
+  }
+
+  // The global the frame routine draws the scene through
+  findRootGlobal() {
+    const sc = this.derived.scene;
+    const paths = this.derived.functions.get(sc.frame);
+    for (const p of paths) {
+      for (const e of p.effects) {
+        if (e.kind !== 'call' || e.fn !== 'vcall@' + this.derived.draw.slot.toString(16).toUpperCase()) continue;
+        for (const a of e.args || []) {
+          const n = this.derived.nodes[a];
+          if (n.k === 'load' && n.base === '' && n.addr === undefined) return n.off;
+        }
+      }
+    }
+    throw new Error('the frame routine draws no node loaded from a global');
+  }
+
+  // Runtime implementations of the routines the model keeps as calls
+  installHooks() {
+    const d = this.derived, sc = d.scene;
+    d.hook(d.drawSlotFunction('Text'), (thisVal, args, state) => { this.onDerivedTextDraw(this.objectOf(thisVal), state); return 0; });
+    d.hook(d.typeSlot('DynamicTexture', d.draw.texture_slot), (thisVal) => this.dynamicTextureHandle(this.objectOf(thisVal)));
+    d.hook(sc.group.draw, (thisVal, args, state, env) => { this.drawChildren(this.objectOf(thisVal), state, env); return 0; });
+    d.hook(sc.group.tick, (thisVal, args, state, env) => { this.tickChildren(this.objectOf(thisVal), args[0], state, env); return 0; });
+    d.hook(sc.array_element, (thisVal, args) => this.arrayElement(thisVal, d.int(args[0])));
+    d.hook(sc.fire_event, (thisVal, args) => this.fireDerivedEvent(args[0], d.string(args[1])));
+    d.hook(sc.present, (thisVal, args, state) => { this.presentFrame(state); return 0; });
+    d.hook(sc.script_tick, () => 0);
+    // The ticks of the classes the runtime drives itself advance audio voices, input and glyph scrolling here.
+    for (const cls of RUNTIME_FIELD_CLASSES) {
+      const slots = sc.slots[cls];
+      if (slots && slots.tick && slots.tick !== sc.group.tick) d.hook(slots.tick, () => 0);
+    }
+    for (const va of sc.tick_hooks || []) if (va !== sc.timers.advance) d.hook(va, () => 0);
+    for (const va of sc.timer_hooks || []) if (va !== sc.timers.remove) d.hook(va, () => 0);
+    d.hook(sc.timers.advance, (thisVal, args, state, env) => { this.advanceTimers(state, env); return 0; });
+    d.hook(sc.timers.remove, (thisVal, args) => { this.removeTimers(args[0]); return 0; });
+    d.hook(sc.loader, (thisVal, args) => this.loadArchive(d.string(args[0])));
+    d.hook(sc.unloader, () => 0);
+    for (const va of sc.image_load || []) d.hook(va, () => 0);
+    d.hook(sc.scene_load.reset, () => 0);
+    d.hook(sc.scene_load.resolve, (thisVal, args, state, env) => { d.storeString(args[0], d.string(args[1]), env); return args[0]; });
+    d.hook(sc.scene_load.populate, (thisVal) => { this.populateInline(this.objectOf(thisVal).node); return 1; });
+    d.hook(sc.scene_load.new_scope, (thisVal) => ({ obj: new SceneObject(SCOPE_TYPE, this.objectOf(thisVal).node), off: 0 }));
+    d.hook(sc.scene_load.attach, () => 0);
+    // Allocators hand back fresh zeroed memory the paths then fill by field offset.
+    for (const va of d.model.allocators) d.hook(va, () => ({ obj: new SceneObject(HEAP_TYPE, null), off: 0 }));
+    // The device creation keeps the present parameters the init filled in.
+    d.hook = d.hook.bind(d);
+    const perform = d.performCall.bind(d);
+    d.performCall = (fn, argIdx, thisIdx, env, seq) => {
+      if (fn === 'Direct3D_CreateDevice') {
+        const params = d.eval(argIdx[4], env);
+        if (typeof params !== 'number') throw new Error(`device created with present parameters at ${JSON.stringify(params)}`);
+        this.presentParams = params;
+        return 0;
+      }
+      return perform(fn, argIdx, thisIdx, env, seq);
+    };
+  }
+
+  objectOf(v) {
+    if (v && v.obj !== undefined) return v.obj;
+    if (v instanceof SceneObject) return v;
+    throw new Error(`hook called on ${JSON.stringify(v)} which is no scene object`);
+  }
+
+  // The children a group object draws, in scene order
+  childObjects(obj) {
+    const node = obj.node;
+    if (!node) throw new Error(`${obj.type} object has no scene node to draw children from`);
+    return node._xapChildren.map((c) => c.derivedObject());
+  }
+
+  // Draws a group's visible children through their class draw methods
+  drawChildren(obj, state, env) {
+    const d = this.derived, g = d.scene.group;
+    for (const child of this.childObjects(obj)) {
+      if (!d.int(d.readField(child, g.visible, 1))) continue;
+      d.run(d.drawSlotFunction(child.type), child, [], state, env);
+    }
+  }
+
+  // Advances a group's children by the frame time through their class tick methods
+  tickChildren(obj, dt, state, env) {
+    const d = this.derived;
+    for (const child of this.childObjects(obj)) {
+      d.run(d.tickSlotFunction(child.type), child, [dt], state, env);
+    }
+  }
+
+  // An element of a node array field: the children array or another multi node field
+  arrayElement(thisVal, index) {
+    if (!thisVal || thisVal.obj === undefined) throw new Error(`array element of ${JSON.stringify(thisVal)}`);
+    const obj = thisVal.obj, off = thisVal.off || 0;
+    const d = this.derived;
+    let list;
+    if (off === d.scene.group.children) list = obj.node._xapChildren;
+    else {
+      const f = d.fieldAt(obj.type, off);
+      if (!f) throw new Error(`${obj.type} has no array field at +0x${off.toString(16)}`);
+      list = obj.node.fieldNodeList(f.name);
+    }
+    if (index < 0 || index >= list.length) return 0;
+    return { obj: list[index].derivedObject() };
+  }
+
+  // Delivers a script event the executable fires to a node or a loaded scene
+  fireDerivedEvent(target, name) {
+    const obj = this.objectOf(target);
+    if (obj.type === SCOPE_TYPE) {
+      if (name === 'initialize') { this.runSceneInitialize(obj.node); return 1; }
+      throw new Error(`event ${name} fired on the scene of ${obj.node.data.def || obj.node.data.type}`);
+    }
+    const handled = this.fireEvent(obj.node, name);
+    return handled === undefined ? 0 : 1;
+  }
+
+  // Steps every field interpolation record on the executable's list, unlinking the finished ones
+  advanceTimers(state, env) {
+    const d = this.derived, t = d.scene.timers;
+    let prev = null;
+    let record = d.memory.load(t.head, 4);
+    while (record && record.obj !== undefined) {
+      const next = d.readField(record.obj, t.next, 4);
+      const running = d.int(d.run(t.step, record.obj, [], state, env)) & 0xFF;
+      if (!running) {
+        if (prev) d.writeField(prev.obj, t.next, next);
+        else d.memory.store(t.head, 4, next);
+      } else {
+        prev = record;
+      }
+      record = next;
+    }
+  }
+
+  // Unlinks the interpolation records that write into a node's fields
+  removeTimers(node) {
+    const d = this.derived, t = d.scene.timers;
+    let prev = null;
+    let record = d.memory.load(t.head, 4);
+    while (record && record.obj !== undefined) {
+      const next = d.readField(record.obj, t.next, 4);
+      const owner = d.readField(record.obj, t.node, 4);
+      if (owner && owner.obj !== undefined && node && node.obj !== undefined && owner.obj === node.obj) {
+        if (prev) d.writeField(prev.obj, t.next, next);
+        else d.memory.store(t.head, 4, next);
+      } else {
+        prev = record;
+      }
+      record = next;
+    }
+  }
+
+  // The archive an inline or level loads, which the runtime built with the scene
+  loadArchive(path) {
+    const key = path.toLowerCase();
+    if (this.archives.has(key)) return { obj: this.archives.get(key) };
+    const archive = new SceneObject(ARCHIVE_TYPE, null);
+    const d = this.derived;
+    const loader = d.functions.get(d.scene.inline_load);
+    if (!loader) throw new Error('the inline load routine is not summarized');
+    for (const [off, value] of this.loadedArchiveFields()) archive.slots.set(off, value);
+    this.archives.set(key, archive);
+    return { obj: archive };
+  }
+
+  // The archive fields the inline draw and tick read, valued as a finished load leaves them
+  loadedArchiveFields() {
+    const d = this.derived, sc = d.scene;
+    const inline = d.types.Inline;
+    const reads = new Map();
+    const walk = (idx) => {
+      const n = d.nodes[idx];
+      if (!n || typeof n !== 'object') return;
+      if (n.k === 'load' && n.addr !== undefined) {
+        const a = d.nodes[n.addr];
+        if (a && a.k === 'bin' && a.op === 'add') {
+          const b = d.nodes[a.b];
+          if (b && b.k === 'i' && this.loadsInlineArchive(a.a)) reads.set(b.v, n.size);
+        }
+      }
+      for (const key of ['a', 'b', 'addr', 'this']) if (n[key] !== undefined) walk(n[key]);
+      for (const key of ['args', 'elems']) if (n[key]) for (const x of n[key]) walk(x);
+    };
+    for (const va of [inline.slots[d.draw.slot / 4], inline.slots[sc.tick_slot / 4]]) {
+      for (const p of d.functions.get(va)) {
+        for (const g of p.guards) walk(g);
+        for (const e of p.effects) { if (e.value !== undefined) walk(e.value); for (const a of e.args || []) walk(a); if (e.this !== undefined) walk(e.this); }
+        walk(p.return);
+      }
+    }
+    // A loaded archive holds data and runs no loading thread, which is what the inline paths test for.
+    const fields = [];
+    const offsets = [...reads.keys()].sort((a, b) => a - b);
+    if (offsets.length < 2) throw new Error('the inline paths read no archive fields');
+    fields.push([offsets[0], 1]);
+    for (const off of offsets.slice(1)) fields.push([off, 0]);
+    return fields;
+  }
+
+  // Reports whether an expression loads the inline's archive field
+  loadsInlineArchive(idx) {
+    const n = this.derived.nodes[idx];
+    if (!n || n.k !== 'load' || n.base !== 'this') return false;
+    const f = this.derived.fieldAt('Inline', n.off);
+    return !f && n.size === 4;
+  }
+
+  // The scene loader hands each field of the inline's scene to its class hook as it parses the file
+  populateInline(node) {
+    if (node._populated) return;
+    node._populated = true;
+    for (const owned of node._ownedNodes) owned.applyFieldHooks();
+  }
+
+  // Runs a loaded scene's initialize once, the way the post load step fires it
+  runSceneInitialize(node) {
+    const scope = node._inlineScope;
+    if (!scope) throw new Error(`${node.data.def || node.data.type} loaded no scene to initialize`);
+    if (scope.initialized) return;
+    scope.initialized = true;
+    const init = scope.get('initialize');
+    if (typeof init !== 'function') return;
+    try {
+      init();
+    } catch (e) {
+      _warn(`[XAP] initialize() error in ${scope.name()}:`, e.message);
+    }
+  }
+
+  // The entry scene's initialize runs after its scripts, as the main scene load fires it
+  runEntryInitialize() {
+    const scope = this.scopes[0];
+    scope.initialized = true;
+    const init = scope.get('initialize');
+    if (typeof init !== 'function') return;
+    try {
+      init();
+    } catch (e) {
+      _warn(`[XAP] initialize() error in ${scope.name()}:`, e.message);
+    }
+  }
+
   async loadFonts() {
     const fontFiles = [
       { file: 'Xbox', role: 'heading' },
       { file: 'XBox_Book', role: 'body' },
     ];
     for (const { file, role } of fontFiles) {
-      try {
-        const resp = await fetch(`${DATA_BASE}/fonts/${file}.json`);
-        if (!resp.ok) continue;
-        const fontData = await resp.json();
-        this.fonts[role] = fontData;
-        _log(`[XTF] Loaded font "${fontData.name}" as ${role}`);
-      } catch (e) {
-        _warn(`[XTF] Failed to load font ${file}: ${e.message}`);
-      }
+      const resp = await fetch(`${DATA_BASE}/fonts/${file}.json`);
+      if (!resp.ok) throw new Error(`font ${file} is not exported`);
+      const fontData = await resp.json();
+      this.fonts[role] = fontData;
+      _log(`[XTF] Loaded font "${fontData.name}" as ${role}`);
     }
   }
 
@@ -180,130 +470,65 @@ class XAPRuntime {
     return data;
   }
 
+  // Builds the entry scene under a root group the frame routine draws
   async loadScene(name) {
     const data = await this.loadSceneData(name);
     const archiveName = name.split('_').slice(0, -1).join('_');
-    this.buildScene(data, this.rootGroup, archiveName);
+    const rootNode = new XAPNode({ type: 'Group', def: '', fields: {} }, this, archiveName);
+    this.root = rootNode.derivedObject();
+    this.buildOwners.push(rootNode);
+    this.buildScene(data, archiveName, rootNode);
+    this.buildOwners.pop();
+    // The main scene load hands every field to its class hook as it parses the file.
+    for (const node of rootNode._ownedNodes) node.applyFieldHooks();
   }
 
-  buildScene(data, parent, archiveName, parentNode) {
+  buildScene(data, archiveName, parentNode) {
+    const scope = new ScriptScope(this, parentNode.scope, parentNode);
+    this.scopes.push(scope);
+    parentNode._inlineScope = scope;
     for (const item of data.items) {
       if (item.kind === 'node' && item.node) {
-        const childNode = this.buildNode(item.node, parent, archiveName);
-        // Register as XAP child of the parent node (for children[] traversal)
-        if (childNode && parentNode) {
-          parentNode._xapChildren.push(childNode);
-        }
+        const childNode = this.buildNode(item.node, archiveName, scope, parentNode);
+        if (childNode) parentNode._xapChildren.push(childNode);
       } else if (item.kind === 'script') {
-        this.pendingScripts.push(item.script);
+        this.pendingScripts.push({ scope, script: item.script });
       }
     }
   }
 
   // ========================================================================
-  // Node builder — FIELD-DRIVEN, no type switches. Every node is a Group.
-  // Its behavior is determined solely by what fields it has.
+  // Node builder: every scene node becomes the executable's object for its class
   // ========================================================================
 
-  buildNode(data, parent, archiveName) {
+  buildNode(data, archiveName, scope, parentNode) {
     const node = new XAPNode(data, this, archiveName);
+    node.scope = scope;
+    node.parentNode = parentNode || null;
+    data._xapNode = node;
+    this.ownNode(node);
     const f = data.fields || {};
-    const group = new THREE.Group();
-    group.name = data.def || data.type;
-    node.threeObj = group;
+    if (this.natives[data.type]) node._native = this.natives[data.type].$init ? this.natives[data.type].$init(node) : {};
+    if (data.type === 'ScreenSaver') this.screenSaver = new ScreenSaverTimer(this, node);
 
-    // Register DEF name globally
     if (data.def) {
       this.nodes[data.def] = node;
       this.scriptScope[data.def] = node.proxy;
+      if (scope) scope.defs.set(data.def, node);
     }
 
-    // --- Transform fields (any node can have these) ---
-    if (f.translation) {
-      const t = asVec3(f.translation);
-      group.position.set(t[0], t[1], t[2]);
-    }
-    if (f.rotation) {
-      const r = asVec4(f.rotation);
-      const axis = new THREE.Vector3(r[0], r[1], r[2]).normalize();
-      group.quaternion.setFromAxisAngle(axis, r[3]);
-    }
-    if (f.scale) {
-      const s = asVec3(f.scale);
-      group.scale.set(s[0], s[1], s[2]);
-    }
-    if (f.scaleOrientation) {
-      node._scaleOrientation = asVec4(f.scaleOrientation);
-    }
-    if (f.visible !== undefined) {
-      group.visible = !!f.visible;
-    }
-    if (f.fade !== undefined) {
-      node._fadeDuration = asNumber(f.fade);
-    }
-
-    // --- Geometry: if node has appearance/geometry fields, build a mesh ---
     const geomData = extractNode(f.geometry);
     const appData = extractNode(f.appearance);
     if (geomData) {
-      this.buildGeometry(node, group, geomData, appData, archiveName);
+      this.buildGeometry(node, geomData, appData, archiveName);
     }
 
-    // --- Viewpoint: store data on node, apply first one to camera ---
-    if (f.fieldOfView !== undefined) {
-      node._viewpoint = {
-        fov: asNumber(f.fieldOfView),
-        position: f.position ? asVec3(f.position) : null,
-        orientation: f.orientation ? asVec4(f.orientation) : null,
-      };
-      // Only apply the FIRST Viewpoint to the camera during scene build.
-      // Subsequent Viewpoints are stored on nodes for script-driven navigation
-      // (GoTo/GoBackTo calls applyViewpoint on the target level).
-      if (!this._viewpointSet) {
-        this._viewpointSet = true;
-        this._applyViewpoint(node._viewpoint);
-      }
-    }
-
-    // --- Background: store on node, apply only the first ---
-    // The Xbox dashboard has multiple Background nodes (4:3, 16:9 variants).
-    // Scripts switch between them. Apply only the first one initially.
-    if (f.skyColor || f.backdrop) {
-      node._background = { skyColor: f.skyColor, backdrop: extractNode(f.backdrop) };
-      if (!this._backgroundSet) {
-        this._backgroundSet = true;
-        if (f.skyColor) {
-          const c = asVec3(f.skyColor);
-          this.scene.background = new THREE.Color(c[0], c[1], c[2]);
-        }
-        const backdropData = extractNode(f.backdrop);
-        if (backdropData) {
-          const url = getField(backdropData, 'url');
-          if (url) this.scene.background = this.loadTexture(url);
-        }
-      }
-    }
-
-    // --- Screen dimensions ---
-    if (f.width !== undefined && f.height !== undefined && data.type === 'Screen') {
-      node._screenWidth = asNumber(f.width);
-      node._screenHeight = asNumber(f.height);
-    }
-
-    // --- Text: if node has font field, render text ---
-    // (All dashboard text lives inside Shape geometry with an Appearance parent,
-    // so buildGeometry handles it. This path handles any bare Text node that has
-    // appearance data on a parent.)
-    if (f.font !== undefined) {
-      const text = f.text || f.string || '';
-      const fontName = f.font || 'Body';
-      const justify = f.justify || 'left';
-      const tr = new TextRenderer(String(text), String(fontName), this.fonts, this.pipeline.createMaterial(), String(justify));
-      group.add(tr.mesh);
+    if (f.font !== undefined && !geomData) {
+      const tr = new TextRenderer(this, node, String(f.font), this.fonts, this.pipeline.createMaterial(), String(f.justify || 'left'));
       node._textRenderer = tr;
+      this.textRenderers.push(tr);
     }
 
-    // --- Audio: if node has url pointing to audio ---
     if (f.url !== undefined && typeof f.url === 'string' && f.url.match(/\.wav$/i)) {
       node._audioUrl = f.url;
       node._audioLoop = !!f.loop;
@@ -313,11 +538,9 @@ class XAPRuntime {
       node._isPlaying = false;
     }
 
-    // --- Periodic audio: play random child AudioClip on interval ---
     if (f.period !== undefined) {
       node._period = asNumber(f.period);
       node._periodNoise = asNumber(f.periodNoise || 0);
-      const rt = this;
       const scheduleNext = () => {
         const delay = (node._period + Math.random() * node._periodNoise) * 1000;
         setTimeout(() => {
@@ -331,126 +554,81 @@ class XAPRuntime {
           scheduleNext();
         }, delay);
       };
-      // Start periodic audio after a brief delay
       setTimeout(scheduleNext, node._period * 1000);
     }
 
-    // --- Waver: rotational oscillation ---
-    if (f.rpm !== undefined) {
-      node._waverRPM = asNumber(f.rpm);
-      node._waverField = asNumber(f.field || 0.5);
-      this.animations.push({
-        type: 'waver', node, group,
-        rpm: node._waverRPM, field: node._waverField,
-        elapsed: Math.random() * 100, // randomize phase
-      });
-    }
-
-    // --- Layer: starts hidden, activated by scripts ---
-    if (data.type === 'Layer') {
-      group.visible = false;
-    }
-
-    // --- Level: register as navigable level ---
-    // The Level's archive field tells which XIP the content came from.
-    // The actual content is loaded via the Level's Inline child node, not here.
     if (f.archive !== undefined) {
       node._archive = String(f.archive);
-      node._levelActive = false;
       const archiveBase = node._archive.replace(/\.xip$/i, '');
       node._sceneName = this.resolveArchive(archiveBase);
-      if (data.def) {
-        this.levels[data.def] = node;
-        // All levels start hidden — initialize() calls GoTo() on the correct one
-        group.visible = false;
-        node._levelActive = false;
-      }
     }
 
-    // --- Inline: if node has url pointing to .xap ---
+    // An inline's scene is built in place, the executable's load step finding it already there.
     if (f.url !== undefined && typeof f.url === 'string' && f.url.match(/\.xap$/i)) {
       node._inlineUrl = f.url;
       const sceneName = this.resolveInlineUrl(String(f.url));
       node._sceneName = sceneName;
-      if (sceneName && this.sceneData[sceneName]) {
-        this.buildScene(this.sceneData[sceneName], group, extractArchivePrefix(sceneName), node);
-      }
+      if (!sceneName || !this.sceneData[sceneName]) throw new Error(`inline ${f.url} names no exported scene`);
+      this.buildOwners.push(node);
+      this.buildScene(this.sceneData[sceneName], extractArchivePrefix(sceneName), node);
+      this.buildOwners.pop();
     }
 
-    // --- Joystick event handlers: extract from node scripts ---
     if (data.scripts && data.scripts.length > 0) {
       node._eventHandlers = {};
-      for (const script of data.scripts) {
-        const match = script.match(/function\s+(\w+)\s*\(/);
-        if (match) {
-          node._eventHandlers[match[1]] = script;
-        }
-      }
+      node._eventSources = data.scripts;
+      this.joysticks.push(node);
     }
 
-    // --- Build ALL node-valued fields as children (shell, path, tunnel, control, frame, etc.) ---
+    // Node valued fields such as a level's control, path and shell are built as nodes of their own.
     for (const [key, value] of Object.entries(f)) {
-      if (key === 'geometry' || key === 'appearance') continue; // handled by buildGeometry
+      if (key === 'geometry' || key === 'appearance') continue;
       const nodeData = extractNode(value);
       if (nodeData) {
-        const childNode = this.buildNode(nodeData, group, archiveName);
-        // Capture control node (Joystick) for Level input binding
-        if (key === 'control' && childNode) {
-          node._controlNode = childNode;
-        }
+        const childNode = this.buildNode(nodeData, archiveName, scope, node);
+        node._fieldNodes[key] = childNode;
+      } else if (Array.isArray(value) && value.some((v) => extractNode(v))) {
+        node._fieldLists[key] = value.map((v) => extractNode(v)).filter(Boolean).map((v) => this.buildNode(v, archiveName, scope, node));
       }
     }
 
-    // --- Sphere geometry (standalone, not inside Shape) ---
-    if (f.radius !== undefined && !geomData) {
-      const sphere = new THREE.Mesh(
-        new THREE.SphereGeometry(asNumber(f.radius), 32, 16),
-        new THREE.MeshBasicMaterial({ side: THREE.DoubleSide })
-      );
-      group.add(sphere);
-      node._mesh = sphere;
-    }
-
-    // Add to parent
-    parent.add(group);
-
-    // Build children — these are the XAP children[] array items
     if (data.children) {
       for (const childData of data.children) {
         if (childData) {
-          const childNode = this.buildNode(childData, group, archiveName);
-          if (childNode) {
-            node._xapChildren.push(childNode);
-          }
+          const childNode = this.buildNode(childData, archiveName, scope, node);
+          if (childNode) node._xapChildren.push(childNode);
         }
       }
     }
 
-    // Store node reference on Three.js object
-    group.userData.xapNode = node;
+    // The executable constructs every node as the scene file names it, so the object exists in file order
+    node.derivedObject();
     return node;
   }
 
+  // Records a node as part of the scene being built, whose loader runs its field hooks
+  ownNode(node) {
+    const owner = this.buildOwners[this.buildOwners.length - 1];
+    if (!owner) throw new Error(`node ${node.data.def || node.data.type} built outside any scene`);
+    owner._ownedNodes.push(node);
+  }
+
   // Build geometry from a node's geometry/appearance field pair
-  buildGeometry(node, group, geomData, appData, archiveName) {
+  buildGeometry(node, geomData, appData, archiveName) {
     const geomFields = geomData.fields || {};
     const geomNode = this.nodeFor(geomData, archiveName);
     if (appData) this.prepareAppearance(appData, archiveName);
     const material = this.pipeline.createMaterial();
 
-    // Mesh reference (url field pointing to .xm)
     if (geomFields.url && typeof geomFields.url === 'string' && geomFields.url.match(/\.xm$/i)) {
       this.loadMesh(geomFields.url, archiveName).then(geometry => {
-        if (!geometry) return;
+        if (!geometry) throw new Error(`mesh ${geomFields.url} is packed in no extracted archive`);
         const mesh = new THREE.Mesh(geometry, material);
         mesh.name = geomData.def || geomFields.url;
-        mesh.frustumCulled = false;
-        group.add(mesh);
+        detachFromThree(mesh);
         node._mesh = mesh;
         const entry = geometry.userData.entry;
-        this.attachBuffer(geomNode, { format: entry.format, stride: entry.stride, primitiveCount: entry.indexCount / 3 });
-        node._drawMesh = mesh;
-        node._drawGeometry = geometry.userData.desc;
+        this.attachBuffer(geomNode, { format: entry.format, stride: entry.stride, primitiveCount: entry.indexCount / 3 }, mesh, geometry.userData.desc);
         this._meshesLoaded = (this._meshesLoaded || 0) + 1;
         if (this._meshesLoaded % 100 === 0) {
           _log(`[XAP] ${this._meshesLoaded} meshes loaded`);
@@ -461,38 +639,34 @@ class XAPRuntime {
       return;
     }
 
-    // Text geometry (has font field)
     if (geomFields.font !== undefined) {
-      const text = geomFields.text || geomFields.string || '';
       const fontName = geomFields.font || 'Body';
       const justify = geomFields.justify || 'left';
-      const tr = new TextRenderer(String(text), String(fontName), this.fonts, material, String(justify));
-      group.add(tr.mesh);
+      const tr = new TextRenderer(this, geomNode, String(fontName), this.fonts, material, String(justify));
       node._textRenderer = tr;
-      node._drawMesh = tr.mesh;
-      node._drawGeometry = TEXT_GEOMETRY;
+      geomNode._textRenderer = tr;
+      this.textRenderers.push(tr);
       return;
     }
 
-    // Sphere geometry (has radius field): the executable builds it with its own buffer layout
     if (geomFields.radius !== undefined) {
       const geometry = this.sphereGeometry(asNumber(geomFields.radius), geomFields.slices, geomFields.stacks);
       const sphere = new THREE.Mesh(geometry, material);
-      sphere.frustumCulled = false;
-      group.add(sphere);
+      detachFromThree(sphere);
       node._mesh = sphere;
       const sb = this.derived.draw.sphere;
-      this.attachBuffer(geomNode, { format: sb.format, stride: sb.stride, primitiveCount: geometry.index.count / 3 });
-      node._drawMesh = sphere;
-      node._drawGeometry = geometry.userData.desc;
+      this.attachBuffer(geomNode, { format: sb.format, stride: sb.stride, primitiveCount: geometry.index.count / 3 }, sphere, geometry.userData.desc);
       return;
     }
     throw new Error(`geometry node ${geomData.type} has neither a mesh url, text nor a radius`);
   }
 
   // Gives a geometry node the loaded buffer object its draw path dereferences
-  attachBuffer(geomNode, geometry) {
-    geomNode.derivedObject().slots.set(this.derived.accessor.offset, { obj: makeBuffer(this.derived.model, geometry) });
+  attachBuffer(geomNode, geometry, mesh, desc) {
+    const buffer = makeBuffer(this.derived.model, geometry);
+    buffer.mesh = mesh;
+    buffer.desc = desc;
+    geomNode.derivedObject().slots.set(this.derived.accessor.offset, { obj: buffer });
   }
 
   // Builds a sphere in the layout the executable stores: position, packed normal and a zero diffuse
@@ -501,7 +675,8 @@ class XAPRuntime {
     const layout = this.derived.model.fixed_function.find((ff) => ff.format === sb.format);
     if (!layout) throw new Error(`sphere format 0x${sb.format.toString(16)} has no fixed function declaration`);
     const decl = this.derived.model.declarations[(layout.declaration >>> 0).toString(16).toUpperCase().padStart(8, '0')];
-    const src = new THREE.SphereGeometry(radius, slices !== undefined ? asNumber(slices) : 32, stacks !== undefined ? asNumber(stacks) : 16);
+    const d = this.derived;
+    const src = new THREE.SphereGeometry(radius, slices !== undefined ? asNumber(slices) : d.defaultField('Sphere', 'slices'), stacks !== undefined ? asNumber(stacks) : d.defaultField('Sphere', 'stacks'));
     const count = src.attributes.position.count;
     const geometry = new THREE.BufferGeometry();
     const attributes = [];
@@ -547,6 +722,8 @@ class XAPRuntime {
       this.nodes[data.def] = node;
       this.scriptScope[data.def] = node.proxy;
     }
+    if (this.buildOwners.length) this.ownNode(node);
+    else node.applyFieldHooks();
     return node;
   }
 
@@ -561,47 +738,100 @@ class XAPRuntime {
     throw new Error(`texture handle ${JSON.stringify(handle)} has no runtime texture`);
   }
 
-  // Applies the device state at an indexed draw to the shape being drawn
-  onDerivedDraw(state) {
-    const t = this.drawTarget;
-    if (!t) throw new Error('derived draw without a shape');
-    this.pipeline.update(t.node._drawMesh.material, state, t.node._drawGeometry, t.matrices);
+  // Applies the device state at a draw call to the mesh being drawn and queues it for the frame
+  onDerivedDraw(state, env, quad) {
+    if (quad) {
+      this.drawQuad(state, quad);
+      return;
+    }
+    const buffer = env.this && env.this.obj !== undefined ? env.this.obj : env.this;
+    if (!buffer || !buffer.mesh) throw new Error(`indexed draw from ${buffer ? buffer.type : 'nothing'} which holds no mesh`);
+    this.pipeline.update(buffer.mesh.material, state, buffer.desc);
+    this.frameDraws.push(buffer.mesh);
   }
 
-  onDerivedTextDraw(state) {
-    const t = this.drawTarget;
-    if (!t) throw new Error('derived text draw without a shape');
-    this.pipeline.update(t.node._textRenderer.material, state, TEXT_GEOMETRY, t.matrices, true);
+  // Draws a range of the vertex buffer the executable filled through a lock
+  drawQuad(state, quad) {
+    const stream = state.stream;
+    if (!stream || !stream.vb) throw new Error(`vertex draw from ${JSON.stringify(stream)} which is no vertex buffer`);
+    const vb = stream.vb;
+    const fvf = typeof state.program === 'number' ? state.program : vb.fvf;
+    const desc = describeFVF(fvf);
+    if (desc.stride !== state.streamStride) throw new Error(`vertex format 0x${fvf.toString(16)} is ${desc.stride} bytes but the stream stride is ${state.streamStride}`);
+    const key = vb;
+    let entry = this.quadMeshes.get(key);
+    const indices = primitiveIndices(quad.primitive, quad.start, quad.count);
+    if (!entry || entry.version !== vb.version || entry.fvf !== fvf || entry.indices !== indices.join(',')) {
+      const count = vb.bytes.length / desc.stride;
+      const geometry = new THREE.BufferGeometry();
+      const view = vb.view;
+      for (const a of desc.attributes) {
+        const data = new Float32Array(count * a.comps);
+        for (let v = 0; v < count; v++) {
+          const base = v * desc.stride + a.offset;
+          if (a.source === 'color') {
+            const c = view.getUint32(base, true);
+            data[v * 4] = ((c >>> 16) & 255) / 255; data[v * 4 + 1] = ((c >>> 8) & 255) / 255; data[v * 4 + 2] = (c & 255) / 255; data[v * 4 + 3] = (c >>> 24) / 255;
+          } else {
+            for (let k = 0; k < a.comps; k++) data[v * a.comps + k] = view.getFloat32(base + 4 * k, true);
+          }
+        }
+        geometry.setAttribute('a_' + a.offset, new THREE.BufferAttribute(data, a.comps));
+      }
+      geometry.setIndex(indices);
+      const mesh = new THREE.Mesh(geometry, entry ? entry.mesh.material : this.pipeline.createMaterial());
+      detachFromThree(mesh);
+      if (entry) entry.mesh.geometry.dispose();
+      entry = { mesh, version: vb.version, fvf, indices: indices.join(',') };
+      this.quadMeshes.set(key, entry);
+    }
+    this.pipeline.update(entry.mesh.material, state, desc);
+    this.frameDraws.push(entry.mesh);
   }
 
-  // Runs the executable's draw paths over the scene in draw order, updating every mesh material
-  updateDerivedDraws() {
-    const d = this.derived;
-    d.clock = this.clock.elapsedTime;
-    this.scene.updateMatrixWorld(true);
-    this.camera.updateMatrixWorld();
-    const view = new Float32Array(this.camera.matrixWorldInverse.elements);
-    const projection = new Float32Array(this.camera.projectionMatrix.elements);
-    const alphaField = Object.entries(d.types.Transform.fields).find(([, f]) => f.name === 'alpha');
-    if (!alphaField) throw new Error('Transform has no alpha field in the executable');
-    const alphaOff = Number(alphaField[0]);
-    const visit = (obj, alpha) => {
-      if (!obj.visible) return;
-      const node = obj.userData.xapNode;
-      if (node && node.data.type === 'Transform') {
-        alpha *= floatFromBits(d.readField(node.derivedObject(), alphaOff, 4));
-      }
-      if (node && node.data.type === 'Shape' && node._drawMesh) {
-        const matrices = { world: new Float32Array(obj.matrixWorld.elements), view, projection };
-        d.hierarchyAlpha = alpha;
-        d.nodeSetup(this.device, matrices);
-        this.drawTarget = { node, matrices };
-        d.drawShape(node.derivedObject(), this.device, matrices);
-        this.drawTarget = null;
-      }
-      for (const child of obj.children) visit(child, alpha);
-    };
-    visit(this.rootGroup, 1);
+  // The glyph draw happens between the render states the executable's text draw routine sets
+  onDerivedTextDraw(obj, state) {
+    const tr = obj.node._textRenderer;
+    if (!tr) throw new Error(`text draw on ${obj.node.data.def || obj.node.data.type} which renders no text`);
+    const td = this.derived.draw.text_draw;
+    for (const [index, value] of td.before) this.derived.setRenderState(state, index, value);
+    tr.update();
+    if (tr.layoutMesh) {
+      const snapshot = cloneState(state);
+      snapshot.transforms[TS_WORLD] = matMul(Float32Array.from(tr.layoutMesh.matrix.elements), state.transforms[TS_WORLD]);
+      this.pipeline.update(tr.material, snapshot, TEXT_GEOMETRY, true);
+      this.frameDraws.push(tr.layoutMesh);
+    }
+    for (const [index, value] of td.after) this.derived.setRenderState(state, index, value);
+  }
+
+  // Shows the frame the executable just drew, fitted to the display shape the console would show it in
+  presentFrame(state) {
+    this.drawRoot.children = this.frameDraws;
+    this.lastDraws = this.frameDraws.map((m) => m.name || m.type);
+    this.frameDraws = [];
+    const clear = this.frameClear;
+    const canvas = this.renderer.domElement;
+    const width = this.derived.memory.load(this.presentParamsAddress() + PRESENT_WIDTH, 4);
+    const height = this.derived.memory.load(this.presentParamsAddress() + PRESENT_HEIGHT, 4);
+    const aspect = (this.console.videoFlags() & VIDEO_FLAG_WIDESCREEN) ? DISPLAY_ASPECT_WIDE : DISPLAY_ASPECT_NORMAL;
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    let vw = cw, vh = cw / aspect;
+    if (vh > ch) { vh = ch; vw = ch * aspect; }
+    const vx = (cw - vw) / 2, vy = (ch - vh) / 2;
+    this.renderer.setScissorTest(false);
+    this.renderer.setClearColor(0x000000, 1);
+    this.renderer.clear(true, true, true);
+    this.renderer.setViewport(vx, vy, vw, vh);
+    this.renderer.setScissor(vx, vy, vw, vh);
+    this.renderer.setScissorTest(true);
+    if (clear && (clear.flags & CLEAR_TARGET)) {
+      this.renderer.setClearColor(clear.color & 0xFFFFFF, (clear.color >>> 24) / 255);
+      this.renderer.clear(true, true, true);
+    }
+    this.renderer.render(this.scene, this.camera);
+    this.frameClear = null;
+    this.frameSize = { width, height };
   }
 
   loadTexture(url) {
@@ -618,7 +848,7 @@ class XAPRuntime {
       `${DATA_BASE}/textures/${base}.png`,
       undefined,
       undefined,
-      () => { _warn(`[XAP] Texture not found: ${base}.png`); }
+      () => { _error(`[XAP] Texture not found: ${base}.png`); }
     );
     // The device sampled texels as stored, with the first image row at v = 0.
     tex.colorSpace = THREE.NoColorSpace;
@@ -671,12 +901,9 @@ class XAPRuntime {
 
   resolveArchive(archiveBase) {
     if (!this.config) return null;
-    // Try exact match
     if (this.config.archives[archiveBase]) return this.config.archives[archiveBase];
-    // Try lowercase
     const lower = archiveBase.toLowerCase();
     if (this.config.archives[lower]) return this.config.archives[lower];
-    // Try all keys case-insensitive
     for (const [key, val] of Object.entries(this.config.archives)) {
       if (key.toLowerCase() === lower) return val;
     }
@@ -686,7 +913,6 @@ class XAPRuntime {
   resolveInline(url) {
     if (!this.config) return null;
     if (this.config.inlines[url]) return this.config.inlines[url];
-    // Try case-insensitive
     const lower = url.toLowerCase();
     for (const [key, val] of Object.entries(this.config.inlines)) {
       if (key.toLowerCase() === lower) return val;
@@ -696,11 +922,9 @@ class XAPRuntime {
 
   // Resolve Inline URL — handles both "scene.xap" and "ArchiveName/default.xap" patterns
   resolveInlineUrl(url) {
-    // Try direct inline mapping first
     const inline = this.resolveInline(url);
     if (inline) return inline;
 
-    // Handle "ArchiveName/default.xap" → resolve via archive mapping
     const parts = url.replace(/\\/g, '/').split('/');
     if (parts.length >= 2 && parts[parts.length - 1].toLowerCase() === 'default.xap') {
       const archiveName = parts[parts.length - 2];
@@ -708,11 +932,9 @@ class XAPRuntime {
       if (archive) return archive;
     }
 
-    // Handle "ArchiveName/scene.xap" → try archive prefix + scene name
     if (parts.length >= 2) {
       const archiveName = parts[0];
       const sceneName = parts[parts.length - 1].replace(/\.xap$/i, '');
-      // Try "archivename_scenename" pattern
       const candidate = archiveName.toLowerCase() + '_' + sceneName.toLowerCase();
       for (const name of (this.config.scenes || [])) {
         if (name.toLowerCase() === candidate) return name;
@@ -728,169 +950,142 @@ class XAPRuntime {
   // ========================================================================
 
   executeScripts() {
-    // Expose all DEF'd node proxies as window globals, keeping the browser console reachable
     for (const [name, node] of Object.entries(this.nodes)) {
       if (name === 'console') continue;
       window[name] = node.proxy;
     }
 
-    // Inject system API stubs on typed nodes
-    this._injectSystemMethods();
-
-    // Provide stub globals for system APIs that don't exist in browser
     window.log = (...args) => _log('[XAP script]', ...args);
-    window.EnableInput = (b) => { _log('[XAP] EnableInput:', b); };
-    window.BlockMemoryUnitInsert = () => {};
-    window.UnblockMemoryUnitInsert = () => {};
-    window.BlockMemoryUnitEnumeration = () => {};
-    window.UnblockMemoryUnitEnumeration = () => {};
-    window.BlockUser = (msg) => { _log('[XAP] BlockUser:', msg); };
-    window.TellUser = (msg, fn) => { _log('[XAP] TellUser:', msg); };
-    window.AskUser = (msg, yesFn, noFn) => { _log('[XAP] AskUser:', msg); };
+    window.EnableInput = (b) => { this.inputEnabled = !!b; _log('[XAP] EnableInput:', b); };
 
-    // Keep console accessible — do NOT lock it down, we need logs for debugging.
-
-    // Bind the first Joystick with event handlers so input works
-    for (const node of Object.values(this.nodes)) {
-      if (node._eventHandlers && Object.keys(node._eventHandlers).length > 0) {
-        node._isBound = true;
-        _log(`[XAP] Auto-bound joystick: ${node.data.def || node.data.type}`);
-        break;
-      }
+    const byScope = new Map();
+    for (const { scope, script } of this.pendingScripts) {
+      if (!byScope.has(scope)) byScope.set(scope, []);
+      byScope.get(scope).push(script);
     }
-
-    let ok = 0, fail = 0, skipped = 0;
-    for (const script of this.pendingScripts) {
-      const trimmed = script.trimStart();
-
-      // Convert behavior blocks: replace sleep N; with async await
-      if (trimmed.startsWith('behavior')) {
-        const bodyStart = trimmed.indexOf('{');
-        const bodyEnd = trimmed.lastIndexOf('}');
-        if (bodyStart >= 0 && bodyEnd > bodyStart) {
-          let body = trimmed.substring(bodyStart + 1, bodyEnd);
-          body = body.replace(/sleep\s+([\d.]+)\s*;/g,
-            'await new Promise(r => setTimeout(r, $1 * 1000));');
-          try {
-            (0, eval)(`(async () => { ${body} })()`);
-            ok++;
-          } catch (e) {
-            fail++;
-            _warn('Behavior error:', e.message);
-          }
-        } else {
-          skipped++;
-        }
-        continue;
-      }
-
-      try {
-        (0, eval)(script);
-        ok++;
-      } catch (e) {
-        fail++;
-        _warn('Script error:', e.message, '\n', script.substring(0, 200));
-      }
+    for (const scope of this.scopes) scope.declare(byScope.get(scope) || []);
+    let ok = 0;
+    for (const scope of this.scopes) {
+      scope.evaluate(byScope.get(scope) || []);
+      ok += (byScope.get(scope) || []).length;
     }
-    _log(`[XAP] Scripts: ${ok} ok, ${fail} failed, ${skipped} skipped (of ${this.pendingScripts.length})`);
+    for (const node of this.joysticks) this.compileHandlers(node);
+    _log(`[XAP] Scripts: ${ok} evaluated in ${this.scopes.length} scene scopes`);
     if (window.console !== nativeConsole) {
       window.console = nativeConsole;
       _warn('[XAP] scripts replaced the console, restored it');
     }
   }
 
-  // Inject system API methods on nodes based on their type
-  _injectSystemMethods() {
-    const systemMethods = {
-      'Config': {
-        GetLanguage: () => 1,
-        SetLanguage: (n) => { _log('[XAP] Config.SetLanguage:', n); },
-        GetVideoMode: () => 0,
-        GetAudioMode: () => 0,
-        SetVideoMode: (n) => {},
-        SetAudioMode: (n) => {},
-        GetLaunchReason: () => '',
-        GetLaunchParameter1: () => 0,
-        GetGameRegion: () => 1,
-        ForceSetLanguage: () => false,
-        ForceSetTimeZone: () => false,
-        ForceSetClock: () => false,
-        CanDriveBeCleanup: (n) => false,
-        BackToLauncher: () => { _log('[XAP] Config.BackToLauncher'); },
-        BackToLauncher2: () => { _log('[XAP] Config.BackToLauncher2'); },
-        SetMusicVolume: (n) => {},
-        GetMusicVolume: () => 100,
-        GetTimeZone: () => 0,
-        SetTimeZone: (n) => {},
-        GetDaylightSavings: () => false,
-        SetDaylightSavings: (b) => {},
-        Get24Hour: () => false,
-        Set24Hour: (b) => {},
-        GetDolbyDigital: () => false,
-        SetDolbyDigital: (b) => {},
-        GetDTS: () => false,
-        SetDTS: (b) => {},
-        GetPAL60: () => false,
-        SetPAL60: (b) => {},
-        Get480p: () => false,
-        Set480p: (b) => {},
-        Get720p: () => false,
-        Set720p: (b) => {},
-        Get1080i: () => false,
-        Set1080i: (b) => {},
-        GetWidescreen: () => false,
-        SetWidescreen: (b) => {},
-        GetLetterbox: () => false,
-        SetLetterbox: (b) => {},
-        GetMoviePCFlags: () => 0,
-        SetMoviePCFlags: (n) => {},
-        GetMovieRating: () => 0,
-        SetMovieRating: (n) => {},
-        GetMachineAccount: () => '',
-        SetMachineAccount: (s) => {},
-      },
-      'Translator': {
-        SetLanguage: (n) => {},
-        Translate: (key) => String(key),
-        GetDateSeparator: () => '/',
-        FormatNumber: (n) => String(n),
-        FormatDate: (y, m, d) => `${m}/${d}/${y}`,
-        FormatTime: (h, m) => `${h}:${String(m).padStart(2, '0')}`,
-      },
-      'DiscDrive': {
-        LaunchDisc: () => { _log('[XAP] DiscDrive.LaunchDisc'); },
-      },
-      'MemoryMonitor': {
-        HaveDeviceTop: (n) => 0,
-        HaveDeviceBottom: (n) => 0,
-        FormatDeviceName: (n) => '',
-        GetDeviceSize: (n) => 0,
-        GetDeviceFreeSize: (n) => 0,
-      },
-      'Recovery': {
-        GetRecoveryKey: () => '',
-      },
-    };
-
-    // System node properties (readable/writable)
-    const systemProperties = {
-      'DiscDrive': { discType: 'none', locked: false },
-      'MemoryMonitor': { blockInsertion: false, enumerationOn: false },
-    };
-
-    for (const node of Object.values(this.nodes)) {
-      const type = node.data.type;
-      if (systemMethods[type]) {
-        node._systemMethods = systemMethods[type];
+  // Compiles a node's handler functions and behaviors inside its fields and scene scope
+  compileHandlers(node) {
+    const fieldProxy = new Proxy({}, {
+      has: (t, k) => typeof k === 'string' && (k === 'children' || (node.data.fields && Object.prototype.hasOwnProperty.call(node.data.fields, k))),
+      get: (t, k) => node.proxy[k],
+      set: (t, k, v) => { node.proxy[k] = v; return true; },
+    });
+    for (const raw of node._eventSources) {
+      const src = rewriteScript(raw);
+      const trimmed = src.trimStart();
+      if (trimmed.startsWith('behavior')) {
+        const bodyStart = trimmed.indexOf('{'), bodyEnd = trimmed.lastIndexOf('}');
+        if (bodyStart < 0 || bodyEnd <= bodyStart) throw new Error(`behavior on ${node.data.def || node.data.type} has no body`);
+        const body = trimmed.substring(bodyStart + 1, bodyEnd).replace(/\bsleep\s+([\d.]+)\s*;/g, 'await __sleep($1);');
+        const loop = new Function('__scope', '__node', '__sleep', '__runtime', `with (__scope) { with (__node) { return (async function () { while (__runtime.running) { ${body}\n await __sleep(0); } }); } }`);
+        const fn = loop(node.scope.handlerProxy, fieldProxy, (sec) => new Promise((r) => setTimeout(r, sec * 1000)), this);
+        fn().catch((e) => _warn(`[XAP] behavior error on ${node.data.def || node.data.type}:`, e.message));
+        continue;
       }
-      if (systemProperties[type]) {
-        for (const [k, v] of Object.entries(systemProperties[type])) {
-          if (node._fields[k] === undefined) {
-            node._fields[k] = v;
-          }
-        }
+      const match = trimmed.match(/^function\s+(\w+)\s*\(/);
+      if (!match) throw new Error(`script on ${node.data.def || node.data.type} is neither a handler nor a behavior: ${trimmed.slice(0, 40)}`);
+      const make = new Function('__scope', '__node', `with (__scope) { with (__node) { return (${trimmed}); } }`);
+      node._eventHandlers[match[1]] = make(node.scope.handlerProxy, fieldProxy);
+    }
+  }
+
+  // Calls a node's handler, searching the parents when the node has none
+  fireEvent(node, name, ...args) {
+    for (let n = node; n; n = n.parentNode) {
+      const handler = n._eventHandlers && n._eventHandlers[name];
+      if (!handler) continue;
+      try {
+        return handler(...args);
+      } catch (e) {
+        _warn(`[XAP] ${name} on ${n.data.def || n.data.type}:`, e.message);
+        return undefined;
       }
     }
+    return undefined;
+  }
+
+  // Natives the runtime implements through its audio machinery and the executable's own native routines
+  runtimeNativeClasses() {
+    const unimplemented = (cls, names) => Object.fromEntries(names.map((n) => [n, () => { throw new Error(`${cls}.${n} is registered by the executable but the runtime does not implement it`); }]));
+    const derivedNative = (va) => (node, ...args) => this.runNative(va, node, args);
+    const classes = {
+      AudioClip: {
+        Play: (node) => node._play(),
+        Stop: (node) => node._stop(),
+        Pause: (node) => node._pause(),
+        PlayOrPause: (node) => (node._transportMode === 0 ? node._play() : node._pause()),
+        getMinutes: (node) => Math.floor(node._playbackSeconds() / 60),
+        getSeconds: (node) => Math.floor(node._playbackSeconds()) % 60,
+      },
+      Keyboard: unimplemented('Keyboard', this.derived.model.system.methods.Keyboard),
+      DVDPlayer: unimplemented('DVDPlayer', this.derived.model.system.methods.DVDPlayer),
+    };
+    for (const [cls, fns] of Object.entries(this.derived.scene.natives)) {
+      classes[cls] = classes[cls] || {};
+      for (const [name, va] of Object.entries(fns)) classes[cls][name] = derivedNative(va);
+    }
+    return classes;
+  }
+
+  // Runs one of the executable's script natives on a node with float arguments
+  runNative(va, node, args) {
+    const d = this.derived;
+    const parent = d.newEnv(null);
+    parent.state = this.device;
+    const bits = args.map((a) => bitsFromFloat(Number(a)));
+    return d.run(va, node.derivedObject(), bits, this.device, parent);
+  }
+
+  // Every method a class registers must be implemented, Date's own members counting as implemented
+  checkNatives(methods) {
+    const missing = [];
+    for (const [cls, names] of Object.entries(methods)) {
+      for (const name of names) {
+        const impl = this.natives[cls] && this.natives[cls][name];
+        if (impl) continue;
+        if (cls === 'Date' && typeof Date.prototype[name] === 'function') continue;
+        missing.push(`${cls}.${name}`);
+      }
+    }
+    if (missing.length) throw new Error(`natives registered by the executable without a runtime implementation: ${missing.join(', ')}`);
+  }
+
+  // The joystick bound last receives input, unbinding returns it to the one bound before
+  bindJoystick(node, bound) {
+    this.boundJoysticks = this.boundJoysticks.filter((n) => n !== node);
+    if (bound) this.boundJoysticks.push(node);
+    node._isBound = bound;
+  }
+
+  // Replaces a mesh node's geometry from its url field
+  reloadMesh(node) {
+    const shape = node.parentNode;
+    if (!shape || !shape._mesh) throw new Error(`mesh ${node.data.def || node.data.type} is not drawn by a shape`);
+    this.loadMesh(String(node.proxy.url), node.archiveName).then((geometry) => {
+      if (!geometry) throw new Error(`mesh ${node.proxy.url} is packed in no extracted archive`);
+      shape._mesh.geometry = geometry;
+      const entry = geometry.userData.entry;
+      this.attachBuffer(node, { format: entry.format, stride: entry.stride, primitiveCount: entry.indexCount / 3 }, shape._mesh, geometry.userData.desc);
+    });
+  }
+
+  // The texture handle a dynamic texture node hands the appearance draw
+  dynamicTextureHandle(obj) {
+    throw new Error(`dynamic texture ${obj.node.data.def || 'DynamicTexture'} is not rendered by the runtime`);
   }
 
   // ========================================================================
@@ -934,23 +1129,33 @@ class XAPRuntime {
     }
   }
 
+  // The joystick that receives input: the one a script bound last, else the active level's control
+  activeJoystick() {
+    if (this.boundJoysticks.length) return this.boundJoysticks[this.boundJoysticks.length - 1];
+    const d = this.derived;
+    const control = d.memory.load(this.controlGlobal(), 4);
+    if (control && control.obj !== undefined) return control.obj.node;
+    return null;
+  }
+
+  // The global the executable binds the arriving level's control into
+  controlGlobal() {
+    const va = this.derived.scene.control_global;
+    if (!va) throw new Error('the executable binds no level control global');
+    return va;
+  }
+
   dispatchJoystickEvent(eventName) {
-    // Find all bound joystick nodes and call their event handler
-    for (const node of Object.values(this.nodes)) {
-      if (node._eventHandlers && node._isBound) {
-        const handler = node._eventHandlers[eventName];
-        if (handler) {
-          try {
-            (0, eval)(handler);
-            // The handler defines a function — now call it
-            if (typeof window[eventName] === 'function') {
-              window[eventName]();
-            }
-          } catch (e) {
-            _warn(`Joystick ${eventName}:`, e.message);
-          }
-        }
-      }
+    if (this.screenSaver) this.screenSaver.activity();
+    if (!this.inputEnabled) return;
+    const node = this.activeJoystick();
+    if (!node || !node._eventHandlers) return;
+    const handler = node._eventHandlers[eventName];
+    if (!handler) return;
+    try {
+      handler();
+    } catch (e) {
+      _warn(`Joystick ${eventName}:`, e.message);
     }
   }
 
@@ -962,7 +1167,6 @@ class XAPRuntime {
       const id = gp.index;
       const prev = this.prevButtons[id] || [];
 
-      // Button mapping (Xbox layout)
       const buttonMap = [
         'OnADown', 'OnBDown', 'OnXDown', 'OnYDown',
         'OnLeftDown', 'OnRightDown', null, null,
@@ -978,7 +1182,6 @@ class XAPRuntime {
         }
       }
 
-      // D-pad from axes
       const deadzone = 0.5;
       if (gp.axes.length >= 2) {
         const ax = gp.axes[0], ay = gp.axes[1];
@@ -993,65 +1196,48 @@ class XAPRuntime {
   }
 
   // ========================================================================
-  // Animation System
-  // ========================================================================
-
-  updateAnimations(dt) {
-    for (let i = this.animations.length - 1; i >= 0; i--) {
-      const anim = this.animations[i];
-      anim.elapsed += dt;
-
-      // Waver: continuous sinusoidal Y-axis oscillation
-      if (anim.type === 'waver') {
-        const angle = Math.sin(anim.elapsed * anim.rpm * 2 * Math.PI / 60) * anim.field;
-        anim.group.rotation.y = angle;
-        continue; // wavers never finish
-      }
-
-      // Standard property interpolation
-      const t = Math.min(anim.elapsed / anim.duration, 1);
-      if (typeof anim.from === 'number') {
-        anim.target[anim.prop] = anim.from + (anim.to - anim.from) * t;
-      }
-
-      if (t >= 1) {
-        this.animations.splice(i, 1);
-      }
-    }
-  }
-
-  // ========================================================================
-  // Render loop
+  // Render loop: the executable's tick then its frame routine
   // ========================================================================
 
   animate() {
+    if (!this.running) return;
     requestAnimationFrame(() => this.animate());
     const dt = this.clock.getDelta();
-
-    this.updateAnimations(dt);
     this.pollGamepad();
-    this.updateDerivedDraws();
+    this.updateAudio();
+    if (this.screenSaver) this.screenSaver.tick(dt);
+    for (const tr of this.textRenderers) tr.tick(dt);
+    try {
+      this.frameDraws = [];
+      this.runRenderer(this.derived.scene.tick);
+      this.runRenderer(this.derived.scene.frame);
+    } catch (err) {
+      this.running = false;
+      _error('Frame failed:', err);
+      document.getElementById('loading').textContent = 'Error: ' + err.message;
+      document.getElementById('loading').classList.remove('hidden');
+      throw err;
+    }
+  }
 
-    this.renderer.render(this.scene, this.camera);
+  // Playback progress feeds the clip handlers the way the engine's voice callbacks do
+  updateAudio() {
+    for (const node of this.playingClips) {
+      if (node._transportMode !== 1 || !node._source) continue;
+      const seconds = node._playbackSeconds();
+      const duration = node._source.buffer ? node._source.buffer.duration : 0;
+      if (duration > 0 && node._fields.sendProgress) {
+        const progress = Math.min(seconds / duration, 1);
+        if (progress !== node._fields.progress) {
+          node._fields.progress = progress;
+          this.fireEvent(node, 'OnProgressChanged');
+        }
+      }
+    }
   }
 
   onResize() {
-    this.camera.aspect = window.innerWidth / window.innerHeight;
-    this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-  }
-
-  _applyViewpoint(vp) {
-    this.camera.fov = THREE.MathUtils.radToDeg(vp.fov);
-    this.camera.updateProjectionMatrix();
-    if (vp.position) {
-      this.camera.position.set(vp.position[0], vp.position[1], vp.position[2]);
-    }
-    if (vp.orientation) {
-      const axis = new THREE.Vector3(vp.orientation[0], vp.orientation[1], vp.orientation[2]).normalize();
-      this.camera.quaternion.setFromAxisAngle(axis, vp.orientation[3]);
-    }
-    _log(`[XAP] Camera: fov=${vp.fov.toFixed(2)} pos=[${vp.position}]`);
   }
 }
 
@@ -1064,10 +1250,8 @@ class XAPNode {
     this.data = data;
     this.runtime = runtime;
     this.archiveName = archiveName;
-    this.threeObj = null;
     this._mesh = null;
     this._textRenderer = null;
-    this._fadeDuration = 0; // transition duration in seconds, NOT opacity
     this._isBound = false;
     this._eventHandlers = null;
     this._audioUrl = '';
@@ -1077,71 +1261,64 @@ class XAPNode {
     this._archive = '';
     this._sceneName = '';
     this._fields = {};
-    this._systemMethods = null;
-    this._onLoadFired = false;
     this._xapChildren = []; // ordered list of XAPNodes from children[] and buildScene
-    this._drawMesh = null;
-    this._drawGeometry = null;
+    this._fieldNodes = {}; // node valued fields such as a level's control, path and shell
+    this._fieldLists = {}; // multi node fields such as a switch's choices
+    this._ownedNodes = []; // nodes of the scene this inline or root loads
+    this._populated = false;
     this._derivedObject = null;
+    this._inlineScope = null;
+    this.scope = null;
+    this.parentNode = null;
+    this._native = null;
+    this._eventSources = null;
+    this._transportMode = 0;
+    this._startedAt = 0;
+    this._pausedAt = 0;
 
-    // Store original field values
     if (data.fields) {
       for (const [key, value] of Object.entries(data.fields)) {
         this._fields[key] = value;
       }
     }
 
-    // Create Proxy for script compatibility
     this.proxy = new Proxy(this, {
       get: (target, prop) => {
         if (typeof prop === 'symbol') return target[prop];
         const s = String(prop);
 
-        // Core properties
+        if (s === '__xapNode') return target;
         if (s === 'children') return target._getChildProxies();
-        if (s === 'visible') return target.threeObj ? target.threeObj.visible : true;
+        if (s === 'transportMode') return target._transportMode;
         if (s === 'text') return target._textRenderer ? target._textRenderer.text : (target._fields.text || '');
         if (s === 'string') return target._fields.string || '';
-        if (s === 'isBound') return target._isBound;
+        if (s === 'isBound' && target.data.type === 'Joystick') return target._isBound;
         if (s === 'volume') return target._audioVolume;
-        if (s === 'isActive') return target._isPlaying;
-        if (s === 'moving') return false; // animation state
-        if (s === 'fade') return target._fadeDuration;
+        if (s === 'isActive' && target._audioUrl !== undefined && target.data.type === 'AudioClip') return target._isPlaying;
 
-        // Methods
-        if (s === 'SetAlpha') return (v) => target._setAlpha(v);
-        if (s === 'SetTranslation') return (x, y, z) => target._setTranslation(x, y, z);
-        if (s === 'SetRotation') return (ax, ay, az, angle) => target._setRotation(ax, ay, az, angle);
-        if (s === 'SetScale') return (x, y, z) => target._setScale(x, y, z);
+        const cls = target.runtime.natives[target.data.type];
+        if (cls) {
+          if (cls.$props && cls.$props[s]) return cls.$props[s].get(target);
+          if (typeof cls[s] === 'function' && !s.startsWith('$')) return (...args) => cls[s](target, ...args);
+        }
         if (s === 'Play') return () => target._play();
         if (s === 'Stop') return () => target._stop();
         if (s === 'SetVolume') return (v) => target._setVolume(v);
-        if (s === 'GoTo') return () => target._goTo();
-        if (s === 'GoBackTo') return () => target._goBackTo();
         if (s === 'length') return target._getChildProxies().length;
 
-        // Appearance / material chain
         if (s === 'appearance') return target._getAppearanceProxy();
         if (s === 'material') return target._getMaterialProxy();
         if (s === 'texture') return target._getTextureProxy();
         if (s === 'geometry') return target._getGeometryProxy();
 
-        // System API methods (Config, Translator, DiscDrive, etc.)
-        if (target._systemMethods && target._systemMethods[s]) {
-          return target._systemMethods[s];
-        }
-
-        // Field access
         if (target._fields[s] !== undefined) return target._fields[s];
+        const field = RUNTIME_FIELD_CLASSES.has(target.data.type) ? null : target.runtime.derived.fieldByName(target.data.type, s);
+        if (field) return target.readDerivedField(field);
 
-        // DEF'd child lookup
         const child = target._findChildByDef(s);
         if (child) return child.proxy;
 
-        // Method on runtime scope
-        if (typeof target.runtime.scriptScope[s] === 'function') {
-          return target.runtime.scriptScope[s];
-        }
+        if (target.scope && target.scope.has(s)) return target.scope.get(s);
 
         return undefined;
       },
@@ -1149,39 +1326,32 @@ class XAPNode {
       set: (target, prop, value) => {
         const s = String(prop);
 
-        if (s === 'visible') {
-          if (target.threeObj) target.threeObj.visible = !!value;
-          // Fire onLoad callback for Inline nodes when first made visible
-          if (!!value && !target._onLoadFired && target._eventHandlers) {
-            const handler = target._eventHandlers['onLoad'];
-            if (handler) {
-              target._onLoadFired = true;
-              setTimeout(() => {
-                try {
-                  (0, eval)(handler);
-                  if (typeof window.onLoad === 'function') {
-                    window.onLoad();
-                    delete window.onLoad; // prevent cross-contamination
-                  }
-                } catch (e) {
-                  _warn(`[XAP] onLoad error for ${target.data.def}:`, e.message);
-                }
-              }, 0);
-            }
-          }
+        const cls = target.runtime.natives[target.data.type];
+        if (cls && cls.$props && cls.$props[s]) {
+          cls.$props[s].set(target, value);
+          return true;
+        }
+        if (s === 'brightness' && target.data.type === 'Screen') {
+          target._writeField(s, Number(value));
+          target.runtime.renderer.domElement.style.filter = `brightness(${Number(value)})`;
+          return true;
+        }
+        if (s === 'url' && target.data.type === 'AudioClip') {
+          target._audioUrl = String(value);
+          target._fields.url = value;
           return true;
         }
         if (s === 'text') {
-          if (target._textRenderer) target._textRenderer.setText(String(value));
           target._fields.text = value;
+          if (target._textRenderer) target._textRenderer.setText(String(value));
           return true;
         }
         if (s === 'string') {
           target._fields.string = value;
           return true;
         }
-        if (s === 'isBound') {
-          target._isBound = !!value;
+        if (s === 'isBound' && target.data.type === 'Joystick') {
+          target.runtime.bindJoystick(target, !!value);
           return true;
         }
         if (s === 'volume') {
@@ -1191,74 +1361,63 @@ class XAPNode {
           }
           return true;
         }
-        if (s === 'fade') {
-          target._fadeDuration = Number(value);
-          return true;
-        }
-        if (s === 'name') {
-          // The derived material lookup reads the field on the next draw.
-          target._fields.name = String(value);
-          return true;
-        }
-        if (s === 'param') {
-          // Material animation parameter
-          target._fields.param = Number(value);
-          return true;
-        }
-        if (s === 'transparency') {
-          target._fields.transparency = Number(value);
+
+        if (target.runtime.derived.fieldByName(target.data.type, s)) {
+          target._writeField(s, value);
           return true;
         }
 
-        // Generic field storage
-        target._fields[s] = value;
+        if (target.scope && target.scope.has(s)) {
+          target.scope.set(s, value);
+          return true;
+        }
+
+        target._writeField(s, value);
         return true;
       }
     });
   }
 
   _getChildProxies() {
-    // Return only XAP children (from children[] array and buildScene),
-    // NOT field-child nodes (control, shell, path, etc.)
-    const proxies = this._xapChildren.map(n => n.proxy);
-    // XAP scripts use children.length() as a function call
-    return new Proxy(proxies, {
-      get(t, p) {
-        if (p === 'length') {
-          const len = t.length;
-          const fn = () => len;
-          fn.valueOf = () => len;
-          fn[Symbol.toPrimitive] = () => len;
-          return fn;
-        }
-        return t[p];
-      }
-    });
+    return this._xapChildren.map(n => n.proxy);
+  }
+
+  // The nodes a multi node field holds
+  fieldNodeList(name) {
+    if (name === 'children') return this._xapChildren;
+    if (this._fieldLists[name]) return this._fieldLists[name];
+    if (this._fieldNodes[name]) return [this._fieldNodes[name]];
+    return [];
   }
 
   _findChildByDef(name) {
-    // Search XAP children and all descendants
     const searchNode = (xapNode) => {
       if (xapNode.data.def === name) return xapNode;
       for (const child of xapNode._xapChildren) {
         const found = searchNode(child);
         if (found) return found;
       }
+      for (const child of Object.values(xapNode._fieldNodes)) {
+        const found = searchNode(child);
+        if (found) return found;
+      }
       return null;
     };
 
-    for (const child of this._xapChildren) {
+    for (const child of [...this._xapChildren, ...Object.values(this._fieldNodes)]) {
       const found = searchNode(child);
       if (found) return found;
     }
 
-    // Also check global DEF registry as fallback
+    if (this.scope) {
+      const scoped = this.scope.lookupDef(name);
+      if (scoped) return scoped;
+    }
     if (this.runtime.nodes[name]) return this.runtime.nodes[name];
 
     return null;
   }
 
-  // Scripts reach the appearance, material and texture nodes a shape draws through
   _fieldNodeProxy(name) {
     const data = extractNode(this._fields[name]);
     return data ? this.runtime.nodeFor(data, this.archiveName).proxy : undefined;
@@ -1269,9 +1428,72 @@ class XAPNode {
   _getTextureProxy() { return this._fieldNodeProxy('texture'); }
   _getGeometryProxy() { return this._fieldNodeProxy('geometry'); }
 
-  // The transform's alpha field scales the hierarchy alpha the materials read
-  _setAlpha(value) {
-    this._fields.alpha = Number(value);
+  // A field value the executable's object holds: a scene value, a hook written slot or the constructor default
+  readDerivedField(field) {
+    const d = this.runtime.derived;
+    const obj = this.derivedObject();
+    const v = d.readField(obj, field.off, field.type === FIELD_BOOL ? 1 : 4);
+    switch (field.type) {
+      case FIELD_BOOL: return !!(d.int(v) & 0xFF);
+      case FIELD_INT: return d.int(v) | 0;
+      case FIELD_NUMBER: return typeof v === 'number' ? floatFromBits(v) : d.scalar(v);
+      case FIELD_STRING: return v && v.str !== undefined ? v.str : '';
+      case FIELD_NODE: return v && v.obj !== undefined && v.obj.node ? v.obj.node.proxy : undefined;
+    }
+    return v;
+  }
+
+  // Hands every scene file field to the class hook, which derives the state the field implies
+  applyFieldHooks() {
+    const d = this.runtime.derived;
+    if (!this.data.fields || !d.types[this.data.type] || RUNTIME_FIELD_CLASSES.has(this.data.type)) return;
+    const obj = this.derivedObject();
+    for (const [name, value] of Object.entries(this.data.fields)) {
+      const field = d.fieldByName(this.data.type, name);
+      if (!field || !HOOKED_FIELD_TYPES.has(field.type)) continue;
+      if (!d.hasFieldHook(this.data.type)) throw new Error(`${this.data.type} field ${name} is set by the scene but its field hook is not summarized`);
+      const hookValue = field.type === FIELD_NODE ? this.fieldNodeValue(value) : value;
+      d.setField(obj, field, hookValue, this.runtime.device);
+    }
+  }
+
+  // The object a node valued field refers to
+  fieldNodeValue(value) {
+    const data = extractNode(value);
+    return data ? { obj: this.runtime.nodeFor(data, this.archiveName).derivedObject() } : 0;
+  }
+
+  // Stores a scene field the way the executable's field writer does, its class hook running first
+  _writeField(name, value) {
+    const d = this.runtime.derived;
+    const field = d.fieldByName(this.data.type, name);
+    const other = value && typeof value === 'object' && value.__xapNode;
+    if (other) value = { _node: other.data };
+    if (field && !RUNTIME_FIELD_CLASSES.has(this.data.type)) {
+      if (!d.hasFieldHook(this.data.type)) throw new Error(`${this.data.type} field ${name} written by a script but its field hook is not summarized`);
+      const hookValue = field.type === FIELD_NODE ? this.fieldNodeValue(value) : value;
+      const store = d.setField(this._derivedObject || this.derivedObject(), field, hookValue, this.runtime.device);
+      if (store) this.storeField(field, value);
+    }
+    this._fields[name] = value;
+    if (this.data.type === 'ImageTexture' && name === 'url') {
+      this.derivedObject().slots.set(d.draw.texture_field, { xapTexture: this.runtime.loadTexture(String(value)) });
+    }
+  }
+
+  // The generic field store the executable performs after the hook allows it
+  storeField(field, value) {
+    const obj = this.derivedObject();
+    switch (field.type) {
+      case FIELD_BOOL: obj.slots.set(field.off, value ? 1 : 0); break;
+      case FIELD_INT: obj.slots.set(field.off, Number(value) >>> 0); break;
+      case FIELD_NUMBER: obj.slots.set(field.off, bitsFromFloat(Number(value))); break;
+      case FIELD_STRING: obj.slots.set(field.off, { str: String(value) }); break;
+      case FIELD_NODE: obj.slots.set(field.off, this.fieldNodeValue(value)); break;
+      case FIELD_VEC3: case FIELD_COLOR: obj.slots.set(field.off, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2])])); break;
+      case FIELD_ROTATION: obj.slots.set(field.off, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2]), Number(value[3])])); break;
+      default: obj.slots.delete(field.off);
+    }
   }
 
   // The executable's object for this node, read by the derived draw paths
@@ -1284,37 +1506,48 @@ class XAPNode {
   derivedField(name, type) {
     const v = this._fields[name];
     if (v === undefined) return undefined;
-    if (type === 9) {
+    if (type === FIELD_NODE) {
       const data = extractNode(v);
       return data ? { obj: this.runtime.nodeFor(data, this.archiveName).derivedObject() } : 0;
     }
-    if (type === 10) return String(Array.isArray(v) ? v[0] : v);
-    if (type === 2) return !!v;
+    if (type === FIELD_STRING) return String(Array.isArray(v) ? v[0] : v);
+    if (type === FIELD_BOOL) return !!v;
+    if (type === FIELD_VEC3 || type === FIELD_ROTATION || type === FIELD_COLOR) return Array.isArray(v) ? v : [v, 0, 0, 0];
     return asNumber(v);
   }
 
-  _setTranslation(x, y, z) {
-    if (this.threeObj) {
-      this.threeObj.position.set(Number(x), Number(y), Number(z));
-    }
+  // Seconds into the clip the voice has played
+  _playbackSeconds() {
+    const rt = this.runtime;
+    if (!rt.audioCtx || this._transportMode === 0) return 0;
+    const at = this._transportMode === 2 ? this._pausedAt : rt.audioCtx.currentTime;
+    return Math.max(0, at - this._startedAt);
   }
 
-  _setRotation(ax, ay, az, angle) {
-    if (this.threeObj) {
-      const axis = new THREE.Vector3(Number(ax), Number(ay), Number(az)).normalize();
-      this.threeObj.quaternion.setFromAxisAngle(axis, Number(angle));
-    }
+  _setTransportMode(mode) {
+    if (this._transportMode === mode) return;
+    this._transportMode = mode;
+    this.runtime.fireEvent(this, 'OnTransportModeChanged');
   }
 
-  _setScale(x, y, z) {
-    if (this.threeObj) {
-      this.threeObj.scale.set(Number(x), Number(y), Number(z));
+  _pause() {
+    const rt = this.runtime;
+    if (!this._source || !rt.audioCtx) return;
+    if (this._transportMode === 2) {
+      rt.audioCtx.resume();
+      this._startedAt += rt.audioCtx.currentTime - this._pausedAt;
+      this._gainNode.gain.value = this._audioVolume;
+      this._setTransportMode(1);
+    } else if (this._transportMode === 1) {
+      this._pausedAt = rt.audioCtx.currentTime;
+      this._gainNode.gain.value = 0;
+      this._setTransportMode(2);
     }
   }
 
   _play() {
-    if (!this._audioUrl) {
-      this._isPlaying = true;
+    if (!this._audioUrl || /^(cd|st):/i.test(this._audioUrl)) {
+      this._isPlaying = false;
       return;
     }
     this._isPlaying = true;
@@ -1330,12 +1563,11 @@ class XAPNode {
       try {
         if (!rt.audioBuffers[cacheKey]) {
           const resp = await fetch(url);
-          if (!resp.ok) return; // audio file not available
+          if (!resp.ok) return;
           const arrayBuf = await resp.arrayBuffer();
           rt.audioBuffers[cacheKey] = await rt.audioCtx.decodeAudioData(arrayBuf);
         }
 
-        // Stop previous source if still playing
         if (self._source) {
           try { self._source.stop(); } catch (_) {}
         }
@@ -1353,9 +1585,18 @@ class XAPNode {
 
         self._source = source;
         self._gainNode = gainNode;
-        source.onended = () => { self._isPlaying = false; };
+        self._startedAt = rt.audioCtx.currentTime;
+        self._setTransportMode(1);
+        rt.playingClips.add(self);
+        source.onended = () => {
+          if (self._source !== source) return;
+          self._isPlaying = false;
+          rt.playingClips.delete(self);
+          self._setTransportMode(0);
+          if (!self._audioLoop) rt.fireEvent(self, 'OnEndOfAudio');
+        };
       } catch (e) {
-        // Audio not critical — don't crash on missing files
+        _warn(`[XAP] audio ${self._audioUrl}:`, e.message);
       }
     })();
   }
@@ -1363,9 +1604,12 @@ class XAPNode {
   _stop() {
     this._isPlaying = false;
     if (this._source) {
-      try { this._source.stop(); } catch (_) {}
+      const source = this._source;
       this._source = null;
+      try { source.stop(); } catch (_) {}
     }
+    this.runtime.playingClips.delete(this);
+    this._setTransportMode(0);
   }
 
   _setVolume(v) {
@@ -1374,210 +1618,416 @@ class XAPNode {
       this._gainNode.gain.value = this._audioVolume;
     }
   }
+}
 
-  _goTo() {
-    // Hide all other levels, show this one
-    for (const [name, lvl] of Object.entries(this.runtime.levels)) {
-      if (lvl.threeObj) lvl.threeObj.visible = false;
-      lvl._levelActive = false;
-    }
-    if (this.threeObj) this.threeObj.visible = true;
-    this._levelActive = true;
+// ============================================================================
+// Script scopes — one per loaded scene, resolving names up through the scene that inlined it
+// ============================================================================
 
-    // Apply this level's Viewpoint to the camera
-    this._applyLevelViewpoint();
+// The engine's dialect calls length as a function on strings and child lists
+function rewriteScript(src) {
+  return src.replace(/\.length\s*\(\s*\)/g, '.length');
+}
 
-    // Bind the joystick control for this level
-    this._bindLevelControl();
-
-    // Fire onLoad handlers on descendant nodes (Inline children etc.)
-    this._fireDescendantOnLoad();
-
-    _log(`[Level] GoTo: ${this.data.def}`);
+class ScriptScope {
+  constructor(runtime, parent, owner) {
+    this.runtime = runtime;
+    this.parent = parent;
+    this.owner = owner;
+    this.names = new Set();
+    this.defs = new Map();
+    this.exports = null;
+    this.initialized = false;
+    // Inside the scene body only ancestor names come from the proxy, own names are its locals
+    this.proxy = new Proxy(Object.create(null), {
+      has: (t, k) => typeof k === 'string' && !this.names.has(k) && (this.defs.has(k) || (this.parent !== null && this.parent.resolves(k))),
+      get: (t, k) => {
+        if (typeof k !== 'string') return undefined;
+        if (this.defs.has(k)) return this.defs.get(k).proxy;
+        return this.parent !== null ? this.parent.lookup(k) : undefined;
+      },
+      set: (t, k, v) => typeof k === 'string' && !this.defs.has(k) && this.parent !== null && this.parent.assign(k, v),
+    });
+    // Handlers and behaviors on nodes see their own scene's names as well
+    this.handlerProxy = new Proxy(Object.create(null), {
+      has: (t, k) => typeof k === 'string' && this.resolves(k),
+      get: (t, k) => (typeof k === 'string' ? this.lookup(k) : undefined),
+      set: (t, k, v) => typeof k === 'string' && this.assign(k, v),
+    });
   }
 
-  _goBackTo() {
-    // Return to this level from a sub-level
-    for (const [name, lvl] of Object.entries(this.runtime.levels)) {
-      if (lvl.threeObj) lvl.threeObj.visible = false;
-      lvl._levelActive = false;
-    }
-    if (this.threeObj) this.threeObj.visible = true;
-    this._levelActive = true;
-
-    // Apply this level's Viewpoint to the camera
-    this._applyLevelViewpoint();
-
-    // Bind the joystick control for this level
-    this._bindLevelControl();
-
-    // Fire onLoad handlers on descendant nodes
-    this._fireDescendantOnLoad();
-
-    _log(`[Level] GoBackTo: ${this.data.def}`);
+  name() {
+    return this.owner && this.owner.data.def ? this.owner.data.def : (this.owner ? this.owner.data.type : 'entry');
   }
 
-  _applyLevelViewpoint() {
-    // Find the first Viewpoint node in this level's subtree
-    const findVP = (xapNode) => {
-      if (xapNode._viewpoint) return xapNode._viewpoint;
-      for (const child of xapNode._xapChildren) {
-        const vp = findVP(child);
-        if (vp) return vp;
+  // Top level declarations are one script item each, a function or a var statement
+  declare(scripts) {
+    for (const src of scripts) {
+      const trimmed = src.trimStart();
+      const fn = trimmed.match(/^function\s+([A-Za-z_$][\w$]*)/);
+      if (fn) { this.names.add(fn[1]); continue; }
+      const vars = trimmed.match(/^var\s+([^;]+)/);
+      if (!vars) continue;
+      for (const part of vars[1].split(',')) {
+        const name = part.trim().split(/[\s=]/)[0];
+        if (name) this.names.add(name);
       }
-      return null;
-    };
-    const vp = findVP(this);
-    if (vp) {
-      this.runtime._applyViewpoint(vp);
     }
   }
 
-  _fireDescendantOnLoad() {
-    const fire = (xapNode) => {
-      if (xapNode._eventHandlers && !xapNode._onLoadFired) {
-        const handler = xapNode._eventHandlers['onLoad'];
-        if (handler) {
-          xapNode._onLoadFired = true;
-          try {
-            (0, eval)(handler);
-            if (typeof window.onLoad === 'function') {
-              window.onLoad();
-              delete window.onLoad;
-            }
-          } catch (e) {
-            _warn(`[XAP] onLoad error for ${xapNode.data.def}:`, e.message);
-          }
-        }
-      }
-      for (const child of xapNode._xapChildren) {
-        fire(child);
-      }
-    };
-    for (const child of this._xapChildren) {
-      fire(child);
-    }
+  has(k) {
+    return this.names.has(k) || this.defs.has(k);
   }
 
-  _bindLevelControl() {
-    // Unbind all joysticks, then bind this level's control joystick
-    for (const node of Object.values(this.runtime.nodes)) {
-      if (node._eventHandlers) node._isBound = false;
-    }
+  resolves(k) {
+    return this.has(k) || (this.parent !== null && this.parent.resolves(k));
+  }
 
-    // Find control node (Joystick) for this level
-    let ctrl = this._controlNode;
+  ownerOf(k) {
+    if (this.has(k)) return this;
+    return this.parent !== null ? this.parent.ownerOf(k) : null;
+  }
 
-    // If this level has no explicit control, search descendants for a joystick
-    if (!ctrl) {
-      const findJoystick = (xapNode) => {
-        if (xapNode._eventHandlers && Object.keys(xapNode._eventHandlers).some(
-          k => k.startsWith('On') && k !== 'onLoad')) {
-          return xapNode;
-        }
-        for (const child of xapNode._xapChildren) {
-          const found = findJoystick(child);
-          if (found) return found;
-        }
-        return null;
-      };
-      ctrl = findJoystick(this);
+  // A DEF name resolves to the node of the nearest scene declaring it
+  lookupDef(k) {
+    for (let sc = this; sc !== null; sc = sc.parent) {
+      const node = sc.defs.get(k);
+      if (node) return node;
     }
+    return null;
+  }
 
-    if (ctrl) {
-      ctrl._isBound = true;
-      _log(`[Level] Bound joystick: ${ctrl.data.def || 'unnamed'}`);
-    } else {
-      _warn(`[Level] No joystick found for ${this.data.def}`);
+  lookup(k) {
+    const o = this.ownerOf(k);
+    return o ? o.get(k) : undefined;
+  }
+
+  assign(k, v) {
+    const o = this.ownerOf(k);
+    if (!o) return false;
+    o.set(k, v);
+    return true;
+  }
+
+  get(k) {
+    const binding = this.exports && this.exports[k];
+    if (binding) return binding[0]();
+    const node = this.defs.get(k);
+    return node ? node.proxy : undefined;
+  }
+
+  set(k, v) {
+    const binding = this.exports && this.exports[k];
+    if (!binding) throw new Error(`scene ${this.name()} declares no ${k}`);
+    binding[1](v);
+  }
+
+  // Runs the scene's scripts as one function body whose declarations become live bindings
+  evaluate(scripts) {
+    const body = scripts.map(rewriteScript).join('\n');
+    const bindings = [...this.names].map((n) => `${JSON.stringify(n)}: [function () { return ${n}; }, function (v) { ${n} = v; }]`).join(',\n');
+    const make = new Function('__scope', `with (__scope) {\n${body}\nreturn {${bindings}};\n}`);
+    this.exports = make(this.proxy);
+  }
+}
+
+// Dates the scripts construct read the console clock and gain the engine's calendar members
+function installDate(vc) {
+  const NativeDate = Date;
+  class ConsoleDate extends NativeDate {
+    constructor(...args) {
+      if (args.length === 0) super(vc.now());
+      else super(...args);
     }
+  }
+  ConsoleDate.now = () => vc.now();
+  Object.assign(ConsoleDate.prototype, dateMembers(vc));
+  window.Date = ConsoleDate;
+}
+
+// Idle time starts the screen saver node's OnStart, input ends it with OnEnd
+class ScreenSaverTimer {
+  constructor(runtime, node) {
+    this.runtime = runtime;
+    this.node = node;
+    this.idle = 0;
+    this.active = false;
+  }
+
+  activity() {
+    this.idle = 0;
+    if (!this.active) return;
+    this.active = false;
+    this.runtime.fireEvent(this.node, 'OnEnd');
+  }
+
+  reset() {
+    this.idle = 0;
+  }
+
+  // Scene values win, the constructor's defaults stand in for omitted ones
+  field(name) {
+    const v = this.node._fields[name];
+    return v === undefined ? this.runtime.derived.defaultField('ScreenSaver', name) : v;
+  }
+
+  tick(dt) {
+    if (!this.field('enabled') || this.active) return;
+    this.idle += dt;
+    if (this.idle < Number(this.field('delay'))) return;
+    this.active = true;
+    this.runtime.fireEvent(this.node, 'OnStart');
   }
 }
 
 // ============================================================================
-// Text Renderer — Canvas-based text in 3D space
+// Text Renderer — glyph layout following the executable's text draw routine
 // ============================================================================
 
+const TEXT_LINE_ADVANCE = 1.0, TEXT_SOFT_LINE_ADVANCE = 1.5, TEXT_SCROLL_GAP = 1.5, TEXT_COLUMN_FADE = 2.0, TEXT_OVERFLOW_FADE = 1.0, TEXT_BOX_MARGIN = 2.0;
+const TEXT_SMALL_GLYPH_INDEX = 190, TEXT_SMALL_GLYPH_SCALE = 0.9, TEXT_HIGHLIGHT_ALPHA = 0.5;
+const CLOCK_TOKEN = '<clock>';
+const TAB = String.fromCharCode(9), CR = String.fromCharCode(13), LF = String.fromCharCode(10);
+
 class TextRenderer {
-  constructor(text, fontName, fontCache, material, justify) {
-    this.text = text;
+  constructor(runtime, node, fontName, fontCache, material, justify) {
+    this.runtime = runtime;
+    this.node = node;
     this.fontName = fontName;
     this.fontCache = fontCache;
     this.material = material;
     this.justify = justify;
-
-    this.mesh = new THREE.Group();
-    this.mesh.name = 'Text';
-
-    this.rebuild();
+    this.text = '';
+    this.builtKey = null;
+    this.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+    this.scrollStart = 0;
+    this.layoutMesh = null;
+    this.basePositions = null;
+    this.alphas = null;
+    this.setText(String(node._fields.text ?? ''));
   }
 
   setText(text) {
     this.text = text;
-    this.rebuild();
+    this.node._fields.scroll = 0;
+    this.scrollStart = 0;
   }
 
-  rebuild() {
-    // Clear previous geometry
-    while (this.mesh.children.length > 0) {
-      const c = this.mesh.children[0];
-      this.mesh.remove(c);
-      if (c.geometry) c.geometry.dispose();
+  // Scene values win, constructor defaults stand in for omitted fields
+  field(name) {
+    const v = this.node._fields[name];
+    return v === undefined ? this.runtime.derived.defaultField('Text', name) : v;
+  }
+
+  // The string the glyphs spell: the clock token becomes the time, translated text comes from the tables
+  displayString() {
+    if (this.text.startsWith(CLOCK_TOKEN)) return this.runtime.console.formatClock();
+    return this.field('translate') ? this.runtime.console.translate(this.runtime.console.language, this.text) : this.text;
+  }
+
+  // Lays the text out again when its string, language, width or font changed
+  update() {
+    const str = this.displayString();
+    const width = asNumber(this.field('width'));
+    const key = `${str} ${width} ${this.fontName}`;
+    if (key !== this.builtKey) {
+      this.builtKey = key;
+      this.rebuild(str, width);
     }
+    this.animate();
+  }
 
-    const role = this.fontName.toLowerCase().includes('heading') ? 'heading' : 'body';
+  rebuild(str, width) {
+    if (this.layoutMesh) this.layoutMesh.geometry.dispose();
+    this.layoutMesh = null;
+    const role = this.fontName.toLowerCase() === 'heading' ? 'heading' : 'body';
     const fontData = this.fontCache[role];
-    if (!fontData || !this.text) return;
+    if (!fontData) throw new Error(`font ${this.fontName} is not loaded`);
+    const laid = layoutText(str, fontData, width);
+    this.bbox = laid.bbox;
+    if (laid.positions.length === 0) return;
+    this.basePositions = Float32Array.from(laid.positions);
+    this.alphas = Float32Array.from(laid.alphas);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('a_0', new THREE.BufferAttribute(Float32Array.from(laid.positions), 3));
+    geometry.setAttribute('a_12', new THREE.BufferAttribute(new Float32Array(laid.alphas.length * 4), 4));
+    geometry.setIndex(laid.indices);
+    this.layoutMesh = new THREE.Mesh(geometry, this.material);
+    detachFromThree(this.layoutMesh);
+    this.applyAlpha(this.alphas, 0, 0);
+  }
 
-    // Merge all glyph triangles into a single geometry
-    const allPositions = [];
-    const allIndices = [];
-    let cursorX = 0;
-    let vertexOffset = 0;
+  // Writes the glyph alpha and offsets the glyphs for justification and scroll
+  applyAlpha(alphas, x, y) {
+    const diffuse = this.layoutMesh.geometry.attributes.a_12;
+    for (let i = 0; i < alphas.length; i++) diffuse.setXYZW(i, 1, 1, 1, alphas[i]);
+    diffuse.needsUpdate = true;
+    this.layoutMesh.matrix.makeTranslation(x, y, 0);
+  }
 
-    for (const ch of this.text) {
-      const glyph = fontData.glyphs[ch];
-      if (!glyph) {
-        // Use space advance for unknown characters
-        const space = fontData.glyphs[' '];
-        cursorX += space ? space.adv : 0.2;
+  // Positions the text the way the draw routine does: justified and scrolled, fading at the box edges
+  animate() {
+    if (!this.layoutMesh) return;
+    const width = asNumber(this.field('width'));
+    let extent = this.bbox.maxX - this.bbox.minX;
+    if (width !== 0 && Math.abs(width) < extent) extent = Math.abs(width);
+    let x = 0;
+    const justify = String(this.justify).toLowerCase();
+    if (justify === 'middle') x = -0.5 * extent;
+    else if (justify === 'end') x = -extent;
+    const height = asNumber(this.field('height'));
+    const textHeight = this.bbox.maxY - this.bbox.minY;
+    const scroll = asNumber(this.node._fields.scroll ?? 0);
+    if (height === 0 || textHeight <= height) {
+      this.applyAlpha(this.alphas, x, scroll);
+      return;
+    }
+    const top = TEXT_LINE_ADVANCE - scroll + (scroll === 0 ? TEXT_LINE_ADVANCE : 0);
+    const bottom = TEXT_LINE_ADVANCE - scroll - height - TEXT_BOX_MARGIN;
+    const faded = new Float32Array(this.alphas.length);
+    for (let i = 0; i < faded.length; i++) faded[i] = this.alphas[i] * scrollFade(this.basePositions[3 * i + 1], top, bottom);
+    this.applyAlpha(faded, x, scroll);
+  }
+
+  // Scrolls text taller than its box after the delay, wrapping past the end with a gap
+  tick(dt) {
+    const rate = asNumber(this.field('scrollRate'));
+    if (rate === 0 || !this.layoutMesh) return;
+    const now = this.runtime.clock.elapsedTime;
+    if (this.scrollStart === 0) this.scrollStart = now + asNumber(this.field('scrollDelay'));
+    if (now < this.scrollStart) return;
+    const height = asNumber(this.field('height'));
+    const textHeight = this.bbox.maxY - this.bbox.minY;
+    if (textHeight <= height) return;
+    let scroll = asNumber(this.node._fields.scroll ?? 0) + dt * height * rate;
+    if (scroll > textHeight + TEXT_SCROLL_GAP) scroll -= textHeight + TEXT_SCROLL_GAP;
+    this.node._fields.scroll = scroll;
+  }
+}
+
+// Alpha of a glyph vertex at a height inside a scrolled box, fading over one line at both edges
+function scrollFade(y, top, bottom) {
+  if (y > top || y < bottom) return 0;
+  return Math.min(1, top - y, y - bottom);
+}
+
+// Places glyph outlines like the executable: lines wrap at a positive width, overflow fades out at the edge,
+// a tab starts a right aligned column and highlight markers halve the alpha of the text between them
+function layoutText(str, fontData, width) {
+  const glyphs = fontData.glyphs;
+  const wrap = width > 0 ? width : 0;
+  const limit = Math.abs(width);
+  const positions = [], alphas = [], indices = [];
+  const chars = [...str];
+  const measure = measureColumns(chars, glyphs, limit);
+  let x = 0, y = 0, vertexCount = 0;
+  let lineStartVertex = 0, column = 1, lastSpace = -1, lastSpaceVertex = 0;
+  let overflow = width < 0, highlight = false, hadTab = false;
+  let minX = 0, maxX = 0, minY = 0, maxY = 0;
+  const finishLine = (hardBreak) => {
+    if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_OVERFLOW_FADE, measure.lineWidth);
+    x = 0;
+    y -= hardBreak || hadTab || highlight ? TEXT_LINE_ADVANCE : TEXT_SOFT_LINE_ADVANCE;
+    lineStartVertex = vertexCount;
+    lastSpace = -1;
+    column = 1;
+    overflow = width < 0;
+  };
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (ch === '*' && markerAt(chars, i)) {
+      highlight = !highlight;
+      continue;
+    }
+    if (ch === CR || ch === LF) {
+      if (ch === CR && chars[i + 1] === LF) i++;
+      finishLine(ch === CR);
+      continue;
+    }
+    if (ch === TAB && width >= 0) {
+      if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_COLUMN_FADE, measure.lineWidth);
+      column = 2;
+      hadTab = true;
+      x = measure.lineWidth - measure.column2;
+      continue;
+    }
+    const glyph = glyphs[ch];
+    if (!glyph) continue;
+    const scale = glyph.i > TEXT_SMALL_GLYPH_INDEX ? TEXT_SMALL_GLYPH_SCALE : 1;
+    const advance = glyph.adv * scale;
+    if (wrap > 0 && ch !== ' ' && column === 1 && x + advance > wrap) {
+      if (lastSpace >= 0) {
+        positions.length = lastSpaceVertex * 3;
+        alphas.length = lastSpaceVertex;
+        indices.length = indexCountFor(indices, lastSpaceVertex);
+        vertexCount = lastSpaceVertex;
+        i = lastSpace;
+        x = 0;
+        y -= TEXT_LINE_ADVANCE;
+        lineStartVertex = vertexCount;
+        lastSpace = -1;
         continue;
       }
-
-      if (glyph.verts && glyph.idx && glyph.idx.length > 0) {
-        for (let i = 0; i < glyph.verts.length; i += 2) {
-          allPositions.push(glyph.verts[i] + cursorX, glyph.verts[i + 1], 0);
-        }
-        for (let i = 0; i < glyph.idx.length; i++) {
-          allIndices.push(glyph.idx[i] + vertexOffset);
-        }
-        vertexOffset += glyph.verts.length / 2;
+      overflow = true;
+    }
+    if (glyph.verts && glyph.idx && glyph.idx.length > 0) {
+      for (let k = 0; k < glyph.verts.length; k += 2) {
+        const px = glyph.verts[k] * scale + x, py = glyph.verts[k + 1] * scale + y;
+        positions.push(px, py, 0);
+        alphas.push(highlight ? TEXT_HIGHLIGHT_ALPHA : 1);
+        minX = Math.min(minX, px); maxX = Math.max(maxX, px); minY = Math.min(minY, py); maxY = Math.max(maxY, py);
       }
-
-      cursorX += glyph.adv;
+      for (let k = 0; k < glyph.idx.length; k++) indices.push(glyph.idx[k] + vertexCount);
+      vertexCount += glyph.verts.length / 2;
     }
-
-    if (allPositions.length === 0) return;
-
-    // Apply justify offset
-    const totalWidth = cursorX;
-    let xShift = 0;
-    if (this.justify === 'middle' || this.justify === 'center') {
-      xShift = -totalWidth / 2;
-    }
-    if (xShift !== 0) {
-      for (let i = 0; i < allPositions.length; i += 3) {
-        allPositions[i] += xShift;
-      }
-    }
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('a_0', new THREE.Float32BufferAttribute(allPositions, 3));
-    geometry.setIndex(allIndices);
-
-    const textMesh = new THREE.Mesh(geometry, this.material);
-    textMesh.frustumCulled = false;
-    this.mesh.add(textMesh);
+    x += advance;
+    if (ch === ' ') { lastSpace = i; lastSpaceVertex = vertexCount; }
   }
+  if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_OVERFLOW_FADE, measure.lineWidth);
+  return { positions, alphas, indices, bbox: { minX, maxX, minY, maxY } };
+}
+
+// A highlight marker is an asterisk whose run ends with another asterisk before a tab, newline or the end
+function markerAt(chars, i) {
+  for (let k = i + 1; k < chars.length; k++) {
+    const c = chars[k];
+    if (c === LF || c === CR || c === TAB) return k - 1 > i && chars[k - 1] === '*';
+  }
+  return chars.length - 1 > i && chars[chars.length - 1] === '*';
+}
+
+// Measures the widest first and second column so overflow and tab stops know the line width
+function measureColumns(chars, glyphs, limit) {
+  let col1 = 0, col2 = 0, x1 = 0, x2 = 0, column = 1, sawTab = false;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (ch === CR || ch === LF) { col1 = Math.max(col1, x1); col2 = Math.max(col2, x2); x1 = 0; x2 = 0; column = 1; continue; }
+    if (ch === TAB) { column = 2; sawTab = true; continue; }
+    if (ch === '*' && markerAt(chars, i)) continue;
+    const glyph = glyphs[ch];
+    if (!glyph) continue;
+    const advance = glyph.adv * (glyph.i > TEXT_SMALL_GLYPH_INDEX ? TEXT_SMALL_GLYPH_SCALE : 1);
+    if (column === 1) x1 += advance; else x2 += advance;
+  }
+  col1 = Math.max(col1, x1); col2 = Math.max(col2, x2);
+  let lineWidth = col1;
+  if (limit !== 0) lineWidth = sawTab ? (col1 + col2 > limit ? limit - col2 : lineWidth) : limit;
+  return { lineWidth, column2: col2 };
+}
+
+// Fades vertices out between two x positions, the way the draw dims text past its width
+function fadeRange(positions, alphas, from, to, start, end) {
+  const span = end - start;
+  for (let i = from; i < to; i++) {
+    const t = span > 0 ? Math.min(1, Math.max(0, (positions[3 * i] - start) / span)) : (positions[3 * i] > start ? 1 : 0);
+    alphas[i] *= 1 - t;
+  }
+}
+
+function indexCountFor(indices, vertexCount) {
+  let n = indices.length;
+  while (n > 0 && indices[n - 1] >= vertexCount) n--;
+  return n;
 }
 
 // ============================================================================
@@ -1585,7 +2035,14 @@ class TextRenderer {
 // ============================================================================
 
 // Text glyph geometry carries positions only, drawn through the fixed function path
-const TEXT_GEOMETRY = describeGeometry({ format: 0, stride: 12, attributes: [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3 }] });
+const TEXT_GEOMETRY = describeGeometry({ format: 0, stride: 28, attributes: [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3 }, { register: 3, semantic: 'diffuse', type: 'FLOAT4', offset: 12, comps: 4 }] });
+
+// Three must not cull by or flip winding from a mesh world matrix the derived shaders ignore
+function detachFromThree(mesh) {
+  mesh.frustumCulled = false;
+  mesh.matrixAutoUpdate = false;
+  mesh.matrixWorldAutoUpdate = false;
+}
 
 const floatBuf = new DataView(new ArrayBuffer(4));
 function floatFromBits(bits) {
@@ -1597,20 +2054,6 @@ function asNumber(v) {
   if (typeof v === 'number') return v;
   if (Array.isArray(v) && v.length > 0) return Number(v[0]);
   return Number(v) || 0;
-}
-
-function asVec3(v) {
-  if (Array.isArray(v)) {
-    return [Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0];
-  }
-  return [0, 0, 0];
-}
-
-function asVec4(v) {
-  if (Array.isArray(v)) {
-    return [Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0, Number(v[3]) || 0];
-  }
-  return [0, 0, 0, 0];
 }
 
 // Extract an inline node from a field value (handles {_node: {...}} wrapper)

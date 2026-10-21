@@ -18,7 +18,7 @@ import (
 	"github.com/nickheyer/discoxip/pkg/xbe"
 )
 
-//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js
+//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js static/system.js
 var staticFiles embed.FS
 
 // Export generates a self-contained web application from extracted XIP data and the dashboard executable.
@@ -136,7 +136,7 @@ func Export(inputDir, outputDir string) error {
 		return err
 	}
 
-	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js"} {
+	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js", "static/system.js"} {
 		data, err := staticFiles.ReadFile(name)
 		if err != nil {
 			return fmt.Errorf("web: reading embedded %s: %w", name, err)

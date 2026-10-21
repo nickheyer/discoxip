@@ -14,6 +14,7 @@ func ExportJSON(w io.Writer, f *Font, maxCodepoint rune) error {
 	}
 
 	type jsonGlyph struct {
+		Index   int       `json:"i"`
 		Advance float32   `json:"adv"`
 		BB      []float32 `json:"bb,omitempty"`
 		Origin  []float32 `json:"org,omitempty"`
@@ -48,6 +49,7 @@ func ExportJSON(w io.Writer, f *Font, maxCodepoint rune) error {
 			}
 
 			jg := jsonGlyph{
+				Index:   glyphIdx - 1,
 				Advance: g.Metrics.AdvanceX,
 			}
 

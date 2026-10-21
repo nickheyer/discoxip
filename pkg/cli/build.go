@@ -28,7 +28,7 @@ This is the single entry point for the full pipeline:
   3. Generate Three.js web app with all assets (includes XBE material extraction)
 
 Example:
-  discoxip build sample/4304 -o output/dashboard`,
+  discoxip build sample/5659 -o output/dashboard`,
 		Args: cobra.ExactArgs(1),
 		RunE: runBuild,
 	}

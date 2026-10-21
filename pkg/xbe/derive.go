@@ -2,6 +2,8 @@ package xbe
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -34,6 +36,9 @@ type RenderModel struct {
 	Globals        map[uint32]GlobalInit         `json:"globals"`
 	Types          map[string]*NodeType          `json:"node_types"`
 	Draw           *DrawModel                    `json:"draw"`
+	System         *SystemModel                  `json:"system"`
+	Scene          *SceneModel                   `json:"scene"`
+	Allocators     []uint32                      `json:"allocators"`
 	defaultPaths   []Path
 	nodePaths      []Path
 	shaderLookup   uint32
@@ -81,7 +86,7 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	if err != nil {
 		return nil, err
 	}
-	rm := &RenderModel{XDK: build, Materials: ms.Materials, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool()}
+	rm := &RenderModel{XDK: build, Materials: ms.Materials, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Allocators: append([]uint32{ms.AllocatorVA}, ms.Allocators...)}
 	rm.StageNames = TextureStageStateNames(build)
 	for _, m := range ms.Materials {
 		m.Apply = pathsJSON(rm.Exprs, m.Paths)
@@ -178,11 +183,22 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	if err := rm.deriveDraw(d, ms, types); err != nil {
 		return nil, err
 	}
+	sm, err := DeriveSystem(d, types)
+	if err != nil {
+		return nil, err
+	}
+	rm.System = sm
+	if err := rm.deriveScene(d, ms, types, sm); err != nil {
+		return nil, err
+	}
 	if err := rm.deriveGlobals(d, ms); err != nil {
 		return nil, err
 	}
 	return rm, nil
 }
+
+// Bytes exported for a constant table a path indexes at run time
+const constantTableBytes = 256
 
 // Records the start value and the writers of every global the exported paths read symbolically
 func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
@@ -193,6 +209,16 @@ func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
 		case Load:
 			if v.Addr != nil {
 				walk(v.Addr)
+				// A table indexed at run time is exported from its constant base.
+				if b, ok := v.Addr.(Bin); ok && b.Op == "add" {
+					for _, side := range []Expr{b.A, b.B} {
+						if c, isC := isConst(side); isC && d.sectionOf(c) != nil && d.sectionOf(c).Flags&0x1 == 0 {
+							if prev, ok := reads[c]; !ok || constantTableBytes > prev {
+								reads[c] = constantTableBytes
+							}
+						}
+					}
+				}
 			} else if v.Base == "" {
 				if prev, ok := reads[uint32(v.Off)]; !ok || v.Size > prev {
 					reads[uint32(v.Off)] = v.Size
@@ -232,6 +258,9 @@ func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
 	for _, paths := range rm.Draw.paths {
 		all = append(all, paths...)
 	}
+	for _, nt := range rm.Types {
+		all = append(all, nt.ctorPaths...)
+	}
 	for _, p := range all {
 		for _, g := range p.Guards {
 			walk(g)
@@ -239,6 +268,12 @@ func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
 		for _, e := range p.Effects {
 			if e.Value != nil {
 				walk(e.Value)
+			}
+			// A matrix the device is handed by constant address is read from the image at run time.
+			if e.Kind == "call" && e.Fn == "D3DDevice_SetTransform" && len(e.Args) == 2 {
+				if c, ok := isConst(e.Args[1]); ok && d.sectionOf(c) != nil {
+					reads[c] = 64
+				}
 			}
 			for _, a := range e.Args {
 				walk(a)
@@ -251,15 +286,15 @@ func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
 		}
 		walk(p.Return)
 	}
-	owner := map[uint32]uint32{}
+	owners := map[uint32][]uint32{}
 	for va, fn := range d.Functions {
 		for _, in := range fn.Instructions {
-			owner[in.VA] = va
+			owners[in.VA] = append(owners[in.VA], va)
 		}
 	}
 	rm.Globals = map[uint32]GlobalInit{}
 	for va, size := range reads {
-		if va == rm.Clock.VA || va == rm.HierarchyAlpha || (rm.Transforms[fmt.Sprintf("%08X", va)] != "") {
+		if rm.Transforms[fmt.Sprintf("%08X", va)] != "" {
 			continue
 		}
 		init, ok := d.Image.ReadBytes(va, size)
@@ -275,9 +310,11 @@ func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
 			if !storesAbsolute(insn, va, size) {
 				continue
 			}
-			if fn, ok := owner[insn.VA]; ok && !seen[fn] {
-				seen[fn] = true
-				g.Writers = append(g.Writers, fn)
+			for _, fn := range owners[insn.VA] {
+				if !seen[fn] {
+					seen[fn] = true
+					g.Writers = append(g.Writers, fn)
+				}
 			}
 		}
 		sort.Slice(g.Writers, func(i, j int) bool { return g.Writers[i] < g.Writers[j] })
@@ -336,8 +373,8 @@ func (rm *RenderModel) deriveCurrentMesh(d *Disassembly) error {
 		}
 	}
 	best, bestN := uint32(0), 0
-	for va, n := range found {
-		if n > bestN {
+	for _, va := range slices.Sorted(maps.Keys(found)) {
+		if n := found[va]; n > bestN {
 			best, bestN = va, n
 		}
 	}
@@ -457,7 +494,8 @@ func collectFormatConstants(g Expr, out map[uint32]bool) {
 func (rm *RenderModel) deriveMeshAccessor(d *Disassembly) error {
 	// The lookup is the function containing a CreateVertexShader call with a null program.
 	var lookupVA uint32
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		if fn.Symbol != nil {
 			continue
 		}
@@ -493,8 +531,8 @@ func (rm *RenderModel) deriveMeshAccessor(d *Disassembly) error {
 		return fmt.Errorf("xbe: no fixed function declaration lookup found")
 	}
 	// The accessor is the call whose result feeds the lookup, and it makes one virtual call.
-	for _, fn := range d.Functions {
-		ins := fn.Instructions
+	for _, va := range d.functionVAs() {
+		ins := d.Functions[va].Instructions
 		for i := range ins {
 			if ins[i].Inst.Op != x86asm.CALL || resolveTarget(&ins[i]) != lookupVA {
 				continue
@@ -551,7 +589,8 @@ func accessorShape(d *Disassembly, va uint32) (*MeshAccessor, error) {
 // Runs the fixed function declaration lookup for every known vertex format
 func (rm *RenderModel) deriveFixedFunction(d *Disassembly, ms *MaterialSystem) error {
 	var lookupVA uint32
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		if fn.Symbol != nil {
 			continue
 		}
@@ -575,6 +614,7 @@ func (rm *RenderModel) deriveFixedFunction(d *Disassembly, ms *MaterialSystem) e
 	rm.shaderLookup = lookupVA
 	// Running the lookup on a symbolic format exposes every format its table compares against.
 	probe := NewExecutor(d)
+	ms.hideFrom(probe)
 	probePaths, err := probe.Run(lookupVA, func(s *execState) { s.pushArgs(Load{Base: "fmt", Off: 0, Size: 4}) })
 	if err != nil {
 		return fmt.Errorf("fixed function lookup probe: %w", err)
@@ -595,6 +635,7 @@ func (rm *RenderModel) deriveFixedFunction(d *Disassembly, ms *MaterialSystem) e
 	sort.Slice(rm.Formats, func(i, j int) bool { return rm.Formats[i] < rm.Formats[j] })
 	for _, f := range rm.Formats {
 		ex := NewExecutor(d)
+		ms.hideFrom(ex)
 		paths, err := ex.Run(lookupVA, func(s *execState) { s.pushArgs(IConst{f}) })
 		if err != nil {
 			return fmt.Errorf("fixed function lookup for format %08X: %w", f, err)
@@ -683,7 +724,8 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 	// The wrapper is the function containing calls to the complex SetRenderState XDK functions.
 	wrapper := uint32(0)
 	counts := map[uint32]int{}
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		if fn.Symbol != nil {
 			continue
 		}
@@ -791,7 +833,8 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 
 	// Defaults: the function with the most static calls to the wrapper.
 	best, bestN := uint32(0), 0
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		n := 0
 		for _, t := range fn.CallTargets {
 			if t == wrapper {
@@ -900,7 +943,8 @@ func stateNameFromSymbol(sym *Symbol, ref string) string {
 func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) error {
 	// It is the function containing a SetVertexShaderConstant call for register 0 with four rows.
 	var target uint32
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		if fn.Symbol != nil {
 			continue
 		}
@@ -935,6 +979,7 @@ func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) e
 		return fmt.Errorf("xbe: no node constant loader found")
 	}
 	ex := NewExecutor(d)
+	ms.hideFrom(ex)
 	paths, err := ex.Run(target, func(s *execState) {})
 	if err != nil {
 		return fmt.Errorf("node constants %08X: %w", target, err)
@@ -969,7 +1014,8 @@ func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) e
 func (rm *RenderModel) deriveClock(d *Disassembly) error {
 	ex := NewExecutor(d)
 	callers := ex.staticThisCallers()
-	for fnVA, thisVA := range callers {
+	for _, fnVA := range slices.Sorted(maps.Keys(callers)) {
+		thisVA := callers[fnVA]
 		fn := d.Functions[fnVA]
 		if fn == nil || len(fn.Instructions) > 400 {
 			continue
@@ -1082,7 +1128,7 @@ func (rm *RenderModel) deriveHierarchyAlpha(d *Disassembly, ms *MaterialSystem) 
 			}
 		}
 	}
-	for va := range counts {
+	for _, va := range slices.Sorted(maps.Keys(counts)) {
 		v, ok := d.Image.ReadU32(va)
 		if !ok || v != 0x3F800000 {
 			continue

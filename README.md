@@ -38,6 +38,6 @@ discoxip font info|export <file.xtf>
 
 ## Development
 ```
-make dev                       # build sample/4304 into build/dev, decompile the XBE, serve on :8000
+make dev                       # build sample/5659 into build/dev, decompile the XBE, serve on :8000
 make dev SRC=<dir> PORT=9000
 ```

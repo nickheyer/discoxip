@@ -33,7 +33,29 @@ func ParseFile(path string) (*Scene, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(string(data))
+	return Parse(decodeWindows1252(data))
+}
+
+// Maps the 0x80 to 0x9F bytes Windows-1252 assigns to printable characters
+var windows1252High = [32]rune{
+	0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+	0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+}
+
+// Decodes the Windows-1252 bytes a scene file is written in
+func decodeWindows1252(data []byte) string {
+	runes := make([]rune, len(data))
+	for i, b := range data {
+		switch {
+		case b < 0x80:
+			runes[i] = rune(b)
+		case b < 0xA0:
+			runes[i] = windows1252High[b-0x80]
+		default:
+			runes[i] = rune(b)
+		}
+	}
+	return string(runes)
 }
 
 func (p *parser) peek() token {
@@ -217,9 +239,8 @@ func (p *parser) parseNodeBody(node *Node) error {
 			node.Children = append(node.Children, children...)
 
 		default:
-			// Decide: field (lowercase start) vs child node (uppercase start)
-			if isUpperStart(t.val) {
-				// Could be a bare child node: TypeName { ... }
+			// A type name followed by its body is a bare child node, anything else names a field
+			if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].typ == tokLBrace {
 				child, err := p.parseNodeStart("")
 				if err != nil {
 					return err

@@ -10,7 +10,7 @@ import (
 )
 
 // Decode converts raw texture data into an RGBA image.
-func Decode(tex *Texture) (*image.RGBA, error) {
+func Decode(tex *Texture) (*image.NRGBA, error) {
 	info := tex.Info
 	w, h := info.Width, info.Height
 
@@ -49,14 +49,14 @@ func ExportPNG(w io.Writer, tex *Texture) error {
 	return png.Encode(w, img)
 }
 
-func pixelsToImage(pixels []byte, w, h int) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
+func pixelsToImage(pixels []byte, w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	copy(img.Pix, pixels)
 	return img
 }
 
-func decodeARGB32(data []byte, w, h int, hasAlpha bool) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
+func decodeARGB32(data []byte, w, h int, hasAlpha bool) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for i := 0; i < w*h; i++ {
 		off := i * 4
 		if off+4 > len(data) {
@@ -70,13 +70,13 @@ func decodeARGB32(data []byte, w, h int, hasAlpha bool) *image.RGBA {
 		if !hasAlpha {
 			a = 255
 		}
-		img.SetRGBA(i%w, i/w, color.RGBA{R: r, G: g, B: b, A: a})
+		img.SetNRGBA(i%w, i/w, color.NRGBA{R: r, G: g, B: b, A: a})
 	}
 	return img
 }
 
-func decodeRGB565(data []byte, w, h int) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
+func decodeRGB565(data []byte, w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for i := 0; i < w*h; i++ {
 		off := i * 2
 		if off+2 > len(data) {
@@ -84,7 +84,7 @@ func decodeRGB565(data []byte, w, h int) *image.RGBA {
 		}
 		c := binary.LittleEndian.Uint16(data[off:])
 		rgba := rgb565ToRGBA(c)
-		img.SetRGBA(i%w, i/w, color.RGBA{R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3]})
+		img.SetNRGBA(i%w, i/w, color.NRGBA{R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3]})
 	}
 	return img
 }

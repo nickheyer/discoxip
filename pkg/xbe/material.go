@@ -2,6 +2,8 @@ package xbe
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,9 +26,10 @@ type MaterialObject struct {
 
 // PathJSON is the serialized form of one execution path with expressions as pool indices.
 type PathJSON struct {
-	Guards  []int        `json:"guards"`
-	Effects []EffectJSON `json:"effects"`
-	Return  int          `json:"return"`
+	Guards   []int        `json:"guards"`
+	GuardPos []int        `json:"guard_pos"`
+	Effects  []EffectJSON `json:"effects"`
+	Return   int          `json:"return"`
 }
 
 // EffectJSON is the serialized form of one store or call.
@@ -37,6 +40,8 @@ type EffectJSON struct {
 	Off     int32        `json:"off,omitempty"`
 	Size    int          `json:"size,omitempty"`
 	Value   int          `json:"value,omitempty"`
+	Addr    int          `json:"addr,omitempty"`
+	HasAddr bool         `json:"has_addr,omitempty"`
 	Fn      string       `json:"fn,omitempty"`
 	Args    []int        `json:"args,omitempty"`
 	This    int          `json:"this,omitempty"`
@@ -54,14 +59,23 @@ type BufferJSON struct {
 func pathsJSON(pool *ExprPool, paths []Path) []PathJSON {
 	out := []PathJSON{}
 	for _, p := range paths {
-		pj := PathJSON{Return: pool.Add(p.Return), Guards: []int{}, Effects: []EffectJSON{}}
-		for _, g := range p.Guards {
+		pj := PathJSON{Return: pool.Add(p.Return), Guards: []int{}, GuardPos: []int{}, Effects: []EffectJSON{}}
+		for i, g := range p.Guards {
 			pj.Guards = append(pj.Guards, pool.Add(g))
+			pos := len(p.Effects)
+			if i < len(p.GuardPos) {
+				pos = p.GuardPos[i]
+			}
+			pj.GuardPos = append(pj.GuardPos, pos)
 		}
 		for _, e := range p.Effects {
 			ej := EffectJSON{Kind: e.Kind, VA: e.VA, Base: e.Base, Off: e.Off, Size: e.Size, Fn: e.Fn, Seq: e.Seq}
 			if e.Value != nil {
 				ej.Value = pool.Add(e.Value)
+			}
+			if e.Addr != nil {
+				ej.Addr = pool.Add(e.Addr)
+				ej.HasAddr = true
 			}
 			for _, a := range e.Args {
 				ej.Args = append(ej.Args, pool.Add(a))
@@ -92,6 +106,17 @@ type MaterialSystem struct {
 	Materials        []*MaterialObject
 	TextureProducers []uint32 // dashboard functions that build textures at runtime
 	Allocators       []uint32 // functions whose results become constructed objects
+}
+
+// Keeps the executor from inlining object allocators and texture producers
+func (ms *MaterialSystem) hideFrom(ex *Executor) {
+	ex.Opaque[ms.AllocatorVA] = true
+	for _, va := range ms.Allocators {
+		ex.Opaque[va] = true
+	}
+	for _, va := range ms.TextureProducers {
+		ex.Opaque[va] = true
+	}
 }
 
 // Finds dashboard functions that create and fill a texture
@@ -174,7 +199,8 @@ func (d *Disassembly) findAllocators(ctors map[uint32]uint32) []uint32 {
 func (d *Disassembly) findMaterialFactory(ctors map[uint32]uint32) (uint32, uint32, error) {
 	bestVA, bestCount := uint32(0), 0
 	var bestAlloc uint32
-	for va, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		ins := fn.Instructions
 		count := 0
 		allocs := map[uint32]int{}
@@ -208,8 +234,8 @@ func (d *Disassembly) findMaterialFactory(ctors map[uint32]uint32) (uint32, uint
 			bestVA, bestCount = va, count
 			bestAlloc = 0
 			bestN := 0
-			for a, n := range allocs {
-				if n > bestN {
+			for _, a := range slices.Sorted(maps.Keys(allocs)) {
+				if n := allocs[a]; n > bestN {
 					bestAlloc, bestN = a, n
 				}
 			}
@@ -302,8 +328,8 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 				return nil, fmt.Errorf("material %s field +%X is symbolic: %s", obj, off, ExprString(mv.v))
 			}
 		}
-		for ctorVA, cvt := range ctors {
-			if cvt == vtVA {
+		for _, ctorVA := range slices.Sorted(maps.Keys(ctors)) {
+			if ctors[ctorVA] == vtVA {
 				m.CtorVA = ctorVA
 			}
 		}

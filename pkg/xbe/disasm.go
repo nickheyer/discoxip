@@ -3,6 +3,8 @@ package xbe
 import (
 	"encoding/binary"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -168,13 +170,18 @@ func (d *Disassembly) discoverFunctions() {
 	d.recoverGaps(entries)
 
 	// Build CalledBy cross-references.
-	for callerVA, fn := range d.Functions {
-		for _, target := range fn.CallTargets {
+	for _, callerVA := range d.functionVAs() {
+		for _, target := range d.Functions[callerVA].CallTargets {
 			if callee, ok := d.Functions[target]; ok {
 				callee.CalledBy = append(callee.CalledBy, callerVA)
 			}
 		}
 	}
+}
+
+// Lists function entry addresses in ascending order
+func (d *Disassembly) functionVAs() []uint32 {
+	return slices.Sorted(maps.Keys(d.Functions))
 }
 
 // Treats code left between discovered functions as further function entries
@@ -257,6 +264,9 @@ func (d *Disassembly) buildFunction(entry uint32, entries map[uint32]bool) *Func
 					}
 				} else if t != entry && !(entries[t] && op == x86asm.JMP) {
 					work = append(work, t)
+				} else if entries[t] && op == x86asm.JMP {
+					// A jump into another function's entry is a tail call.
+					callTargets = append(callTargets, t)
 				}
 				if isUnconditionalJump(op) {
 					break

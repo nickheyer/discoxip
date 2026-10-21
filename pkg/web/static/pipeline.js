@@ -12,7 +12,14 @@ const TA_COMPLEMENT = 0x10, TA_ALPHAREPLICATE = 0x20;
 const TOP = { 1: 'DISABLE', 2: 'SELECTARG1', 3: 'SELECTARG2', 4: 'MODULATE', 5: 'MODULATE2X', 6: 'MODULATE4X', 7: 'ADD', 8: 'ADDSIGNED', 9: 'ADDSIGNED2X', 10: 'SUBTRACT', 11: 'ADDSMOOTH', 12: 'BLENDDIFFUSEALPHA', 13: 'BLENDCURRENTALPHA', 14: 'BLENDTEXTUREALPHA', 15: 'BLENDFACTORALPHA', 16: 'BLENDTEXTUREALPHAPM', 22: 'DOTPRODUCT3', 23: 'MULTIPLYADD', 24: 'LERP' };
 
 // Xbox render state enums use OpenGL numbering
-const GL_NEVER = 0x200, GL_ALWAYS = 0x207;
+const GL_NEVER = 0x200, GL_ALWAYS = 0x207, GL_CW = 0x900, GL_CCW = 0x901;
+
+// D3D transform states and primitive types
+const TS_VIEW = 0, TS_PROJECTION = 1, TS_WORLD = 6;
+const PT_TRIANGLELIST = 4, PT_TRIANGLESTRIP = 5, PT_TRIANGLEFAN = 6;
+
+// Flexible vertex format bits
+const FVF_XYZ = 0x002, FVF_XYZRHW = 0x004, FVF_NORMAL = 0x010, FVF_DIFFUSE = 0x040, FVF_SPECULAR = 0x080, FVF_TEXCOUNT_SHIFT = 8, FVF_TEXCOUNT_MASK = 0xF00;
 
 export class DevicePipeline {
   constructor(THREE, model, textures) {
@@ -40,8 +47,15 @@ export class DevicePipeline {
     return material;
   }
 
+  // The world, view and projection the device holds at a draw
+  matrices(snapshot) {
+    const world = snapshot.transforms[TS_WORLD], view = snapshot.transforms[TS_VIEW], projection = snapshot.transforms[TS_PROJECTION];
+    if (!world || !view || !projection) throw new Error(`draw with transforms ${Object.keys(snapshot.transforms).join(',')} set, world, view and projection are needed`);
+    return { world, view, projection };
+  }
+
   // Applies a draw snapshot to a material for a geometry whose attributes are keyed by byte offset
-  update(material, snapshot, geometry, matrices, fixedFunction = false) {
+  update(material, snapshot, geometry, fixedFunction = false) {
     const THREE = this.THREE;
     const plan = this.plan(snapshot, geometry, fixedFunction);
     if (plan.key !== material._derivedKey) {
@@ -49,7 +63,8 @@ export class DevicePipeline {
       this.sources.set(plan.key, src);
       material.vertexShader = src.vertex;
       material.fragmentShader = src.fragment;
-      material.uniforms = {};
+      // Three binds the uniforms object at compile time so the object stays and only its entries change
+      for (const name of Object.keys(material.uniforms)) delete material.uniforms[name];
       for (const name of src.uniformNames) material.uniforms[name] = { value: null };
       material._derivedKey = plan.key;
       material.needsUpdate = true;
@@ -63,7 +78,8 @@ export class DevicePipeline {
       }
       u.c.value = regs;
     } else {
-      const wvp = matMul(matMul(matrices.world, matrices.view), matrices.projection);
+      const m = this.matrices(snapshot);
+      const wvp = matMul(matMul(m.world, m.view), m.projection);
       u.u_wvp.value = new THREE.Matrix4().fromArray(wvp);
     }
     const tf = snapshot.rs.TEXTUREFACTOR >>> 0;
@@ -92,7 +108,8 @@ export class DevicePipeline {
     if (tex.wrapS !== wrapU || tex.wrapT !== wrapV) {
       tex.wrapS = wrapU;
       tex.wrapT = wrapV;
-      tex.needsUpdate = true;
+      // A loading image is uploaded with these modes by its loader, an uploaded one needs a re-upload
+      if (tex.image) tex.needsUpdate = true;
     }
     return tex;
   }
@@ -119,10 +136,13 @@ export class DevicePipeline {
     const zf = this.depthFuncs[rs.ZFUNC];
     if (zf === undefined) throw new Error(`depth function ${rs.ZFUNC} is not mapped`);
     material.depthFunc = zf;
+    // CW culls the FRONTFACE winding and CCW the other, the D3D runtime starting FRONTFACE clockwise
+    const front = rs.FRONTFACE === undefined ? GL_CW : rs.FRONTFACE;
+    if (front !== GL_CW && front !== GL_CCW) throw new Error(`front face ${front} is not mapped`);
     switch (rs.CULLMODE) {
       case 0: material.side = THREE.DoubleSide; break;
-      case 0x900: material.side = THREE.BackSide; break;
-      case 0x901: material.side = THREE.FrontSide; break;
+      case GL_CW:
+      case GL_CCW: material.side = rs.CULLMODE === front ? THREE.FrontSide : THREE.BackSide; break;
       default: throw new Error(`cull mode ${rs.CULLMODE} is not mapped`);
     }
     material.colorWrite = (rs.COLORWRITEENABLE & 0x01010101) !== 0;
@@ -194,6 +214,8 @@ export class DevicePipeline {
     const uniformNames = ['u_tfactor'];
     let vertex = 'precision highp float;\n';
     const varyings = 'varying vec4 vD0; varying vec4 vD1; varying vec4 vT0; varying vec4 vT1; varying vec4 vT2; varying vec4 vT3;\n';
+    // D3D clip space keeps depth in 0..w, which WebGL expects in -w..w.
+    const clip = 'gl_Position = vec4(oPos.x, oPos.y, 2.0 * oPos.z - oPos.w, oPos.w);\n';
     if (plan.program) {
       const prog = plan.program;
       for (const [reg, off] of Object.entries(plan.attributes)) vertex += `attribute vec4 a_${off};\n#define v${reg} a_${off}\n`;
@@ -204,7 +226,7 @@ export class DevicePipeline {
       vertex += 'const vec4 cneg38 = vec4(1.0); const vec4 cneg37 = vec4(0.0);\n';
       vertex += varyings;
       vertex += 'void main() {\n' + prog.glsl + '\n';
-      vertex += 'gl_Position = vec4((oPos.xyz - cneg37.xyz) / cneg38.xyz * oPos.w, oPos.w);\n';
+      vertex += 'oPos = vec4((oPos.xyz - cneg37.xyz) / cneg38.xyz * oPos.w, oPos.w);\n' + clip;
       vertex += 'vD0 = oD0; vD1 = oD1; vT0 = oT0; vT1 = oT1; vT2 = oT2; vT3 = oT3;\n}\n';
     } else {
       const a = plan.attributes;
@@ -214,7 +236,7 @@ export class DevicePipeline {
       vertex += 'uniform mat4 u_wvp;\n';
       uniformNames.push('u_wvp');
       vertex += varyings;
-      vertex += `void main() {\ngl_Position = u_wvp * vec4(a_${a.position}, 1.0);\n`;
+      vertex += `void main() {\nvec4 oPos = u_wvp * vec4(a_${a.position}, 1.0);\n` + clip;
       // A vertex attribute the stream does not supply reads the register's reset value.
       vertex += a.diffuse !== undefined ? `vD0 = a_${a.diffuse};\n` : 'vD0 = vec4(0.0, 0.0, 0.0, 1.0);\n';
       vertex += 'vD1 = vec4(0.0, 0.0, 0.0, 1.0);\n';
@@ -315,3 +337,41 @@ export function describeGeometry(entry) {
   for (const a of entry.attributes) byOffset[a.offset] = a;
   return { format: entry.format, stride: entry.stride, attributes: entry.attributes, byOffset };
 }
+
+// Lays out a flexible vertex format the way D3D packs it: position, normal, colors, then texture coordinates
+export function describeFVF(fvf) {
+  if (fvf & FVF_XYZRHW) throw new Error(`transformed vertex format 0x${fvf.toString(16)} is not drawn by the pipeline`);
+  if (!(fvf & FVF_XYZ)) throw new Error(`vertex format 0x${fvf.toString(16)} carries no position`);
+  const attributes = [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3, source: 'float' }];
+  let offset = 12;
+  if (fvf & FVF_NORMAL) { attributes.push({ register: 2, semantic: 'normal', type: 'FLOAT3', offset, comps: 3, source: 'float' }); offset += 12; }
+  if (fvf & FVF_DIFFUSE) { attributes.push({ register: 3, semantic: 'diffuse', type: 'D3DCOLOR', offset, comps: 4, source: 'color' }); offset += 4; }
+  if (fvf & FVF_SPECULAR) { attributes.push({ register: 4, semantic: 'specular', type: 'D3DCOLOR', offset, comps: 4, source: 'color' }); offset += 4; }
+  const texCount = (fvf & FVF_TEXCOUNT_MASK) >> FVF_TEXCOUNT_SHIFT;
+  for (let i = 0; i < texCount; i++) { attributes.push({ register: 9 + i, semantic: 'texcoord' + i, type: 'FLOAT2', offset, comps: 2, source: 'float' }); offset += 8; }
+  return { format: fvf, stride: offset, attributes, byOffset: Object.fromEntries(attributes.map((a) => [a.offset, a])) };
+}
+
+// Indices that draw a D3D primitive range of a non indexed stream as triangles
+export function primitiveIndices(primitive, start, count) {
+  const out = [];
+  switch (primitive) {
+    case PT_TRIANGLELIST:
+      for (let i = 0; i < count * 3; i++) out.push(start + i);
+      break;
+    case PT_TRIANGLESTRIP:
+      for (let i = 0; i < count; i++) {
+        if (i % 2 === 0) out.push(start + i, start + i + 1, start + i + 2);
+        else out.push(start + i + 1, start + i, start + i + 2);
+      }
+      break;
+    case PT_TRIANGLEFAN:
+      for (let i = 0; i < count; i++) out.push(start, start + i + 1, start + i + 2);
+      break;
+    default:
+      throw new Error(`primitive type ${primitive} is not drawn by the pipeline`);
+  }
+  return out;
+}
+
+export { TS_VIEW, TS_PROJECTION, TS_WORLD };

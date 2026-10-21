@@ -197,12 +197,6 @@ func (pool *ExprPool) addNode(node map[string]any) int {
 	return len(pool.Nodes) - 1
 }
 
-// MarshalJSON lets statements embed expressions directly.
-func marshalExpr(e Expr) json.RawMessage {
-	b, _ := json.Marshal(exprJSON(e))
-	return b
-}
-
 // String renders an expression in C like notation for the dump output.
 func ExprString(e Expr) string {
 	switch v := e.(type) {

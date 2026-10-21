@@ -2,6 +2,8 @@ package xbe
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -19,6 +21,11 @@ type NodeType struct {
 	Fields map[int32]NodeField `json:"fields"`
 	Slots  []uint32            `json:"slots"`
 	Init   map[int32]NodeInit  `json:"init"`
+	// Construct is every path of the constructor, run on each new object of the class
+	Construct []PathJSON `json:"construct"`
+	// InitError says why the constructor could not be run for its defaults.
+	InitError string `json:"init_error,omitempty"`
+	ctorPaths []Path
 }
 
 // NodeField is one scene file field of a node class at its object offset.
@@ -40,10 +47,19 @@ type SphereBuffer struct {
 	Stride uint32 `json:"stride"`
 }
 
+// TextDraw is the render state the text draw routine sets before and after its glyph draw.
+type TextDraw struct {
+	VA     uint32      `json:"va"`
+	Before [][2]uint32 `json:"before"`
+	After  [][2]uint32 `json:"after"`
+}
+
 // DrawModel is the derived draw path from a shape node down to the indexed draw call.
 type DrawModel struct {
 	Slot           int32                 `json:"slot"`
 	TextureSlot    int32                 `json:"texture_slot"`
+	FieldSetSlot   int32                 `json:"field_set_slot"`
+	TextDraw       TextDraw              `json:"text_draw"`
 	KindCheck      uint32                `json:"kind_check"`
 	MeshLoaded     uint32                `json:"mesh_loaded"`
 	ShaderLookup   uint32                `json:"shader_lookup"`
@@ -63,7 +79,8 @@ type DrawModel struct {
 func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error) {
 	counts := map[uint32]int{}
 	sites := map[uint32][]registration{}
-	for _, fn := range d.Functions {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
 		ins := fn.Instructions
 		for i := range ins {
 			if ins[i].Inst.Op != x86asm.CALL {
@@ -104,8 +121,8 @@ func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error)
 		}
 	}
 	best, bestN := uint32(0), 0
-	for t, n := range counts {
-		if n > bestN {
+	for _, t := range slices.Sorted(maps.Keys(counts)) {
+		if n := counts[t]; n > bestN {
 			best, bestN = t, n
 		}
 	}
@@ -212,19 +229,33 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 	return types, nil
 }
 
-// Runs a constructor on a symbolic object and keeps the constants it stores into fields
-func (d *Disassembly) ctorInits(ex *Executor, ctor uint32) (map[int32]NodeInit, error) {
+// Runs a constructor on a symbolic object and keeps its paths and the constants it stores into fields
+func (d *Disassembly) ctorInits(ex *Executor, ctor uint32) (map[int32]NodeInit, []Path, error) {
 	sub := NewExecutorShared(ex)
-	paths, err := sub.Run(ctor, func(s *execState) {
-		s.regs[1] = Ptr{"this", 0}
-		s.pushArgs(Sym{"ctor.arg0"}, Sym{"ctor.arg1"}, Sym{"ctor.arg2"})
-	})
-	if err != nil {
-		return nil, err
+	sub.CopyUnknown = true
+	var paths []Path
+	// A helper the executor cannot follow, such as a string assignment, stays an opaque call.
+	for attempt := 0; ; attempt++ {
+		var err error
+		paths, err = sub.Run(ctor, func(s *execState) {
+			s.regs[1] = Ptr{"this", 0}
+			s.pushArgs(Sym{"ctor.arg0"}, Sym{"ctor.arg1"}, Sym{"ctor.arg2"})
+		})
+		if err == nil {
+			break
+		}
+		ee, ok := err.(*ExecError)
+		if !ok || len(ee.Frames) == 0 || attempt >= 8 {
+			return nil, nil, err
+		}
+		sub.Opaque[ee.Frames[len(ee.Frames)-1]] = true
 	}
 	inits := map[int32]NodeInit{}
 	for _, p := range paths {
 		for _, e := range p.Effects {
+			if e.Kind == "copy" && e.Base == "this" {
+				return nil, nil, fmt.Errorf("constructor %08X copies an unknown length into the object at +%X", ctor, e.Off)
+			}
 			if e.Kind != "store" || e.Base != "this" {
 				continue
 			}
@@ -244,7 +275,7 @@ func (d *Disassembly) ctorInits(ex *Executor, ctor uint32) (map[int32]NodeInit, 
 			inits[e.Off] = NodeInit{Size: e.Size, Value: c}
 		}
 	}
-	return inits, nil
+	return inits, paths, nil
 }
 
 // Finds the vtable slot of the type's method that calls the given helper directly
@@ -431,15 +462,48 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 			}
 		}
 	}
-	// Constructor defaults stand in for fields the scene files omit on the classes the draw reads.
-	for _, name := range append(chain, "Transform") {
+	// Constructor defaults stand in for fields the scene files omit, the draw chain's being required.
+	required := map[string]bool{"Transform": true}
+	for _, name := range chain {
+		required[name] = true
+	}
+	for _, name := range slices.Sorted(maps.Keys(types)) {
 		nt := types[name]
-		inits, err := d.ctorInits(ex, nt.Ctor)
+		if rootType(types, nt) != "Node" {
+			continue
+		}
+		inits, paths, err := d.ctorInits(ex, nt.Ctor)
 		if err != nil {
-			return fmt.Errorf("xbe: node type %s constructor: %w", name, err)
+			if required[name] {
+				return fmt.Errorf("xbe: node type %s constructor: %w", name, err)
+			}
+			nt.InitError = err.Error()
+			continue
 		}
 		nt.Init = inits
+		nt.Construct = pathsJSON(rm.Exprs, paths)
+		nt.ctorPaths = paths
 	}
+	// A scripted field write calls the class hook the material node overrides to drop its cached material
+	fieldSlot, err := fieldSetSlot(summarize, dm, matnode, types[matnode.Parent])
+	if err != nil {
+		return err
+	}
+	dm.FieldSetSlot = fieldSlot
+	for _, name := range chain {
+		nt := types[name]
+		if nt.Vtable == 0 {
+			continue
+		}
+		if err := summarize(nt.Slots[fieldSlot/4]); err != nil {
+			return err
+		}
+	}
+	textDraw, err := d.textDrawStates(types["Text"].Slots[slot/4], rm.Wrapper)
+	if err != nil {
+		return err
+	}
+	dm.TextDraw = textDraw
 	if err := summarize(bufferDraw); err != nil {
 		return err
 	}
@@ -476,14 +540,20 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 				if off, ok := thisField(e.Args[0]); ok {
 					dm.BufferFields["primitive"] = off
 				}
+				// The count derives from one field besides the primitive type that scales it.
 				set := map[string]bool{}
 				exprSyms(e.Args[1], set)
+				var counts []int32
 				for k := range set {
 					var off int32
-					if n, _ := fmt.Sscanf(k, "this@%X", &off); n == 1 {
-						dm.BufferFields["count"] = off
+					if n, _ := fmt.Sscanf(k, "this@%X", &off); n == 1 && off != dm.BufferFields["primitive"] {
+						counts = append(counts, off)
 					}
 				}
+				if len(counts) != 1 {
+					return fmt.Errorf("xbe: buffer draw %08X computes its vertex count from %d fields", bufferDraw, len(counts))
+				}
+				dm.BufferFields["count"] = counts[0]
 			case e.Fn == fmt.Sprintf("sub_%08X", rm.shaderLookup) && len(e.Args) == 1:
 				if off, ok := thisField(e.Args[0]); ok {
 					dm.BufferFields["format"] = off
@@ -545,6 +615,18 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	return nil
 }
 
+// Follows the parent chain to the class a node type descends from
+func rootType(types map[string]*NodeType, nt *NodeType) string {
+	for nt.Parent != "" {
+		parent := types[nt.Parent]
+		if parent == nil {
+			break
+		}
+		nt = parent
+	}
+	return nt.Name
+}
+
 // Returns the last immediates a function stores at two register relative offsets
 func lastFieldConstants(d *Disassembly, va uint32, formatOff, strideOff int32) (uint32, uint32) {
 	var format, stride uint32
@@ -591,18 +673,14 @@ func takesDescriptor(d *Disassembly, caller, callee uint32, descs map[uint32]boo
 	return false
 }
 
-// Records every immediate argument of a path that addresses a wide string in the image
+// Records every immediate argument of a path that addresses a wide string in the image, empty ones included
 func (rm *RenderModel) collectStrings(d *Disassembly, p Path, out map[uint32]string) {
 	var walk func(e Expr)
 	walk = func(e Expr) {
 		switch v := e.(type) {
 		case CallResult:
 			for _, a := range v.Args {
-				if c, ok := isConst(a); ok {
-					if s := d.Image.ReadUTF16(c); s != "" && isPrintable(s) {
-						out[c] = s
-					}
-				}
+				rm.collectString(d, a, out)
 				walk(a)
 			}
 		case Bin:
@@ -629,16 +707,148 @@ func (rm *RenderModel) collectStrings(d *Disassembly, p Path, out map[uint32]str
 	}
 	for _, e := range p.Effects {
 		if e.Value != nil {
+			rm.collectString(d, e.Value, out)
 			walk(e.Value)
 		}
 		for _, a := range e.Args {
-			if c, ok := isConst(a); ok {
-				if s := d.Image.ReadUTF16(c); s != "" && isPrintable(s) {
-					out[c] = s
-				}
-			}
+			rm.collectString(d, a, out)
 			walk(a)
 		}
 	}
 	walk(p.Return)
+}
+
+// Records a constant that addresses a wide string in the image, an empty one included
+func (rm *RenderModel) collectString(d *Disassembly, e Expr, out map[uint32]string) {
+	c, ok := isConst(e)
+	if !ok {
+		return
+	}
+	if s := d.Image.ReadUTF16(c); s != "" && isPrintable(s) {
+		out[c] = s
+	} else if w, ok := d.Image.ReadU16(c); ok && w == 0 && d.sectionOf(c) != nil {
+		out[c] = ""
+	}
+}
+
+// Finds the field write hook slot as the override comparing the descriptor word with own field offsets
+func fieldSetSlot(summarize func(uint32) error, dm *DrawModel, nt, parent *NodeType) (int32, error) {
+	own := map[uint32]bool{}
+	for off := range nt.Fields {
+		own[uint32(off)] = true
+	}
+	found := int32(-1)
+	var failed []string
+	for i, va := range nt.Slots {
+		if parent != nil && i < len(parent.Slots) && parent.Slots[i] == va {
+			continue
+		}
+		if err := summarize(va); err != nil {
+			failed = append(failed, err.Error())
+			continue
+		}
+		matches := false
+		for _, p := range dm.paths[va] {
+			for _, g := range p.Guards {
+				if comparesArgWord(g, own) {
+					matches = true
+				}
+			}
+		}
+		if !matches {
+			continue
+		}
+		if found >= 0 {
+			return 0, fmt.Errorf("xbe: node type %s compares field offsets in two methods (slots %d and %d)", nt.Name, found/4, i)
+		}
+		found = int32(i * 4)
+	}
+	if found < 0 {
+		return 0, fmt.Errorf("xbe: no %s method compares a field descriptor against its fields (%s)", nt.Name, strings.Join(failed, "; "))
+	}
+	return found, nil
+}
+
+// Reports whether an expression compares the first word of the first argument with one of the offsets
+func comparesArgWord(e Expr, offsets map[uint32]bool) bool {
+	switch v := e.(type) {
+	case Cond:
+		if argWord(v.A) {
+			if c, ok := isConst(v.B); ok && offsets[c] {
+				return true
+			}
+		}
+		if argWord(v.B) {
+			if c, ok := isConst(v.A); ok && offsets[c] {
+				return true
+			}
+		}
+		return comparesArgWord(v.A, offsets) || comparesArgWord(v.B, offsets)
+	case Not:
+		return comparesArgWord(v.A, offsets)
+	case Bin:
+		return comparesArgWord(v.A, offsets) || comparesArgWord(v.B, offsets)
+	case Un:
+		return comparesArgWord(v.A, offsets)
+	}
+	return false
+}
+
+// Reports whether an expression loads the word the first argument points at
+func argWord(e Expr) bool {
+	l, ok := e.(Load)
+	if !ok || l.Addr == nil || l.Off != 0 {
+		return false
+	}
+	switch a := l.Addr.(type) {
+	case Sym:
+		return a.Name == "arg0"
+	case Bin:
+		s, ok := a.A.(Sym)
+		c, isZero := isConst(a.B)
+		return ok && s.Name == "arg0" && a.Op == "add" && isZero && c == 0
+	}
+	return false
+}
+
+// Collects the wrapper render states the text draw sets, split at the virtual glyph draw after the first
+func (d *Disassembly) textDrawStates(va, wrapper uint32) (TextDraw, error) {
+	fn := d.Functions[va]
+	if fn == nil {
+		return TextDraw{}, fmt.Errorf("xbe: text draw %08X is not disassembled", va)
+	}
+	td := TextDraw{VA: va}
+	var imms []uint32
+	drawn := false
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op == x86asm.PUSH {
+			if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
+				imms = append(imms, uint32(imm))
+			} else {
+				imms = nil
+			}
+			continue
+		}
+		if in.Inst.Op == x86asm.CALL {
+			if resolveTarget(in) == wrapper {
+				if len(imms) < 2 {
+					return TextDraw{}, fmt.Errorf("xbe: text draw %08X calls the render state wrapper at %08X without two immediates", va, in.VA)
+				}
+				pair := [2]uint32{imms[len(imms)-1], imms[len(imms)-2]}
+				if drawn {
+					td.After = append(td.After, pair)
+				} else {
+					td.Before = append(td.Before, pair)
+				}
+			} else if _, indirect := in.Inst.Args[0].(x86asm.Mem); indirect && len(td.Before) > 0 {
+				drawn = true
+			}
+		}
+		imms = nil
+	}
+	if len(td.Before) == 0 || len(td.After) == 0 {
+		return TextDraw{}, fmt.Errorf("xbe: text draw %08X sets %d render states before and %d after its glyph draw", va, len(td.Before), len(td.After))
+	}
+	return td, nil
 }

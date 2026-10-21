@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf16"
 )
 
 // XOR keys for unscrambling the entry point and kernel thunk address.
@@ -288,6 +289,19 @@ func (img *Image) ReadUTF16(va uint32) string {
 		}
 	}
 	return string(result)
+}
+
+// ReadWideString reads a null-terminated UTF-16LE string at a virtual address, keeping every character.
+func (img *Image) ReadWideString(va uint32) string {
+	var units []uint16
+	for addr := va; ; addr += 2 {
+		c, ok := img.ReadU16(addr)
+		if !ok || c == 0 {
+			break
+		}
+		units = append(units, c)
+	}
+	return string(utf16.Decode(units))
 }
 
 // FindSection returns the section with the given name, or nil.

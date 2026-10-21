@@ -2,8 +2,10 @@ package xbe
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -17,6 +19,7 @@ type Effect struct {
 	Kind    string      `json:"kind"` // store or call
 	VA      uint32      `json:"va"`
 	Base    string      `json:"base,omitempty"`
+	Addr    Expr        `json:"-"` // symbolic address of a store through a pointer the path computed
 	Off     int32       `json:"off,omitempty"`
 	Size    int         `json:"size,omitempty"`
 	Value   Expr        `json:"-"`
@@ -35,9 +38,10 @@ type ArgBuffer struct {
 
 // Path is one complete execution of a function under a set of guards.
 type Path struct {
-	Guards  []Expr
-	Effects []Effect
-	Return  Expr
+	Guards   []Expr
+	GuardPos []int // effects recorded before each guard was taken
+	Effects  []Effect
+	Return   Expr
 }
 
 // RetAddr marks a return address pushed by an inlined call.
@@ -89,26 +93,29 @@ const (
 	maxPaths      = 512
 	maxInlineSize = 4000
 	maxFrameSteps = 2500
+	maxLoopUnroll = 4
 )
 
 type execState struct {
-	regs    [8]Expr
-	mem     map[memKey]memVal
-	fpu     []Expr
-	fl      flagState
-	fcmp    *fcmpRec
-	axFSW   bool
-	va      uint32
-	guards  []Expr
-	effects []Effect
-	steps   int
-	stack   []RetAddr
-	frames  []uint32  // entry addresses of inlined callees
-	fsteps  []int     // instructions executed inside each inlined frame
-	entry   [][8]Expr // register values at entry of the outer function and each inlined frame
-	pushes  int       // argument pushes since the last call boundary
-	pending *pendingCall
-	bound   map[string]Expr // atomic symbolic values fixed by earlier guards
+	regs     [8]Expr
+	mem      map[memKey]memVal
+	fpu      []Expr
+	fl       flagState
+	fcmp     *fcmpRec
+	axFSW    bool
+	va       uint32
+	guards   []Expr
+	guardPos []int
+	effects  []Effect
+	steps    int
+	stack    []RetAddr
+	frames   []uint32  // entry addresses of inlined callees
+	fsteps   []int     // instructions executed inside each inlined frame
+	entry    [][8]Expr // register values at entry of the outer function and each inlined frame
+	pushes   int       // argument pushes since the last call boundary
+	pending  *pendingCall
+	bound    map[string]Expr // atomic symbolic values fixed by earlier guards
+	loops    map[uint32]int  // backward symbolic branches taken per jump on this path
 }
 
 // pendingCall remembers the arguments popped for a call of unknown arity so a later
@@ -119,22 +126,24 @@ type pendingCall struct {
 
 // Executor runs x86 code symbolically over the disassembled image.
 type Executor struct {
-	d          *Disassembly
-	seq        int
-	paths      []Path
-	vtables    map[uint32]uint32 // global object pointer VA to vtable VA
-	symbols    map[uint32]*Symbol
-	nameOf     map[uint32]string
-	Opaque     map[uint32]bool // functions never inlined
-	ftol       map[uint32]bool
-	errCount   int
-	allocHook  func() Expr     // fresh object pointer for the allocator when set
-	written    map[uint32]bool // global bytes some instruction stores to directly
-	Results    map[uint32]Expr // fixed return values for opaque functions
-	Allocators map[uint32]bool // functions whose results are fresh objects
-	savePush   map[uint32]bool // push instructions that save callee owned registers
-	StepLimit  int             // per path instruction budget, zero means the default
-	FrameLimit int             // per inlined frame budget, negative disables the budget
+	d           *Disassembly
+	seq         int
+	paths       []Path
+	vtables     map[uint32]uint32 // global object pointer VA to vtable VA
+	symbols     map[uint32]*Symbol
+	nameOf      map[uint32]string
+	Opaque      map[uint32]bool // functions never inlined
+	ftol        map[uint32]bool
+	errCount    int
+	allocHook   func() Expr     // fresh object pointer for the allocator when set
+	CopyUnknown bool            // keeps rep movs of symbolic length as copy effects instead of failing
+	written     map[uint32]bool // global bytes some instruction stores to directly
+	Results     map[uint32]Expr // fixed return values for opaque functions
+	Allocators  map[uint32]bool // functions whose results are fresh objects
+	savePush    map[uint32]bool // push instructions that save callee owned registers
+	StepLimit   int             // per path instruction budget, zero means the default
+	FrameLimit  int             // per inlined frame budget, negative disables the budget
+	PathLimit   int             // paths one run may enumerate, zero means the default
 }
 
 // NewExecutor prepares an executor with symbol and vtable knowledge.
@@ -246,8 +255,8 @@ func isFtol(fn *Function) bool {
 // Finds functions invoked with a static object address in ecx
 func (ex *Executor) staticThisCallers() map[uint32]uint32 {
 	out := map[uint32]uint32{}
-	for _, fn := range ex.d.Functions {
-		ins := fn.Instructions
+	for _, va := range ex.d.functionVAs() {
+		ins := ex.d.Functions[va].Instructions
 		var ecxImm uint32
 		for i := range ins {
 			in := &ins[i]
@@ -299,8 +308,8 @@ func (ex *Executor) isDataAddress(va uint32) bool {
 // Maps globals holding heap objects to the vtable their constructor installs
 func (ex *Executor) resolveGlobalObjects() {
 	staticThis := ex.staticThisCallers()
-	for fnVA, fn := range ex.d.Functions {
-		ins := fn.Instructions
+	for _, fnVA := range ex.d.functionVAs() {
+		ins := ex.d.Functions[fnVA].Instructions
 		bases := map[x86asm.Reg]uint32{}
 		if t, ok := staticThis[fnVA]; ok {
 			bases[x86asm.ECX] = t
@@ -368,7 +377,8 @@ func (ex *Executor) resolveGlobalObjects() {
 func (ex *Executor) LearnGlobalObjects(allocators []uint32, opaque []uint32) {
 	callers := ex.staticThisCallers()
 	seen := map[uint32]bool{}
-	for fnVA, thisVA := range callers {
+	for _, fnVA := range slices.Sorted(maps.Keys(callers)) {
+		thisVA := callers[fnVA]
 		if seen[fnVA] {
 			continue
 		}
@@ -515,12 +525,17 @@ func (s *execState) clone() *execState {
 	for k, v := range s.bound {
 		n.bound[k] = v
 	}
+	n.loops = make(map[uint32]int, len(s.loops))
+	for k, v := range s.loops {
+		n.loops[k] = v
+	}
 	n.mem = make(map[memKey]memVal, len(s.mem))
 	for k, v := range s.mem {
 		n.mem[k] = v
 	}
 	n.fpu = append([]Expr(nil), s.fpu...)
 	n.guards = append([]Expr(nil), s.guards...)
+	n.guardPos = append([]int(nil), s.guardPos...)
 	n.effects = append([]Effect(nil), s.effects...)
 	n.stack = append([]RetAddr(nil), s.stack...)
 	n.frames = append([]uint32(nil), s.frames...)
@@ -614,7 +629,7 @@ func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 	a = asPtr(a)
 	p, ok := a.(Ptr)
 	if !ok {
-		s.effects = append(s.effects, Effect{Kind: "store", VA: va, Base: "?", Size: size, Value: v})
+		s.effects = append(s.effects, Effect{Kind: "store", VA: va, Base: "?", Addr: a, Size: size, Value: v})
 		return
 	}
 	// Overwrite overlapping entries, which can start up to 63 bytes before this store.
@@ -686,6 +701,15 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 		}
 		return mv.v
 	}
+	// An aligned word inside a vector or matrix value is that value's element.
+	if size == 4 {
+		for delta := int32(4); delta < 64; delta += 4 {
+			k := memKey{p.Base, p.Off - delta}
+			if mv, ok := s.mem[k]; ok && mv.size > 8 && p.Off+4 <= k.off+int32(mv.size) {
+				return Elem{mv.v, int(delta / 4)}
+			}
+		}
+	}
 	// Assemble from overlapping entries byte by byte when any exist.
 	var parts []Expr
 	anyHit := false
@@ -717,7 +741,7 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 	return out
 }
 
-// Reads memory never written on this path from the image or as a symbolic input
+// Reads memory never written on this path from the image or as a symbolic input a guard may have fixed
 func (ex *Executor) loadBacking(s *execState, p Ptr, size int) Expr {
 	if p.Base == "" {
 		va := uint32(p.Off)
@@ -743,13 +767,13 @@ func (ex *Executor) loadBacking(s *execState, p Ptr, size int) Expr {
 			}
 		}
 	}
-	return Load{Base: p.Base, Off: p.Off, Size: size}
+	return s.substitute(Load{Base: p.Base, Off: p.Off, Size: size})
 }
 
 // Reports whether an expression already carries a floating point value
 func isFloatExpr(e Expr) bool {
 	switch v := e.(type) {
-	case FConst:
+	case FConst, Elem:
 		return true
 	case Un:
 		switch v.Op {
@@ -787,9 +811,16 @@ func (ex *Executor) loadFloat(s *execState, a Expr, size int) Expr {
 			}
 		}
 		if size == 4 {
-			return mkUn("bits2f", ex.load(s, a, 4))
+			w := ex.load(s, a, 4)
+			if isFloatExpr(w) {
+				return w
+			}
+			return mkUn("bits2f", w)
 		}
 		return Un{"f64", Load{Base: p.Base, Off: p.Off, Size: 8}}
+	}
+	if size == 4 {
+		return mkUn("bits2f", Load{Addr: a, Size: 4})
 	}
 	return Un{"f64", Load{Addr: a, Size: size}}
 }
@@ -916,7 +947,11 @@ func (ex *Executor) run(s *execState) error {
 		if s.steps > limit {
 			return &ExecError{VA: s.va, Frames: s.frames, Limit: true, Err: fmt.Errorf("step limit exceeded"), Effects: s.effects}
 		}
-		if len(ex.paths) > maxPaths {
+		pathLimit := maxPaths
+		if ex.PathLimit > 0 {
+			pathLimit = ex.PathLimit
+		}
+		if len(ex.paths) > pathLimit {
 			return &ExecError{VA: s.va, Frames: s.frames, Limit: true, Err: fmt.Errorf("path limit exceeded"), Effects: s.effects}
 		}
 		in, ok := ex.d.InsnByVA[s.va]
@@ -978,10 +1013,11 @@ func (ex *Executor) doReturn(s *execState, clean int32) (bool, error) {
 
 // Finishes a path when the outermost return executes
 func (ex *Executor) finish(s *execState) {
-	ex.paths = append(ex.paths, Path{Guards: s.guards, Effects: s.effects, Return: s.regs[0]})
+	ex.paths = append(ex.paths, Path{Guards: s.guards, GuardPos: s.guardPos, Effects: s.effects, Return: s.regs[0]})
 }
 
-// Forks on a symbolic condition and continues both outcomes
+// Forks on a symbolic condition and continues both outcomes, a loop leaving after a few symbolic
+// iterations with its exit condition recorded as a guard
 func (ex *Executor) branch(s *execState, cond Expr, taken, fall uint32) (bool, error) {
 	if c, ok := isConst(cond); ok {
 		if c != 0 {
@@ -991,14 +1027,29 @@ func (ex *Executor) branch(s *execState, cond Expr, taken, fall uint32) (bool, e
 		}
 		return false, nil
 	}
+	if taken < s.va {
+		if s.loops == nil {
+			s.loops = map[uint32]int{}
+		}
+		s.loops[s.va]++
+		if s.loops[s.va] > maxLoopUnroll {
+			s.guards = append(s.guards, mkNot(cond))
+			s.guardPos = append(s.guardPos, len(s.effects))
+			s.bindFrom(mkNot(cond))
+			s.va = fall
+			return false, nil
+		}
+	}
 	alt := s.clone()
 	alt.guards = append(alt.guards, mkNot(cond))
+	alt.guardPos = append(alt.guardPos, len(alt.effects))
 	alt.bindFrom(mkNot(cond))
 	alt.va = fall
 	if err := ex.run(alt); err != nil {
 		return true, err
 	}
 	s.guards = append(s.guards, cond)
+	s.guardPos = append(s.guardPos, len(s.effects))
 	s.bindFrom(cond)
 	s.va = taken
 	return false, nil
@@ -1236,8 +1287,16 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		ex.setOperand(s, in, args[0], 1, c)
 	case x86asm.JMP:
 		if rel, ok := args[0].(x86asm.Rel); ok {
-			s.va = in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
-			return false, nil
+			target := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
+			if !ex.Opaque[target] {
+				s.va = target
+				return false, nil
+			}
+			// A tail jump into an opaque function is that function's call followed by the return.
+			if err := ex.call(s, in, 0); err != nil {
+				return false, err
+			}
+			return ex.doReturn(s, 0)
 		}
 		// An indirect jump is a tail call followed by a return to the caller.
 		if err := ex.call(s, in, 0); err != nil {
@@ -1282,9 +1341,25 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	case x86asm.MOVSD, x86asm.MOVSB, x86asm.MOVSW:
 		size := map[x86asm.Op]int{x86asm.MOVSD: 4, x86asm.MOVSB: 1, x86asm.MOVSW: 2}[op]
 		if hasRep(in) {
-			cnt, ok := isConst(s.getReg(x86asm.ECX))
-			if !ok {
+			count := s.getReg(x86asm.ECX)
+			cnt, ok := isConst(count)
+			if !ok && !ex.CopyUnknown {
 				return false, fmt.Errorf("rep movs with symbolic count")
+			}
+			if !ok {
+				// A copy of unknown length is kept as an effect on its destination, the pointers moving past it.
+				dst := asPtr(s.getReg(x86asm.EDI))
+				base := "?"
+				off := int32(0)
+				if p, isPtr := dst.(Ptr); isPtr {
+					base, off = p.Base, p.Off
+				}
+				s.effects = append(s.effects, Effect{Kind: "copy", VA: in.VA, Base: base, Off: off, Size: size, Value: count})
+				advance := mkBin("mul", count, IConst{uint32(size)})
+				s.setReg(x86asm.EDI, mkBin("add", s.getReg(x86asm.EDI), advance))
+				s.setReg(x86asm.ESI, mkBin("add", s.getReg(x86asm.ESI), advance))
+				s.setReg(x86asm.ECX, IConst{0})
+				break
 			}
 			for i := uint32(0); i < cnt; i++ {
 				ex.movs(s, in, size)
@@ -1618,7 +1693,7 @@ func calleeCleanupOf(fn *Function) int {
 }
 
 // XDK functions that return a handle through a pointer argument
-var outParams = map[string]int{"D3DDevice_CreateVertexShader": 2, "D3DDevice_CreateTexture": 6, "D3DDevice_CreatePixelShader": 1, "D3DDevice_CreateVertexBuffer": 3}
+var outParams = map[string]int{"D3DDevice_CreateVertexShader": 2, "D3DDevice_CreateTexture": 6, "D3DDevice_CreatePixelShader": 1, "D3DDevice_CreateVertexBuffer": 4, "D3DVertexBuffer_Lock": 3, "D3DXCreateMatrixStack": 1, "D3DDevice_GetBackBuffer": 2, "Direct3D_CreateDevice": 5}
 
 // Library helpers whose bodies are pure arithmetic and are executed instead of summarized
 var inlineSymbols = map[string]bool{"?0D3DXCOLOR": true}
@@ -1670,6 +1745,17 @@ func (ex *Executor) loadBlock(s *execState, a Expr, size int) Expr {
 	if elems != nil {
 		return Block{Elems: elems}
 	}
+	// A range some store on this path only partly covers is read word by word, the rest as entry values
+	if ex.writtenWithin(s, p, size) {
+		for off := int32(0); off < int32(size); off += 4 {
+			w := ex.load(s, Ptr{p.Base, p.Off + off}, 4)
+			if !isFloatExpr(w) && !isElem(w) {
+				w = mkUn("bits2f", w)
+			}
+			elems = append(elems, w)
+		}
+		return Block{Elems: elems}
+	}
 	if p.Base == "" && ex.isConstantGlobal(uint32(p.Off), size) {
 		for off := int32(0); off < int32(size); off += 4 {
 			v, _ := ex.d.Image.ReadU32(uint32(p.Off + off))
@@ -1678,6 +1764,16 @@ func (ex *Executor) loadBlock(s *execState, a Expr, size int) Expr {
 		return Block{Elems: elems}
 	}
 	return Load{Base: p.Base, Off: p.Off, Size: size}
+}
+
+// Reports whether any store on this path touches bytes of a range
+func (ex *Executor) writtenWithin(s *execState, p Ptr, size int) bool {
+	for k, mv := range s.mem {
+		if k.base == p.Base && k.off < p.Off+int32(size) && p.Off < k.off+int32(mv.size) {
+			return true
+		}
+	}
+	return false
 }
 
 // Records a call to code outside the analysis with its arguments
@@ -1757,7 +1853,7 @@ func (ex *Executor) opaqueCall(s *execState, in *Instruction, next uint32, name 
 		// Pointer arguments become the values they point at and the output buffer receives the result.
 		vals := make([]Expr, len(args))
 		for i, a := range args {
-			if c, ok := isConst(a); ok && ex.isDataAddress(c) {
+			if c, ok := isConst(a); ok && ex.d.sectionOf(c) != nil {
 				a = Ptr{"", int32(c)}
 				args[i] = a
 			}
@@ -1823,6 +1919,21 @@ func argBufferSize(name string, i int, result int) int {
 	case "D3DXMatrixInverse":
 		if i == 1 {
 			return 4
+		}
+	case "D3DXMatrixAffineTransformation":
+		switch i {
+		case 2, 4:
+			return 12
+		case 3:
+			return 16
+		}
+	case "D3DXMatrixRotationAxis", "D3DXQuaternionRotationAxis":
+		if i == 1 {
+			return 12
+		}
+	case "D3DXMatrixRotationQuaternion":
+		if i == 1 {
+			return 16
 		}
 	}
 	return result
