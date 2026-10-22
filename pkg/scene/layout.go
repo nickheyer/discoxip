@@ -89,16 +89,8 @@ func fvfLayout(format uint32) (Layout, error) {
 	return layout, nil
 }
 
-// LoadLayouts derives the render model from an executable and returns its vertex layouts.
-func LoadLayouts(xbePath string) (map[uint32]Layout, *xbe.RenderModel, error) {
-	img, err := xbe.Open(xbePath)
-	if err != nil {
-		return nil, nil, err
-	}
-	d, err := xbe.Disassemble(img)
-	if err != nil {
-		return nil, nil, err
-	}
+// LoadLayouts derives the render model from a disassembled executable and returns its vertex layouts.
+func LoadLayouts(d *xbe.Disassembly) (map[uint32]Layout, *xbe.RenderModel, error) {
 	rm, err := xbe.DeriveRender(d)
 	if err != nil {
 		return nil, nil, err

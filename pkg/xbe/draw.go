@@ -26,6 +26,7 @@ type NodeType struct {
 	// InitError says why the constructor could not be run for its defaults.
 	InitError string `json:"init_error,omitempty"`
 	ctorPaths []Path
+	factory   bool // the constructor allocates its own object
 }
 
 // NodeField is one scene file field of a node class at its object offset.
@@ -75,10 +76,87 @@ type DrawModel struct {
 	paths          map[uint32][]Path
 }
 
-// Finds the registrar as the function called with a name string, a size, a constructor and two tables
+// siteArgs are the constant arguments one call site passes, by stack slot and by register.
+type siteArgs struct {
+	stack []uint32
+	known []bool
+	regs  map[x86asm.Reg]uint32
+}
+
+// Evaluates the immediates a call site passes on the stack and in registers, tracking copies and zeroing within the function
+func (d *Disassembly) siteArguments(fn *Function, i int) siteArgs {
+	ins := fn.Instructions
+	regs := map[x86asm.Reg]uint32{}
+	var pushes []uint32
+	var known []bool
+	for j := 0; j < i; j++ {
+		in := &ins[j]
+		switch in.Inst.Op {
+		case x86asm.CALL, x86asm.RET, x86asm.JMP:
+			pushes, known = nil, nil
+			for _, r := range d.writtenBy(in) {
+				delete(regs, r)
+			}
+			continue
+		case x86asm.MOV:
+			if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
+					regs[wideRegister(dst)] = uint32(imm)
+				} else if src, ok := in.Inst.Args[1].(x86asm.Reg); ok {
+					if v, ok := regs[wideRegister(src)]; ok {
+						regs[wideRegister(dst)] = v
+					} else {
+						delete(regs, wideRegister(dst))
+					}
+				} else {
+					delete(regs, wideRegister(dst))
+				}
+			}
+			continue
+		case x86asm.XOR, x86asm.SUB:
+			if a, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+				if b, ok := in.Inst.Args[1].(x86asm.Reg); ok && a == b {
+					regs[wideRegister(a)] = 0
+					continue
+				}
+			}
+		case x86asm.PUSH:
+			if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
+				pushes, known = append(pushes, uint32(imm)), append(known, true)
+			} else if r, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+				v, ok := regs[wideRegister(r)]
+				pushes, known = append(pushes, v), append(known, ok)
+			} else {
+				pushes, known = append(pushes, 0), append(known, false)
+			}
+			continue
+		}
+		for _, r := range d.writtenBy(in) {
+			delete(regs, r)
+		}
+	}
+	out := siteArgs{regs: regs}
+	for k := len(pushes) - 1; k >= 0; k-- {
+		out.stack = append(out.stack, pushes[k])
+		out.known = append(out.known, known[k])
+	}
+	return out
+}
+
+// registrarSlot names where the registrar takes one of its arguments.
+type registrarSlot struct {
+	loc  argLocation
+	role string
+}
+
+// Finds the registrar as the function most often called with a class name, and how its call sites lay out the
+// name, size, constructor, parent descriptor, field table and descriptor arguments
 func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error) {
-	counts := map[uint32]int{}
-	sites := map[uint32][]registration{}
+	type site struct {
+		fn   *Function
+		args siteArgs
+	}
+	sites := map[uint32][]site{}
 	for _, va := range d.functionVAs() {
 		fn := d.Functions[va]
 		ins := fn.Instructions
@@ -86,65 +164,153 @@ func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error)
 			if ins[i].Inst.Op != x86asm.CALL {
 				continue
 			}
-			var pushes []uint32
-			var desc uint32
-			for j := i - 1; j >= 0 && j > i-9; j-- {
-				in := &ins[j]
-				if in.Inst.Op == x86asm.PUSH {
-					imm, ok := in.Inst.Args[0].(x86asm.Imm)
-					if !ok {
-						break
-					}
-					pushes = append(pushes, uint32(imm))
-				}
-				if in.Inst.Op == x86asm.MOV {
-					if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && r == x86asm.ECX {
-						if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-							desc = uint32(imm)
-						}
-					}
-				}
-				if in.Inst.Op == x86asm.CALL {
-					break
-				}
-			}
-			if len(pushes) != 5 || desc == 0 {
-				continue
-			}
-			name := d.Image.ReadUTF16(pushes[0])
-			if name == "" || !isPrintable(name) || d.Functions[pushes[2]] == nil {
-				continue
-			}
 			t := resolveTarget(&ins[i])
-			counts[t]++
-			sites[t] = append(sites[t], registration{name: name, size: pushes[1], ctor: pushes[2], parent: pushes[3], table: pushes[4], desc: desc})
+			if t == 0 || d.Functions[t] == nil {
+				continue
+			}
+			args := d.siteArguments(fn, i)
+			named, constructed := false, false
+			classify := func(v uint32) {
+				if d.namesObject(v) {
+					named = true
+				}
+				if c := d.Functions[v]; c != nil && c.Symbol == nil {
+					constructed = true
+				}
+			}
+			for k, v := range args.stack {
+				if args.known[k] {
+					classify(v)
+				}
+			}
+			for _, v := range args.regs {
+				classify(v)
+			}
+			if named && constructed {
+				sites[t] = append(sites[t], site{fn, args})
+			}
 		}
 	}
 	best, bestN := uint32(0), 0
-	for _, t := range slices.Sorted(maps.Keys(counts)) {
-		if n := counts[t]; n > bestN {
+	for _, t := range slices.Sorted(maps.Keys(sites)) {
+		if n := len(sites[t]); n > bestN {
 			best, bestN = t, n
 		}
 	}
 	if bestN < 8 {
 		return 0, nil, fmt.Errorf("xbe: no node type registrar found (best candidate registers %d types)", bestN)
 	}
-	return best, sites, nil
+	// The argument slots every site fills: stack slots the callee cleans and registers holding immediates at all sites.
+	stackArgs := calleeCleanupOf(d.Functions[best]) / 4
+	var slots []argLocation
+	for k := 0; k < stackArgs; k++ {
+		slots = append(slots, argLocation{Stack: k})
+	}
+	for _, r := range d.liveInRegisters(d.Functions[best]) {
+		slots = append(slots, argLocation{Reg: r})
+	}
+	value := func(st site, loc argLocation) (uint32, bool) {
+		if loc.Reg != 0 {
+			v, ok := st.args.regs[loc.Reg]
+			return v, ok
+		}
+		if loc.Stack < len(st.args.stack) {
+			return st.args.stack[loc.Stack], st.args.known[loc.Stack]
+		}
+		return 0, false
+	}
+	// Each slot is classified by what nearly every site passes in it, a stray value never settling the role.
+	roles := map[argLocation]string{}
+	for _, loc := range slots {
+		names, ctors, numbers, data, zero := 0, 0, 0, 0, 0
+		distinct := map[uint32]bool{}
+		fields := 0
+		known := 0
+		for _, st := range sites[best] {
+			v, ok := value(st, loc)
+			if !ok {
+				continue
+			}
+			known++
+			distinct[v] = true
+			switch {
+			case v == 0:
+				zero++
+			case d.sectionOf(v) == nil:
+				numbers++
+			case d.namesObject(v):
+				names++
+			case d.Functions[v] != nil && d.Functions[v].Symbol == nil:
+				ctors++
+			case d.isDataAddress(v):
+				data++
+				if np, ok := d.Image.ReadU32(v + 20); ok && d.namesObject(np) {
+					fields++
+				}
+			}
+		}
+		mostly := func(n int) bool { return known > 0 && n*10 >= known*9 }
+		switch {
+		case mostly(names):
+			roles[loc] = "name"
+		case mostly(ctors + zero):
+			roles[loc] = "ctor"
+		case mostly(numbers):
+			roles[loc] = "size"
+		case mostly(data+zero) && fields > 0:
+			roles[loc] = "table"
+		case mostly(data) && len(distinct) == known:
+			roles[loc] = "desc"
+		case mostly(data + zero):
+			roles[loc] = "parent"
+		}
+	}
+	byRole := map[string]argLocation{}
+	for loc, role := range roles {
+		if prev, dup := byRole[role]; dup {
+			return 0, nil, fmt.Errorf("xbe: registrar %08X takes its %s in both %s and %s", best, role, prev, loc)
+		}
+		byRole[role] = loc
+	}
+	for _, role := range []string{"name", "ctor", "size", "desc"} {
+		if _, ok := byRole[role]; !ok {
+			return 0, nil, fmt.Errorf("xbe: registrar %08X call sites reveal no %s argument (%v)", best, role, roles)
+		}
+	}
+	out := map[uint32][]registration{}
+	for _, st := range sites[best] {
+		get := func(role string) uint32 {
+			loc, ok := byRole[role]
+			if !ok {
+				return 0
+			}
+			v, _ := value(st, loc)
+			return v
+		}
+		name := d.Image.ReadUTF16(get("name"))
+		if name == "" || !isPrintable(name) || d.Functions[get("ctor")] == nil {
+			continue
+		}
+		out[best] = append(out[best], registration{name: name, size: get("size"), ctor: get("ctor"), parent: get("parent"), table: get("table"), desc: get("desc")})
+	}
+	return best, out, nil
 }
 
+// registration is one node class the executable registers with its layout tables.
 type registration struct {
 	name                            string
 	size, ctor, parent, table, desc uint32
 }
 
-// Follows an allocation thunk to the constructor it tail jumps into
+// Follows an allocation thunk to the constructor it tail jumps into, a jump within the function being a branch
 func (d *Disassembly) realCtor(va uint32) uint32 {
-	for _, in := range d.Functions[va].Instructions {
+	fn := d.Functions[va]
+	for _, in := range fn.Instructions {
 		if in.Inst.Op != x86asm.JMP {
 			continue
 		}
 		t := resolveTarget(&in)
-		if t == 0 || t == va || d.InsnByVA[t] == nil {
+		if t == 0 || t == va || d.InsnByVA[t] == nil || (t > va && t < va+uint32(fn.Size)) {
 			continue
 		}
 		if d.Functions[t] == nil {
@@ -159,11 +325,21 @@ func (d *Disassembly) realCtor(va uint32) uint32 {
 	return va
 }
 
-// Reads the vtable entries that point at code
+// Reads the vtable entries that point at code, stopping where the next constructed vtable begins
 func (d *Disassembly) vtableSlots(vt uint32) []uint32 {
+	end := uint32(0)
+	for _, info := range d.constructorInfo() {
+		if info.vtable > vt && (end == 0 || info.vtable < end) {
+			end = info.vtable
+		}
+	}
 	var out []uint32
 	for s := uint32(0); s < 64; s++ {
-		v, ok := d.Image.ReadU32(vt + 4*s)
+		addr := vt + 4*s
+		if end != 0 && addr >= end {
+			break
+		}
+		v, ok := d.Image.ReadU32(addr)
 		if !ok || d.InsnByVA[v] == nil {
 			break
 		}
@@ -199,7 +375,20 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 			}
 		}
 		if fn := d.Functions[nt.Ctor]; fn != nil {
-			nt.Vtable = ctorVtable(d, fn)
+			nt.Vtable, _ = ctorShape(d, fn)
+			if nt.Vtable == 0 {
+				// A factory allocates the object itself and installs the vtable on the allocation.
+				for _, c := range d.constructions(fn) {
+					if c.vtable == 0 {
+						continue
+					}
+					if nt.Vtable != 0 && nt.Vtable != c.vtable {
+						return nil, fmt.Errorf("xbe: node type %s factory %08X installs vtables %08X and %08X", r.name, nt.Ctor, nt.Vtable, c.vtable)
+					}
+					nt.Vtable = c.vtable
+					nt.factory = true
+				}
+			}
 		}
 		if nt.Vtable != 0 {
 			nt.Slots = d.vtableSlots(nt.Vtable)
@@ -229,17 +418,36 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 	return types, nil
 }
 
-// Runs a constructor on a symbolic object and keeps its paths and the constants it stores into fields
-func (d *Disassembly) ctorInits(ex *Executor, ctor uint32) (map[int32]NodeInit, []Path, error) {
+// Runs a constructor on a symbolic object and keeps its paths and the constants it stores into fields, a factory
+// receiving that object from its allocator
+func (d *Disassembly) ctorInits(ex *Executor, nt *NodeType, allocators []uint32) (map[int32]NodeInit, []Path, error) {
+	ctor := nt.Ctor
 	sub := NewExecutorShared(ex)
 	sub.CopyUnknown = true
+	if nt.factory {
+		sub.Allocators = map[uint32]bool{}
+		for _, va := range allocators {
+			sub.Opaque[va] = true
+			sub.Allocators[va] = true
+		}
+		allocated := 0
+		sub.allocHook = func() Expr {
+			allocated++
+			if allocated == 1 {
+				return Ptr{"this", 0}
+			}
+			return Ptr{fmt.Sprintf("new%d", allocated), 0}
+		}
+	}
 	var paths []Path
 	// A helper the executor cannot follow, such as a string assignment, stays an opaque call.
 	for attempt := 0; ; attempt++ {
 		var err error
 		paths, err = sub.Run(ctor, func(s *execState) {
-			s.regs[1] = Ptr{"this", 0}
-			s.pushArgs(Sym{"ctor.arg0"}, Sym{"ctor.arg1"}, Sym{"ctor.arg2"})
+			if !nt.factory {
+				s.regs[1] = Ptr{"this", 0}
+			}
+			sub.seedArgs(s, ctor, "ctor.arg", 3)
 		})
 		if err == nil {
 			break
@@ -341,12 +549,25 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		}
 	}
 	dm := &DrawModel{Functions: map[uint32][]PathJSON{}, Strings: map[uint32]string{}, paths: map[uint32][]Path{}}
-	slot, ok := d.slotCalling(shape, rm.Accessor.Function)
-	if !ok {
-		return fmt.Errorf("xbe: no Shape method calls the format accessor %08X", rm.Accessor.Function)
+	// The draw slot is the one whose Shape method records the mesh being drawn in the current mesh global.
+	slot, err := d.shapeDrawSlot(shape, rm.Accessor.Global)
+	if err != nil {
+		return err
+	}
+	if rm.Accessor.Function != 0 {
+		if viaAccessor, ok := d.slotCalling(shape, rm.Accessor.Function); !ok || viaAccessor != slot {
+			return fmt.Errorf("xbe: the Shape stores the current mesh in slot %d but calls the format accessor in slot %d", slot/4, viaAccessor/4)
+		}
 	}
 	dm.Slot = slot
 	shapeDraw := shape.Slots[slot/4]
+	// The draw chain's shader lookup is the helper whose result the shape draw hands to the vertex shader setter.
+	if lookup, ok := d.resultFeeding(shapeDraw, "D3DDevice_SetVertexShader"); ok {
+		if rm.shaderLookup != 0 && rm.shaderLookup != lookup {
+			return fmt.Errorf("xbe: the shape draw feeds the vertex shader from %08X but the format lookup is %08X", lookup, rm.shaderLookup)
+		}
+		rm.shaderLookup = lookup
+	}
 	dm.ShaderLookup = rm.shaderLookup
 	descs := map[uint32]bool{}
 	for _, nt := range types {
@@ -360,15 +581,19 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	}
 	for _, t := range d.plainCallees(shapeDraw) {
 		switch {
-		case t == rm.Accessor.Function || t == rm.shaderLookup:
+		case (t == rm.Accessor.Function || t == rm.shaderLookup) && t != 0:
 		case meshCallees[t]:
 			dm.MeshLoaded = t
 		case takesDescriptor(d, shapeDraw, t, descs):
 			dm.KindCheck = t
 		}
 	}
-	if dm.KindCheck == 0 || dm.MeshLoaded == 0 {
-		return fmt.Errorf("xbe: shape draw %08X does not call a kind check and a mesh loaded check (kind %08X loaded %08X)", shapeDraw, dm.KindCheck, dm.MeshLoaded)
+	// With the kind check inlined, the shape draw compares a registered descriptor itself.
+	if dm.KindCheck == 0 && !comparesDescriptor(d, shapeDraw, descs) {
+		return fmt.Errorf("xbe: shape draw %08X neither calls a kind check nor compares a type descriptor", shapeDraw)
+	}
+	if dm.MeshLoaded == 0 {
+		return fmt.Errorf("xbe: shape draw %08X does not call a mesh loaded check", shapeDraw)
 	}
 	matDraw := matnode.Slots[slot/4]
 	for _, t := range d.plainCallees(matDraw) {
@@ -380,7 +605,10 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		}
 	}
 	if dm.MaterialLookup == 0 {
-		return fmt.Errorf("xbe: material node draw %08X never looks its material up", matDraw)
+		// With the lookup inlined, the material node draw searches the registry the factory filled.
+		if ms.Registry == nil || !searchesRegistry(d, matDraw, ms.Registry.Base) {
+			return fmt.Errorf("xbe: material node draw %08X never looks its material up", matDraw)
+		}
 	}
 	// The buffer object is constructed with the vtable whose first method issues the indexed draw.
 	for _, vt := range d.findConstructors() {
@@ -417,7 +645,7 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		}
 		paths, _, _, err := sub.RunWithRetries(va, func(s *execState) {
 			s.regs[1] = Ptr{"this", 0}
-			s.pushArgs(Sym{"arg0"}, Sym{"arg1"})
+			sub.seedArgs(s, va, "arg", 2)
 		}, 8)
 		if err != nil {
 			return fmt.Errorf("draw path %08X: %w", va, err)
@@ -430,6 +658,14 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	appearanceDraw := appearance.Slots[slot/4]
 	if err := summarize(appearanceDraw); err != nil {
 		return err
+	}
+	// An unidentified library routine the appearance hands a virtual getter's result to is the texture setter.
+	if setter, ok := usageOf(dm.paths[appearanceDraw], d, "D3DDevice_SetTexture"); ok {
+		d.nameByUsage(setter, "D3DDevice_SetTexture")
+		delete(dm.paths, appearanceDraw)
+		if err := summarize(appearanceDraw); err != nil {
+			return err
+		}
 	}
 	for _, p := range dm.paths[appearanceDraw] {
 		for _, e := range p.Effects {
@@ -472,7 +708,7 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		if rootType(types, nt) != "Node" {
 			continue
 		}
-		inits, paths, err := d.ctorInits(ex, nt.Ctor)
+		inits, paths, err := d.ctorInits(ex, nt, append([]uint32{ms.AllocatorVA}, ms.Allocators...))
 		if err != nil {
 			if required[name] {
 				return fmt.Errorf("xbe: node type %s constructor: %w", name, err)
@@ -499,7 +735,7 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 			return err
 		}
 	}
-	textDraw, err := d.textDrawStates(types["Text"].Slots[slot/4], rm.Wrapper)
+	textDraw, err := rm.textDrawStates(d, types["Text"].Slots[slot/4])
 	if err != nil {
 		return err
 	}
@@ -507,8 +743,10 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	if err := summarize(bufferDraw); err != nil {
 		return err
 	}
-	if err := summarize(rm.shaderLookup); err != nil {
-		return err
+	if rm.shaderLookup != 0 {
+		if err := summarize(rm.shaderLookup); err != nil {
+			return err
+		}
 	}
 	// The buffer object's fields are the ones its draw hands to the stream, index and draw calls.
 	dm.BufferFields = map[string]int32{}
@@ -554,7 +792,12 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 					return fmt.Errorf("xbe: buffer draw %08X computes its vertex count from %d fields", bufferDraw, len(counts))
 				}
 				dm.BufferFields["count"] = counts[0]
-			case e.Fn == fmt.Sprintf("sub_%08X", rm.shaderLookup) && len(e.Args) == 1:
+			case rm.shaderLookup != 0 && e.Fn == fmt.Sprintf("sub_%08X", rm.shaderLookup) && len(e.Args) == 1:
+				if off, ok := thisField(e.Args[0]); ok {
+					dm.BufferFields["format"] = off
+				}
+			case e.Fn == "D3DDevice_SetVertexShader" && len(e.Args) == 1:
+				// Without a fixed function lookup the buffer hands its format to the device as the shader itself.
 				if off, ok := thisField(e.Args[0]); ok {
 					dm.BufferFields["format"] = off
 				}
@@ -566,30 +809,45 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 			return fmt.Errorf("xbe: buffer draw %08X does not reveal the %s field", bufferDraw, name)
 		}
 	}
-	// The loaded check calls the class's load slot, and the sphere's load builds a buffer whose
-	// format and stride are the last constants its builder stores into those fields.
+	// The load slot is the virtual call on the mesh whose Sphere override stores a buffer format and stride
 	if err := summarize(dm.MeshLoaded); err != nil {
 		return err
 	}
-	for _, p := range dm.paths[dm.MeshLoaded] {
-		for _, e := range p.Effects {
-			if e.Kind == "call" && strings.HasPrefix(e.Fn, "vcall@") {
-				fmt.Sscanf(e.Fn, "vcall@%X", &dm.LoadSlot)
-			}
+	meshField, ok := fieldStoredTo(dm.paths[shapeDraw], rm.Accessor.Global)
+	if !ok {
+		return fmt.Errorf("xbe: shape draw %08X stores no field of its own into the current mesh global %08X", shapeDraw, rm.Accessor.Global)
+	}
+	onMesh := map[int32]bool{}
+	for _, p := range dm.paths[shapeDraw] {
+		for _, s := range virtualSlotsOn(p, Load{Base: "this", Off: meshField, Size: 4}) {
+			onMesh[s] = true
 		}
 	}
-	if dm.LoadSlot == 0 {
-		return fmt.Errorf("xbe: mesh loaded check %08X makes no virtual load call", dm.MeshLoaded)
+	for _, p := range dm.paths[dm.MeshLoaded] {
+		for _, s := range virtualSlotsOn(p, Ptr{"this", 0}) {
+			onMesh[s] = true
+		}
 	}
-	sphereLoad := types["Sphere"].Slots[dm.LoadSlot/4]
-	for _, t := range d.plainCallees(sphereLoad) {
-		format, stride := lastFieldConstants(d, t, dm.BufferFields["format"], dm.BufferFields["stride"])
-		if format != 0 {
+	sphere := types["Sphere"]
+	for _, s := range slices.Sorted(maps.Keys(onMesh)) {
+		if int(s/4) >= len(sphere.Slots) {
+			continue
+		}
+		load := sphere.Slots[s/4]
+		for _, t := range append([]uint32{load}, d.plainCallees(load)...) {
+			format, stride := lastFieldConstants(d, t, dm.BufferFields["format"], dm.BufferFields["stride"])
+			if format == 0 || stride == 0 {
+				continue
+			}
+			if dm.LoadSlot != 0 && dm.LoadSlot != s {
+				return fmt.Errorf("xbe: Sphere builds its buffer in both slot %d and slot %d", dm.LoadSlot/4, s/4)
+			}
+			dm.LoadSlot = s
 			dm.Sphere = SphereBuffer{Format: format, Stride: stride}
 		}
 	}
-	if dm.Sphere.Format == 0 || dm.Sphere.Stride == 0 {
-		return fmt.Errorf("xbe: sphere load %08X stores no buffer format and stride", sphereLoad)
+	if dm.LoadSlot == 0 {
+		return fmt.Errorf("xbe: no virtual call on the mesh (slots %v) builds the sphere buffer", slices.Sorted(maps.Keys(onMesh)))
 	}
 	// The image texture getter returns the field its loader fills with the device texture.
 	imageGetter := types["ImageTexture"].Slots[dm.TextureSlot/4]
@@ -613,6 +871,36 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	}
 	rm.Draw = dm
 	return nil
+}
+
+// Finds the object field whose value the paths store into a global
+func fieldStoredTo(paths []Path, global uint32) (int32, bool) {
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "store" || e.Base != "" || uint32(e.Off) != global {
+				continue
+			}
+			if l, ok := e.Value.(Load); ok && l.Base == "this" && l.Addr == nil {
+				return l.Off, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// Lists the vtable slots a path calls on an object
+func virtualSlotsOn(p Path, object Expr) []int32 {
+	var out []int32
+	for _, e := range p.Effects {
+		if e.Kind != "call" || !strings.HasPrefix(e.Fn, "vcall@") || len(e.Args) == 0 || !sameExpr(e.Args[0], object) {
+			continue
+		}
+		var slot int32
+		if n, _ := fmt.Sscanf(e.Fn, "vcall@%X", &slot); n == 1 {
+			out = append(out, slot)
+		}
+	}
+	return out
 }
 
 // Follows the parent chain to the class a node type descends from
@@ -652,21 +940,23 @@ func lastFieldConstants(d *Disassembly, va uint32, formatOff, strideOff int32) (
 	return format, stride
 }
 
-// Reports whether a call site in caller passes a registered type descriptor to callee
+// Reports whether a call site in caller passes a registered type descriptor to callee, on the stack or in a register
 func takesDescriptor(d *Disassembly, caller, callee uint32, descs map[uint32]bool) bool {
-	ins := d.Functions[caller].Instructions
+	fn := d.Functions[caller]
+	ins := fn.Instructions
 	for i := range ins {
 		if ins[i].Inst.Op != x86asm.CALL || resolveTarget(&ins[i]) != callee {
 			continue
 		}
-		for j := i - 1; j >= 0 && j > i-6; j-- {
-			if ins[j].Inst.Op == x86asm.PUSH {
-				if imm, ok := ins[j].Inst.Args[0].(x86asm.Imm); ok && descs[uint32(imm)] {
-					return true
-				}
+		args := d.siteArguments(fn, i)
+		for k, v := range args.stack {
+			if args.known[k] && descs[v] {
+				return true
 			}
-			if ins[j].Inst.Op == x86asm.CALL {
-				break
+		}
+		for _, v := range args.regs {
+			if descs[v] {
+				return true
 			}
 		}
 	}
@@ -811,44 +1101,244 @@ func argWord(e Expr) bool {
 	return false
 }
 
-// Collects the wrapper render states the text draw sets, split at the virtual glyph draw after the first
-func (d *Disassembly) textDrawStates(va, wrapper uint32) (TextDraw, error) {
+// Collects the render states the text draw sets, split at the virtual glyph draw after the first, whether it
+// calls the wrapper or sets them through the XDK routines and state tables the wrapper inlined
+func (rm *RenderModel) textDrawStates(d *Disassembly, va uint32) (TextDraw, error) {
 	fn := d.Functions[va]
 	if fn == nil {
 		return TextDraw{}, fmt.Errorf("xbe: text draw %08X is not disassembled", va)
 	}
 	td := TextDraw{VA: va}
-	var imms []uint32
+	methods := map[uint32]uint32{}
+	for idx, name := range rm.StateNames {
+		for method, mname := range rm.NVStateNames {
+			if sameStateName(mname, name) {
+				methods[method] = idx
+			}
+		}
+	}
+	names := map[string]uint32{}
+	for idx, name := range rm.StateNames {
+		names[strings.ToUpper(strings.ReplaceAll(name, "_", ""))] = idx
+	}
+	layout, _ := d.deviceState()
 	drawn := false
-	for i := range fn.Instructions {
-		in := &fn.Instructions[i]
-		if in.Inst.Op == x86asm.PUSH {
-			if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
-				imms = append(imms, uint32(imm))
-			} else {
-				imms = nil
-			}
-			continue
+	record := func(pair [2]uint32) {
+		if drawn {
+			td.After = append(td.After, pair)
+		} else {
+			td.Before = append(td.Before, pair)
 		}
-		if in.Inst.Op == x86asm.CALL {
-			if resolveTarget(in) == wrapper {
-				if len(imms) < 2 {
-					return TextDraw{}, fmt.Errorf("xbe: text draw %08X calls the render state wrapper at %08X without two immediates", va, in.VA)
+	}
+	visited := map[uint32]bool{}
+	helpers := false
+	var walk func(fn *Function, depth int) error
+	walk = func(fn *Function, depth int) error {
+		ins := fn.Instructions
+		for i := range ins {
+			in := &ins[i]
+			// A deferred state the wrapper inlined is a constant store into the XDK's state table.
+			if in.Inst.Op == x86asm.MOV && layout != nil && layout.renders != nil {
+				if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base == 0 && m.Index == 0 {
+					if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
+						if _, state, ok := layout.renders.locate(uint32(m.Disp)); ok {
+							record([2]uint32{state, uint32(imm)})
+						}
+					}
 				}
-				pair := [2]uint32{imms[len(imms)-1], imms[len(imms)-2]}
-				if drawn {
-					td.After = append(td.After, pair)
-				} else {
-					td.Before = append(td.Before, pair)
+				continue
+			}
+			if in.Inst.Op != x86asm.CALL {
+				continue
+			}
+			if _, indirect := in.Inst.Args[0].(x86asm.Mem); indirect {
+				if len(td.Before) > 0 {
+					drawn = true
 				}
-			} else if _, indirect := in.Inst.Args[0].(x86asm.Mem); indirect && len(td.Before) > 0 {
-				drawn = true
+				continue
+			}
+			target := resolveTarget(in)
+			callee := d.Functions[target]
+			if callee == nil {
+				continue
+			}
+			// A dashboard helper the draw calls sets its states at the call's position.
+			if helpers && callee.Symbol == nil && target != rm.Wrapper && !visited[target] && depth < 2 && !d.inLibrary(target) {
+				visited[target] = true
+				if err := walk(callee, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+			args := d.siteArguments(fn, i)
+			value := func(loc argLocation) (uint32, bool) {
+				if loc.Reg != 0 {
+					v, ok := args.regs[loc.Reg]
+					return v, ok
+				}
+				if loc.Stack < len(args.stack) {
+					return args.stack[loc.Stack], args.known[loc.Stack]
+				}
+				return 0, false
+			}
+			switch {
+			case target == rm.Wrapper:
+				st, ok1 := value(rm.wrapperState)
+				v, ok2 := value(rm.wrapperValue)
+				if !ok1 || !ok2 {
+					return fmt.Errorf("xbe: text draw %08X calls the render state wrapper at %08X without constant arguments", va, in.VA)
+				}
+				record([2]uint32{st, v})
+			case callee.Symbol != nil && callee.Symbol.Name == "D3DDevice_SetRenderState_Simple":
+				m, ok1 := args.regs[x86asm.ECX]
+				v, ok2 := args.regs[x86asm.EDX]
+				st, known := methods[m]
+				if !ok1 || !ok2 || !known {
+					return fmt.Errorf("xbe: text draw %08X sets a simple render state at %08X without a constant method and value", va, in.VA)
+				}
+				record([2]uint32{st, v})
+			case rm.setterStates[target] != 0:
+				// A complex state's setter is known from the index the wrapper dispatches it under.
+				v, ok := value(argLocation{Stack: 0})
+				if !ok {
+					return fmt.Errorf("xbe: text draw %08X calls the setter of state %d at %08X without a constant value", va, rm.setterStates[target], in.VA)
+				}
+				record([2]uint32{rm.setterStates[target], v})
+			case callee.Symbol != nil && strings.HasPrefix(callee.Symbol.Name, "D3DDevice_SetRenderState_"):
+				st, known := names[strings.ToUpper(strings.TrimPrefix(callee.Symbol.Name, "D3DDevice_SetRenderState_"))]
+				v, ok := value(argLocation{Stack: 0})
+				if !known || !ok {
+					return fmt.Errorf("xbe: text draw %08X calls %s at %08X without a constant value", va, callee.Symbol.Name, in.VA)
+				}
+				record([2]uint32{st, v})
 			}
 		}
-		imms = nil
+		return nil
+	}
+	// The draw sets the states itself, or else through the helpers it calls.
+	for _, helpers = range []bool{false, true} {
+		td.Before, td.After, drawn = nil, nil, false
+		visited = map[uint32]bool{va: true}
+		if err := walk(fn, 0); err != nil {
+			return TextDraw{}, err
+		}
+		if len(td.Before) > 0 && len(td.After) > 0 {
+			break
+		}
 	}
 	if len(td.Before) == 0 || len(td.After) == 0 {
 		return TextDraw{}, fmt.Errorf("xbe: text draw %08X sets %d render states before and %d after its glyph draw", va, len(td.Before), len(td.After))
 	}
 	return td, nil
+}
+
+// Finds the vtable slot whose Shape method stores the mesh it draws into the current mesh global
+func (d *Disassembly) shapeDrawSlot(shape *NodeType, meshGlobal uint32) (int32, error) {
+	var found []int32
+	for i, va := range shape.Slots {
+		fn := d.Functions[va]
+		if fn == nil {
+			continue
+		}
+		for j := range fn.Instructions {
+			if storesAbsolute(&fn.Instructions[j], meshGlobal, 4) {
+				found = append(found, int32(4*i))
+				break
+			}
+		}
+	}
+	if len(found) != 1 {
+		return 0, fmt.Errorf("xbe: %d Shape methods store the current mesh global %08X (%v)", len(found), meshGlobal, found)
+	}
+	return found[0], nil
+}
+
+// Reports whether a function compares a value against a registered type descriptor
+func comparesDescriptor(d *Disassembly, va uint32, descs map[uint32]bool) bool {
+	for _, in := range d.Functions[va].Instructions {
+		if in.Inst.Op != x86asm.CMP || argCount(&in) != 2 {
+			continue
+		}
+		if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && descs[uint32(imm)] {
+			return true
+		}
+	}
+	return false
+}
+
+// Finds the direct callee of a function whose result is pushed to a named library function right after it returns
+func (d *Disassembly) resultFeeding(va uint32, symbol string) (uint32, bool) {
+	ins := d.Functions[va].Instructions
+	found := uint32(0)
+	for i := range ins {
+		if ins[i].Inst.Op != x86asm.CALL {
+			continue
+		}
+		callee := d.Functions[resolveTarget(&ins[i])]
+		if callee == nil || callee.Symbol == nil || callee.Symbol.Name != symbol {
+			continue
+		}
+		for j := i - 1; j >= 0 && j > i-4; j-- {
+			if ins[j].Inst.Op == x86asm.CALL {
+				if t := resolveTarget(&ins[j]); t != 0 && d.Functions[t] != nil && d.Functions[t].Symbol == nil {
+					found = t
+				}
+				break
+			}
+			if ins[j].Inst.Op != x86asm.PUSH {
+				break
+			}
+			if r, ok := ins[j].Inst.Args[0].(x86asm.Reg); !ok || r != x86asm.EAX {
+				break
+			}
+		}
+	}
+	return found, found != 0
+}
+
+// Reports whether a function hands the material registry to a library search routine
+func searchesRegistry(d *Disassembly, va, base uint32) bool {
+	fn := d.Functions[va]
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op != x86asm.CALL {
+			continue
+		}
+		callee := d.Functions[resolveTarget(in)]
+		if callee == nil || callee.Symbol == nil {
+			continue
+		}
+		args := d.siteArguments(fn, i)
+		for k, v := range args.stack {
+			if args.known[k] && v == base {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Finds the unnamed library routine the paths pass a virtual getter's result to, when the named routine is absent
+func usageOf(paths []Path, d *Disassembly, name string) (uint32, bool) {
+	found := uint32(0)
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "call" {
+				continue
+			}
+			if e.Fn == name {
+				return 0, false
+			}
+			var va uint32
+			if !scanSub(e.Fn, &va) || !d.inLibrary(va) {
+				continue
+			}
+			for _, a := range e.Args {
+				if cr, ok := a.(CallResult); ok && strings.HasPrefix(cr.Fn, "vcall@") {
+					found = va
+				}
+			}
+		}
+	}
+	return found, found != 0
 }

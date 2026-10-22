@@ -296,6 +296,10 @@ func mkBin(op string, a, b Expr) Expr {
 				return IConst{av >> (bv & 31)}
 			case "sar":
 				return IConst{uint32(int32(av) >> (bv & 31))}
+			case "imulhi":
+				return IConst{uint32((int64(int32(av)) * int64(int32(bv))) >> 32)}
+			case "mulhi":
+				return IConst{uint32((uint64(av) * uint64(bv)) >> 32)}
 			}
 		}
 	}
@@ -333,7 +337,7 @@ func mkBin(op string, a, b Expr) Expr {
 			return a
 		}
 	}
-	if (op == "and" || op == "or") && ExprString(a) == ExprString(b) {
+	if (op == "and" || op == "or") && sameExpr(a, b) {
 		return a
 	}
 	if op == "shr" {
@@ -371,6 +375,9 @@ func mkBin(op string, a, b Expr) Expr {
 	return Bin{op, a, b}
 }
 
+// Float operations with two operands
+var floatBinOps = map[string]bool{"fadd": true, "fsub": true, "fmul": true, "fdiv": true, "fmin": true, "fmax": true, "fmod": true, "fpow": true, "fatan2": true}
+
 // Builds a float operation, folding constants
 func mkFBin(op string, a, b Expr) Expr {
 	if av, ok := isFConst(a); ok {
@@ -384,6 +391,16 @@ func mkFBin(op string, a, b Expr) Expr {
 				return FConst{av * bv}
 			case "fdiv":
 				return FConst{av / bv}
+			case "fmin":
+				return FConst{math.Min(av, bv)}
+			case "fmax":
+				return FConst{math.Max(av, bv)}
+			case "fmod":
+				return FConst{math.Mod(av, bv)}
+			case "fpow":
+				return FConst{math.Pow(av, bv)}
+			case "fatan2":
+				return FConst{math.Atan2(av, bv)}
 			}
 		}
 	}
@@ -423,6 +440,30 @@ func mkUn(op string, a Expr) Expr {
 			return FConst{math.Cos(av)}
 		case "fsqrt":
 			return FConst{math.Sqrt(av)}
+		case "ftan":
+			return FConst{math.Tan(av)}
+		case "ffloor":
+			return FConst{math.Floor(av)}
+		case "fceil":
+			return FConst{math.Ceil(av)}
+		case "fexp":
+			return FConst{math.Exp(av)}
+		case "flog":
+			return FConst{math.Log(av)}
+		case "flog10":
+			return FConst{math.Log10(av)}
+		case "fatan":
+			return FConst{math.Atan(av)}
+		case "fasin":
+			return FConst{math.Asin(av)}
+		case "facos":
+			return FConst{math.Acos(av)}
+		case "fsinh":
+			return FConst{math.Sinh(av)}
+		case "fcosh":
+			return FConst{math.Cosh(av)}
+		case "ftanh":
+			return FConst{math.Tanh(av)}
 		case "f2i":
 			return IConst{uint32(int32(av))}
 		case "f2i_rn":
@@ -435,6 +476,9 @@ func mkUn(op string, a Expr) Expr {
 	}
 	if u, ok := a.(Un); ok && (op == "zx8" && u.Op == "zx8" || op == "zx16" && (u.Op == "zx16" || u.Op == "zx8")) {
 		return a
+	}
+	if u, ok := a.(Un); ok && (op == "bits2f" && u.Op == "f2bits" || op == "f2bits" && u.Op == "bits2f") {
+		return u.A
 	}
 	if op == "zx8" || op == "zx16" {
 		mask := uint32(0xFF)
@@ -607,4 +651,62 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Nodes a structural comparison visits before giving up on shared or deep expression trees
+const sameExprBudget = 512
+
+// Reports whether two expressions are structurally identical, false when they are too large to compare
+func sameExpr(a, b Expr) bool {
+	budget := sameExprBudget
+	return sameExprWithin(a, b, &budget)
+}
+
+func sameExprWithin(a, b Expr, budget *int) bool {
+	*budget--
+	if *budget < 0 {
+		return false
+	}
+	switch x := a.(type) {
+	case nil:
+		return b == nil
+	case IConst, FConst, Sym, Ptr, RetAddr:
+		return a == b
+	case Load:
+		y, ok := b.(Load)
+		return ok && x.Base == y.Base && x.Off == y.Off && x.Size == y.Size && sameExprWithin(x.Addr, y.Addr, budget)
+	case Bin:
+		y, ok := b.(Bin)
+		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+	case Un:
+		y, ok := b.(Un)
+		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget)
+	case Cond:
+		y, ok := b.(Cond)
+		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+	case FCmpSet:
+		y, ok := b.(FCmpSet)
+		return ok && x.Set == y.Set && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+	case Not:
+		y, ok := b.(Not)
+		return ok && sameExprWithin(x.A, y.A, budget)
+	case Elem:
+		y, ok := b.(Elem)
+		return ok && x.Index == y.Index && sameExprWithin(x.A, y.A, budget)
+	case Block:
+		y, ok := b.(Block)
+		if !ok || len(x.Elems) != len(y.Elems) {
+			return false
+		}
+		for i := range x.Elems {
+			if !sameExprWithin(x.Elems[i], y.Elems[i], budget) {
+				return false
+			}
+		}
+		return true
+	case CallResult:
+		y, ok := b.(CallResult)
+		return ok && x.Seq == y.Seq && x.Fn == y.Fn
+	}
+	return false
 }

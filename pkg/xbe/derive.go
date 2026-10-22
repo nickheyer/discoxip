@@ -3,9 +3,11 @@ package xbe
 import (
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/arch/x86/x86asm"
 )
@@ -39,9 +41,17 @@ type RenderModel struct {
 	System         *SystemModel                  `json:"system"`
 	Scene          *SceneModel                   `json:"scene"`
 	Allocators     []uint32                      `json:"allocators"`
+	Registry       *MaterialRegistry             `json:"material_registry"`
 	defaultPaths   []Path
 	nodePaths      []Path
 	shaderLookup   uint32
+	lookups        []shaderLookup
+	accessorSites  []accessorSite
+	wrapperState   argLocation
+	wrapperValue   argLocation
+	matrixStack    uint32
+	stateCounts    map[uint32]int
+	setterStates   map[uint32]uint32 // XDK setter each complex state dispatches to, by its address
 }
 
 // MeshAccessor is how the draw path reaches the vertex format of the mesh being drawn.
@@ -79,22 +89,40 @@ type ClockGlobal struct {
 	Via   uint32  `json:"writer"`
 }
 
+var stageTrace = os.Getenv("DISCOXIP_STAGE_TRACE") != ""
+
+var stageStart = time.Now()
+
+// Prints a derivation stage name with the seconds elapsed when stage tracing is on
+func stage(name string) {
+	if stageTrace {
+		fmt.Fprintf(os.Stderr, "stage: %s (%.1fs)\n", name, time.Since(stageStart).Seconds())
+	}
+}
+
 // DeriveRender runs every derivation and assembles the render model.
 func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	build := int(d.Image.LibBuild("D3D8"))
+	rm := &RenderModel{XDK: build, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool()}
+	rm.StageNames = TextureStageStateNames(build)
+	rm.NVStateNames = nv097StateNames
+	// The render state wrapper comes first so the state tables it writes are known before any path is summarized.
+	stage("render states")
+	if err := rm.deriveRenderStates(d); err != nil {
+		return nil, err
+	}
+	stage("materials")
 	ms, err := DeriveMaterials(d)
 	if err != nil {
 		return nil, err
 	}
-	rm := &RenderModel{XDK: build, Materials: ms.Materials, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Allocators: append([]uint32{ms.AllocatorVA}, ms.Allocators...)}
-	rm.StageNames = TextureStageStateNames(build)
+	rm.Materials, rm.Allocators, rm.Registry = ms.Materials, append([]uint32{ms.AllocatorVA}, ms.Allocators...), ms.Registry
 	for _, m := range ms.Materials {
 		m.Apply = pathsJSON(rm.Exprs, m.Paths)
 	}
 
 	// Shader programs and declarations referenced by any material path.
 	formats := map[uint32]bool{}
-	var createSites []uint32
 	for _, m := range ms.Materials {
 		for _, p := range m.Paths {
 			for _, e := range p.Effects {
@@ -112,7 +140,6 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 							return nil, err
 						}
 					}
-					createSites = appendUnique(createSites, e.VA)
 					if f, ok := boundFormat(p.Guards); ok {
 						rm.addShaderBinding(ShaderBinding{Format: f, Declaration: declVA, Program: progVA})
 					}
@@ -128,25 +155,32 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	}
 	sort.Slice(rm.Formats, func(i, j int) bool { return rm.Formats[i] < rm.Formats[j] })
 
+	stage("mesh accessor")
 	if err := rm.deriveMeshAccessor(d); err != nil {
 		return nil, err
 	}
 
+	stage("fixed function")
 	if err := rm.deriveFixedFunction(d, ms); err != nil {
 		return nil, err
 	}
+	stage("transforms")
 	if err := rm.deriveTransforms(d); err != nil {
 		return nil, err
 	}
-	if err := rm.deriveRenderStates(d, ms); err != nil {
+	stage("render state defaults")
+	if err := rm.deriveRenderDefaults(d, ms); err != nil {
 		return nil, err
 	}
+	stage("node constants")
 	if err := rm.deriveNodeConstants(d, ms); err != nil {
 		return nil, err
 	}
+	stage("clock")
 	if err := rm.deriveClock(d); err != nil {
 		return nil, err
 	}
+	stage("hierarchy alpha")
 	if err := rm.deriveHierarchyAlpha(d, ms); err != nil {
 		return nil, err
 	}
@@ -165,6 +199,7 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 			producers = append(producers, va)
 		}
 	}
+	stage("textures")
 	textures, err := DeriveTextures(d, producers, ms.Allocators)
 	if err != nil {
 		return nil, err
@@ -172,25 +207,31 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	rm.Textures = textures
 	rm.Vertex = fixedFunctionRegisters
 	rm.NVStateNames = nv097StateNames
+	stage("current mesh")
 	if err := rm.deriveCurrentMesh(d); err != nil {
 		return nil, err
 	}
+	stage("node types")
 	types, err := DeriveNodeTypes(d)
 	if err != nil {
 		return nil, err
 	}
 	rm.Types = types
+	stage("draw")
 	if err := rm.deriveDraw(d, ms, types); err != nil {
 		return nil, err
 	}
+	stage("system")
 	sm, err := DeriveSystem(d, types)
 	if err != nil {
 		return nil, err
 	}
 	rm.System = sm
+	stage("scene")
 	if err := rm.deriveScene(d, ms, types, sm); err != nil {
 		return nil, err
 	}
+	stage("globals")
 	if err := rm.deriveGlobals(d, ms); err != nil {
 		return nil, err
 	}
@@ -346,45 +387,6 @@ func storesAbsolute(insn *Instruction, va uint32, size int) bool {
 	return start < va+uint32(size) && start+uint32(w) > va
 }
 
-// Finds the global that holds the mesh being drawn: the pointer loaded into ecx for the format accessor
-func (rm *RenderModel) deriveCurrentMesh(d *Disassembly) error {
-	accessor := rm.Accessor.Function
-	found := map[uint32]int{}
-	for _, fn := range d.Functions {
-		ins := fn.Instructions
-		for i := range ins {
-			if ins[i].Inst.Op != x86asm.CALL || resolveTarget(&ins[i]) != accessor {
-				continue
-			}
-			for j := i - 1; j >= 0 && j > i-5; j-- {
-				jn := &ins[j]
-				if jn.Inst.Op != x86asm.MOV {
-					continue
-				}
-				dst, ok := jn.Inst.Args[0].(x86asm.Reg)
-				if !ok || dst != x86asm.ECX {
-					continue
-				}
-				if m, ok := jn.Inst.Args[1].(x86asm.Mem); ok && m.Base == 0 && m.Index == 0 {
-					found[uint32(m.Disp)]++
-				}
-				break
-			}
-		}
-	}
-	best, bestN := uint32(0), 0
-	for _, va := range slices.Sorted(maps.Keys(found)) {
-		if n := found[va]; n > bestN {
-			best, bestN = va, n
-		}
-	}
-	if best == 0 {
-		return fmt.Errorf("xbe: no global feeds the format accessor %08X", accessor)
-	}
-	rm.Accessor.Global = best
-	return nil
-}
-
 // Vertex register meanings for fixed function declarations in Xbox D3D8
 var fixedFunctionRegisters = map[int]string{0: "position", 1: "blendweight", 2: "normal", 3: "diffuse", 4: "specular", 5: "fog", 6: "pointsize", 7: "backdiffuse", 8: "backspecular", 9: "texcoord0", 10: "texcoord1", 11: "texcoord2", 12: "texcoord3"}
 
@@ -489,241 +491,105 @@ func collectFormatConstants(g Expr, out map[uint32]bool) {
 	}
 }
 
-// Identifies the accessor whose result the draw path hands to the fixed function declaration lookup
-// and reads the field and vtable slot it dereferences by running it on a symbolic mesh
-func (rm *RenderModel) deriveMeshAccessor(d *Disassembly) error {
-	// The lookup is the function containing a CreateVertexShader call with a null program.
-	var lookupVA uint32
-	for _, va := range d.functionVAs() {
-		fn := d.Functions[va]
-		if fn.Symbol != nil {
-			continue
-		}
-		for i := range fn.Instructions {
-			in := &fn.Instructions[i]
-			if in.Inst.Op != x86asm.CALL {
-				continue
-			}
-			t := resolveTarget(in)
-			callee := d.Functions[t]
-			if callee == nil || callee.Symbol == nil || callee.Symbol.Name != "D3DDevice_CreateVertexShader" {
-				continue
-			}
-			// Null program means fixed function: find push 0 for the second argument.
-			zeroPushes := 0
-			for j := i - 1; j >= 0 && j > i-12; j-- {
-				jn := &fn.Instructions[j]
-				if jn.Inst.Op == x86asm.PUSH {
-					if imm, ok := jn.Inst.Args[0].(x86asm.Imm); ok && imm == 0 {
-						zeroPushes++
-					}
-				}
-				if jn.Inst.Op == x86asm.CALL {
-					break
-				}
-			}
-			if zeroPushes >= 2 {
-				lookupVA = va
-			}
-		}
-	}
-	if lookupVA == 0 {
-		return fmt.Errorf("xbe: no fixed function declaration lookup found")
-	}
-	// The accessor is the call whose result feeds the lookup, and it makes one virtual call.
-	for _, va := range d.functionVAs() {
-		ins := d.Functions[va].Instructions
-		for i := range ins {
-			if ins[i].Inst.Op != x86asm.CALL || resolveTarget(&ins[i]) != lookupVA {
-				continue
-			}
-			for j := i - 1; j >= 0 && j > i-8; j-- {
-				if ins[j].Inst.Op != x86asm.CALL {
-					continue
-				}
-				t := resolveTarget(&ins[j])
-				if d.Functions[t] == nil {
-					break
-				}
-				acc, err := accessorShape(d, t)
-				if err != nil {
-					return err
-				}
-				if acc != nil {
-					rm.Accessor = *acc
-					return nil
-				}
-				break
-			}
-		}
-	}
-	return fmt.Errorf("xbe: fixed function lookup %08X has no virtual accessor caller", lookupVA)
-}
-
-// Runs a candidate accessor on a symbolic mesh and reads the field offset and slot of its virtual call
-func accessorShape(d *Disassembly, va uint32) (*MeshAccessor, error) {
-	ex := NewExecutor(d)
-	paths, err := ex.Run(va, func(s *execState) { s.regs[1] = Ptr{"mesh", 0} })
-	if err != nil {
-		return nil, nil
-	}
-	for _, p := range paths {
-		for _, e := range p.Effects {
-			if e.Kind != "call" || !strings.HasPrefix(e.Fn, "vcall@") || len(e.Args) != 1 {
-				continue
-			}
-			var slot int32
-			if n, _ := fmt.Sscanf(e.Fn, "vcall@%X", &slot); n != 1 {
-				continue
-			}
-			l, ok := e.Args[0].(Load)
-			if !ok || l.Base != "mesh" || l.Addr != nil {
-				return nil, fmt.Errorf("xbe: format accessor %08X makes its virtual call on %s", va, ExprString(e.Args[0]))
-			}
-			return &MeshAccessor{Function: va, Offset: l.Off, Slot: slot}, nil
-		}
-	}
-	return nil, nil
-}
-
-// Runs the fixed function declaration lookup for every known vertex format
-func (rm *RenderModel) deriveFixedFunction(d *Disassembly, ms *MaterialSystem) error {
-	var lookupVA uint32
-	for _, va := range d.functionVAs() {
-		fn := d.Functions[va]
-		if fn.Symbol != nil {
-			continue
-		}
-		for i := range fn.Instructions {
-			in := &fn.Instructions[i]
-			if in.Inst.Op != x86asm.CALL {
-				continue
-			}
-			callee := d.Functions[resolveTarget(in)]
-			if callee == nil || callee.Symbol == nil || callee.Symbol.Name != "D3DDevice_CreateVertexShader" {
-				continue
-			}
-			if calleeCleanupOf(fn) == 4 {
-				lookupVA = va
-			}
-		}
-	}
-	if lookupVA == 0 {
-		return fmt.Errorf("xbe: no single argument shader lookup found")
-	}
-	rm.shaderLookup = lookupVA
-	// Running the lookup on a symbolic format exposes every format its table compares against.
-	probe := NewExecutor(d)
-	ms.hideFrom(probe)
-	probePaths, err := probe.Run(lookupVA, func(s *execState) { s.pushArgs(Load{Base: "fmt", Off: 0, Size: 4}) })
-	if err != nil {
-		return fmt.Errorf("fixed function lookup probe: %w", err)
-	}
-	known := map[uint32]bool{}
-	for _, f := range rm.Formats {
-		known[f] = true
-	}
-	for _, p := range probePaths {
-		for _, g := range p.Guards {
-			collectFormatConstants(g, known)
-		}
-	}
-	rm.Formats = rm.Formats[:0]
-	for f := range known {
-		rm.Formats = append(rm.Formats, f)
-	}
-	sort.Slice(rm.Formats, func(i, j int) bool { return rm.Formats[i] < rm.Formats[j] })
-	for _, f := range rm.Formats {
-		ex := NewExecutor(d)
-		ms.hideFrom(ex)
-		paths, err := ex.Run(lookupVA, func(s *execState) { s.pushArgs(IConst{f}) })
-		if err != nil {
-			return fmt.Errorf("fixed function lookup for format %08X: %w", f, err)
-		}
-		for _, p := range paths {
-			for _, e := range p.Effects {
-				if e.Kind == "call" && e.Fn == "D3DDevice_CreateVertexShader" && len(e.Args) >= 2 {
-					declVA, ok := constAddr(e.Args[0])
-					if !ok {
-						return fmt.Errorf("fixed function lookup for format %08X passes a symbolic declaration %s", f, ExprString(e.Args[0]))
-					}
-					if err := rm.addDeclaration(d, declVA); err != nil {
-						return err
-					}
-					rm.FixedFunction = append(rm.FixedFunction, FFDeclaration{Format: f, Declaration: declVA})
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// Binds the view and projection matrix globals from static SetTransform call sites
+// Binds the view and projection matrix globals from the SetTransform calls the dashboard's functions make
 func (rm *RenderModel) deriveTransforms(d *Disassembly) error {
 	names := map[uint32]string{transformView: "view", transformProjection: "projection"}
-	for _, fn := range d.Functions {
-		ins := fn.Instructions
-		regs := map[x86asm.Reg]uint32{}
-		var pushes []uint32
-		for i := range ins {
-			in := &ins[i]
-			switch in.Inst.Op {
-			case x86asm.MOV:
-				if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
-					if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-						regs[dst] = uint32(imm)
-					} else {
-						delete(regs, dst)
-					}
-				}
-			case x86asm.PUSH:
-				if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
-					pushes = append(pushes, uint32(imm))
-				} else if r, ok := in.Inst.Args[0].(x86asm.Reg); ok {
-					if v, ok := regs[r]; ok {
-						pushes = append(pushes, v)
-					} else {
-						pushes = append(pushes, 0xFFFFFFFF)
-					}
-				} else {
-					pushes = append(pushes, 0xFFFFFFFF)
-				}
-				continue
-			case x86asm.CALL:
-				callee := d.Functions[resolveTarget(in)]
-				if callee != nil && callee.Symbol != nil && callee.Symbol.Name == "D3DDevice_SetTransform" && len(pushes) >= 2 {
-					state, matrix := pushes[len(pushes)-1], pushes[len(pushes)-2]
-					if name, ok := names[state]; ok && matrix != 0xFFFFFFFF && d.sectionOf(matrix) != nil {
-						key := fmt.Sprintf("%08X", matrix)
-						if prev, ok := rm.Transforms[key]; ok && prev != name {
-							return fmt.Errorf("xbe: matrix global %s passed as both %s and %s", key, prev, name)
-						}
-						rm.Transforms[key] = name
-					}
-				}
-				pushes = nil
-				delete(regs, x86asm.EAX)
-				delete(regs, x86asm.ECX)
-				delete(regs, x86asm.EDX)
-				continue
-			case x86asm.POP, x86asm.LEA, x86asm.XOR, x86asm.ADD, x86asm.SUB, x86asm.AND, x86asm.OR, x86asm.IMUL, x86asm.SHL, x86asm.SHR, x86asm.SAR, x86asm.INC, x86asm.DEC, x86asm.MOVZX, x86asm.MOVSX:
-				if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
-					delete(regs, dst)
-				}
+	ex := NewExecutor(d)
+	callers := ex.staticThisCallers()
+	states := map[uint32]map[uint32]int{}
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil {
+			continue
+		}
+		calls := false
+		for _, t := range fn.CallTargets {
+			if c := d.Functions[t]; c != nil && c.Symbol != nil && c.Symbol.Name == "D3DDevice_SetTransform" {
+				calls = true
 			}
 		}
+		if !calls {
+			continue
+		}
+		sub := NewExecutorShared(ex)
+		sub.StepLimit = 30000
+		sub.PathLimit = 128
+		this := callers[va]
+		paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) {
+			if this != 0 {
+				ex.seedThis(s, va, this, 3)
+			} else {
+				s.regs[1] = Ptr{"this", 0}
+				sub.seedArgs(s, va, "arg", 3)
+			}
+		}, 6)
+		var effects []Effect
+		for _, p := range paths {
+			effects = append(effects, p.Effects...)
+		}
+		effects = append(effects, partial...)
+		for _, e := range effects {
+			if e.Kind != "call" || e.Fn != "D3DDevice_SetTransform" || len(e.Args) != 2 {
+				continue
+			}
+			state, ok1 := isConst(e.Args[0])
+			// The world matrix comes from the matrix stack top through a virtual accessor on a global object.
+			if cr, isCall := e.Args[1].(CallResult); ok1 && state == transformWorld && isCall && strings.HasPrefix(cr.Fn, "vcall@") {
+				var slot int32
+				if n, _ := fmt.Sscanf(cr.Fn, "vcall@%X", &slot); n == 1 {
+					if rm.WorldSlot != 0 && rm.WorldSlot != slot {
+						return fmt.Errorf("xbe: the world transform comes from accessor slots %d and %d", rm.WorldSlot, slot)
+					}
+					rm.WorldSlot = slot
+					for _, a := range cr.Args {
+						if l, ok := a.(Load); ok && l.Base == "" && l.Addr == nil && l.Size == 4 {
+							rm.matrixStack = uint32(l.Off)
+						} else if va, ok := globalObjectAddress(a); ok {
+							rm.matrixStack = va
+						}
+					}
+				}
+				continue
+			}
+			matrix, ok2 := constAddr(e.Args[1])
+			if !ok1 || !ok2 || !d.inPureData(matrix) {
+				continue
+			}
+			if states[matrix] == nil {
+				states[matrix] = map[uint32]int{}
+			}
+			states[matrix][state]++
+		}
 	}
-	if len(rm.Transforms) < 2 {
-		return fmt.Errorf("xbe: view and projection globals not both found in SetTransform calls (%v)", rm.Transforms)
+	for _, matrix := range slices.Sorted(maps.Keys(states)) {
+		// A matrix handed to the device for several transforms is a constant, not one the camera computes.
+		if len(states[matrix]) != 1 {
+			continue
+		}
+		for state := range states[matrix] {
+			name, ok := names[state]
+			if !ok {
+				continue
+			}
+			for prev, prevName := range rm.Transforms {
+				if prevName == name {
+					return fmt.Errorf("xbe: both %s and %08X are handed to the device as the %s matrix", prev, matrix, name)
+				}
+			}
+			rm.Transforms[fmt.Sprintf("%08X", matrix)] = name
+		}
+	}
+	if len(rm.Transforms) == 0 {
+		return fmt.Errorf("xbe: no view or projection global is handed to the device")
 	}
 	return nil
 }
 
 // Derives render state names from the wrapper's method table and the startup defaults
-func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) error {
-	// The wrapper is the function containing calls to the complex SetRenderState XDK functions.
-	wrapper := uint32(0)
+func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
+	// Candidates call the render state setters of the XDK, the wrapper among them mapping a state index to a method through a table.
 	counts := map[uint32]int{}
+	tables := map[uint32]uint32{}
 	for _, va := range d.functionVAs() {
 		fn := d.Functions[va]
 		if fn.Symbol != nil {
@@ -735,33 +601,26 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 				n++
 			}
 		}
-		if n > 5 {
-			counts[va] = n
-			if n > counts[wrapper] {
-				wrapper = va
-			}
+		if n == 0 {
+			continue
+		}
+		counts[va] = n
+		if table := methodTableLoad(d, fn); table != 0 {
+			tables[va] = table
+		}
+	}
+	wrapper := uint32(0)
+	for _, va := range slices.Sorted(maps.Keys(tables)) {
+		if wrapper == 0 || counts[va] > counts[wrapper] {
+			wrapper = va
 		}
 	}
 	if wrapper == 0 {
-		return fmt.Errorf("xbe: no render state wrapper found")
+		return fmt.Errorf("xbe: no render state wrapper indexes a method table")
 	}
 	rm.Wrapper = wrapper
+	table := tables[wrapper]
 	names := map[uint32]string{}
-	// Simple states: the wrapper indexes a method table; find mov ecx,[reg*?+table] style loads.
-	var table uint32
-	for _, in := range d.Functions[wrapper].Instructions {
-		if in.Inst.Op != x86asm.MOV || argCount(&in) != 2 {
-			continue
-		}
-		if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && m.Base != 0 && m.Disp > 0x10000 {
-			if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.ECX {
-				table = uint32(m.Disp)
-			}
-		}
-	}
-	if table == 0 {
-		return fmt.Errorf("xbe: render state wrapper %08X has no method table", wrapper)
-	}
 	for idx := uint32(0); idx < 256; idx++ {
 		v, ok := d.Image.ReadU32(table + idx*4)
 		if !ok {
@@ -793,7 +652,8 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 				continue
 			}
 			callee := d.Functions[resolveTarget(in)]
-			if callee == nil || callee.Symbol == nil || !strings.HasPrefix(callee.Symbol.Name, "D3DDevice_SetRenderState_") {
+			// Setters whose bytes several states share are identified under collision names.
+			if callee == nil || callee.Symbol == nil || !strings.Contains(callee.Symbol.Name, "SetRenderState") {
 				continue
 			}
 			switch callee.Symbol.Name {
@@ -801,6 +661,17 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 				continue
 			}
 			names[uint32(lastCmp)] = stateNameFromSymbol(callee.Symbol, cross[uint32(lastCmp)])
+			if rm.setterStates == nil {
+				rm.setterStates = map[uint32]uint32{}
+			}
+			rm.setterStates[resolveTarget(in)] = uint32(lastCmp)
+		}
+	}
+	// A setter name several functions share came from an ambiguous signature, and the dispatch index names it instead.
+	shared := map[string]int{}
+	for _, fn := range d.Functions {
+		if fn.Symbol != nil {
+			shared[fn.Symbol.Name]++
 		}
 	}
 	for idx, name := range names {
@@ -808,16 +679,28 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 		if !ok {
 			continue
 		}
-		if !sameStateName(ref, name) {
+		if !sameStateName(ref, name) && shared["D3DDevice_SetRenderState_"+name] < 2 {
 			return fmt.Errorf("xbe: render state %d is %s in the binary but %s in the XDK %d table", idx, name, ref, rm.XDK)
 		}
 		names[idx] = ref
 	}
-	// Deferred states: the wrapper hands one contiguous index range to the deferred setter,
-	// and that range must coincide with the deferred section of the XDK table.
-	lo, hi, err := d.deferredStateRange(wrapper)
+	state, value, err := d.wrapperInputs(wrapper)
 	if err != nil {
 		return err
+	}
+	rm.wrapperState, rm.wrapperValue = state, value
+	// Deferred states: the wrapper hands one contiguous index range to the deferred setter,
+	// and that range must coincide with the deferred section of the XDK table.
+	lo, hi, array, err := d.deferredStateRange(wrapper, state, value)
+	if err != nil {
+		return err
+	}
+	if array != 0 {
+		layout, err := d.deviceState()
+		if err != nil {
+			return err
+		}
+		layout.renders = &stateArray{base: array, count: uint32(len(cross))}
 	}
 	sections := RenderStateSections(rm.XDK)
 	if lo != sections[1] || hi != sections[2] {
@@ -830,12 +713,21 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 		names[idx] = cross[idx]
 	}
 	rm.StateNames = names
+	rm.stateCounts = counts
+	return nil
+}
 
-	// Defaults: the function with the most static calls to the wrapper.
+// Runs the function setting the render state defaults at startup
+func (rm *RenderModel) deriveRenderDefaults(d *Disassembly, ms *MaterialSystem) error {
+	wrapper, counts := rm.Wrapper, rm.stateCounts
+	// Defaults: the function setting the most states, through the wrapper or the XDK setters it inlined.
 	best, bestN := uint32(0), 0
 	for _, va := range d.functionVAs() {
+		if va == wrapper {
+			continue
+		}
 		fn := d.Functions[va]
-		n := 0
+		n := counts[va]
 		for _, t := range fn.CallTargets {
 			if t == wrapper {
 				n++
@@ -855,7 +747,7 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 	thisVA := ex.staticThisCallers()[best]
 	paths, err := ex.Run(best, func(s *execState) {
 		if thisVA != 0 {
-			s.regs[1] = Ptr{"", int32(thisVA)}
+			ex.seedThis(s, best, thisVA, 0)
 		} else {
 			s.regs[1] = Ptr{"this", 0}
 		}
@@ -868,23 +760,123 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly, ms *MaterialSystem) er
 	return nil
 }
 
+// Finds the table a function indexes into ecx right before calling the simple render state setter
+func methodTableLoad(d *Disassembly, fn *Function) uint32 {
+	ins := fn.Instructions
+	for i := range ins {
+		if ins[i].Inst.Op != x86asm.CALL {
+			continue
+		}
+		callee := d.Functions[resolveTarget(&ins[i])]
+		if callee == nil || callee.Symbol == nil || callee.Symbol.Name != "D3DDevice_SetRenderState_Simple" {
+			continue
+		}
+		for j := i - 1; j >= 0 && j > i-8; j-- {
+			in := &ins[j]
+			if in.Inst.Op != x86asm.MOV || argCount(in) != 2 {
+				continue
+			}
+			dst, ok := in.Inst.Args[0].(x86asm.Reg)
+			if !ok || dst != x86asm.ECX {
+				continue
+			}
+			if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && (m.Base != 0 || m.Index != 0) && d.sectionOf(uint32(m.Disp)) != nil {
+				return uint32(m.Disp)
+			}
+			break
+		}
+	}
+	return 0
+}
+
+// Locates the state index and value inputs of the wrapper, the index being the input it scales into its tables
+func (d *Disassembly) wrapperInputs(wrapper uint32) (argLocation, argLocation, error) {
+	fn := d.Functions[wrapper]
+	regs := d.liveInRegisters(fn)
+	roles, err := d.inputRoles(fn, regs, calleeCleanupOf(fn)/4)
+	if err != nil {
+		return argLocation{}, argLocation{}, err
+	}
+	var state, value argLocation
+	found := 0
+	for loc, r := range roles {
+		if r.scaled {
+			state = loc
+			found++
+		}
+	}
+	if found != 1 {
+		return argLocation{}, argLocation{}, fmt.Errorf("xbe: render state wrapper %08X scales %d of its inputs into a table, expected one (%v)", wrapper, found, roles)
+	}
+	found = 0
+	for loc := range roles {
+		if loc != state {
+			value = loc
+			found++
+		}
+	}
+	if found != 1 {
+		return argLocation{}, argLocation{}, fmt.Errorf("xbe: render state wrapper %08X takes %d inputs besides the state, expected one (%v)", wrapper, found, roles)
+	}
+	return state, value, nil
+}
+
 // Runs the wrapper on a symbolic state and reads the bounds guarding its deferred setter call
-func (d *Disassembly) deferredStateRange(wrapper uint32) (uint32, uint32, error) {
+func (d *Disassembly) deferredStateRange(wrapper uint32, stateLoc, valueLoc argLocation) (uint32, uint32, uint32, error) {
 	ex := NewExecutor(d)
 	state := Sym{"rs.state"}
-	paths, err := ex.Run(wrapper, func(s *execState) { s.pushArgs(state, Sym{"rs.value"}) })
+	paths, err := ex.Run(wrapper, func(s *execState) {
+		stackArgs := calleeCleanupOf(d.Functions[wrapper]) / 4
+		args := symbolicArgs(stackArgs, -1, nil)
+		if stateLoc.Reg != 0 {
+			s.regs[regIndex[stateLoc.Reg]] = state
+		} else {
+			args[stateLoc.Stack] = state
+		}
+		if valueLoc.Reg != 0 {
+			s.regs[regIndex[valueLoc.Reg]] = Sym{"rs.value"}
+		} else {
+			args[valueLoc.Stack] = Sym{"rs.value"}
+		}
+		s.pushArgs(args...)
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("render state wrapper %08X: %w", wrapper, err)
+		return 0, 0, 0, fmt.Errorf("render state wrapper %08X: %w", wrapper, err)
 	}
 	for _, p := range paths {
-		deferred := false
+		// The deferred path hands the state to the XDK's deferred setter or, when that is inlined, records it in a table
+		// indexed by the state without any setter call.
+		deferred, setter, indexed := false, false, false
+		array := uint32(0)
 		for _, e := range p.Effects {
 			if e.Kind == "call" && e.Fn == "D3DDevice_SetRenderState_Deferred" {
 				deferred = true
 			}
+			if e.Kind == "call" && strings.HasPrefix(e.Fn, "D3DDevice_SetRenderState") {
+				setter = true
+			}
+			if e.Kind == "store" && e.Addr != nil && e.Value == Expr(Sym{"rs.value"}) {
+				set := map[string]bool{}
+				exprSyms(e.Addr, set)
+				if set[state.Name] {
+					indexed = true
+					// The value lands in the XDK's own state table indexed by the state, the last such table being the XDK's.
+					if b, ok := e.Addr.(Bin); ok && b.Op == "add" {
+						if c, ok := isConst(b.B); ok {
+							array = c
+						} else if c, ok := isConst(b.A); ok {
+							array = c
+						}
+					}
+				}
+			}
 		}
-		if !deferred {
+		if !deferred && (setter || !indexed) {
 			continue
+		}
+		if deferred {
+			// The XDK's own setter keeps its table, so the stores here are the dashboard's copy.
+			array = 0
 		}
 		lo, hi := uint32(0), uint32(0)
 		for _, g := range p.Guards {
@@ -908,11 +900,11 @@ func (d *Disassembly) deferredStateRange(wrapper uint32) (uint32, uint32, error)
 			}
 		}
 		if lo == 0 || hi <= lo {
-			return 0, 0, fmt.Errorf("render state wrapper %08X defers an unbounded range %d..%d", wrapper, lo, hi)
+			return 0, 0, 0, fmt.Errorf("render state wrapper %08X defers an unbounded range %d..%d", wrapper, lo, hi)
 		}
-		return lo, hi, nil
+		return lo, hi, array, nil
 	}
-	return 0, 0, fmt.Errorf("render state wrapper %08X never calls the deferred setter", wrapper)
+	return 0, 0, 0, fmt.Errorf("render state wrapper %08X never calls the deferred setter", wrapper)
 }
 
 // Compares a binary derived state name with the XDK table name ignoring case and underscores
@@ -941,36 +933,51 @@ func stateNameFromSymbol(sym *Symbol, ref string) string {
 
 // Runs the function that loads the per node vertex shader constants
 func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) error {
-	// It is the function containing a SetVertexShaderConstant call for register 0 with four rows.
+	// It is the function whose paths load four rows into vertex shader constant register zero.
+	probe := NewExecutor(d)
+	ms.hideFrom(probe)
 	var target uint32
 	for _, va := range d.functionVAs() {
 		fn := d.Functions[va]
 		if fn.Symbol != nil {
 			continue
 		}
-		ins := fn.Instructions
-		for i := range ins {
-			if ins[i].Inst.Op != x86asm.CALL {
+		calls := false
+		for _, t := range fn.CallTargets {
+			if c := d.Functions[t]; c != nil && c.Symbol != nil && strings.HasPrefix(c.Symbol.Name, "D3DDevice_SetVertexShaderConstant") {
+				calls = true
+			}
+		}
+		if !calls {
+			continue
+		}
+		sub := NewExecutorShared(probe)
+		sub.StepLimit = 30000
+		sub.PathLimit = 128
+		paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) {}, 6)
+		var effects []Effect
+		for _, p := range paths {
+			effects = append(effects, p.Effects...)
+		}
+		effects = append(effects, partial...)
+		for _, e := range effects {
+			if e.Kind != "call" || !strings.HasPrefix(e.Fn, "D3DDevice_SetVertexShaderConstant") || len(e.Args) < 2 {
 				continue
 			}
-			callee := d.Functions[resolveTarget(&ins[i])]
-			if callee == nil || callee.Symbol == nil || callee.Symbol.Name != "D3DDevice_SetVertexShaderConstant" {
+			register, ok := isConst(e.Args[0])
+			if !ok || register != 0 {
 				continue
 			}
-			// Register is the last push before the call; count 4 is pushed first.
-			var pushes []int64
-			for j := i - 1; j >= 0 && j > i-8 && len(pushes) < 3; j-- {
-				if ins[j].Inst.Op == x86asm.PUSH {
-					if imm, ok := ins[j].Inst.Args[0].(x86asm.Imm); ok {
-						pushes = append(pushes, int64(imm))
-					} else if r, ok := ins[j].Inst.Args[0].(x86asm.Reg); ok && r == x86asm.ESI {
-						pushes = append(pushes, -2)
-					} else {
-						pushes = append(pushes, -1)
-					}
+			rows := uint32(0)
+			if len(e.Args) >= 3 {
+				rows, _ = isConst(e.Args[2])
+			} else {
+				fmt.Sscanf(strings.TrimPrefix(e.Fn, "D3DDevice_SetVertexShaderConstant"), "%d", &rows)
+			}
+			if rows == 4 {
+				if target != 0 && target != va {
+					return fmt.Errorf("xbe: both %08X and %08X load four rows into vertex shader constant zero", target, va)
 				}
-			}
-			if len(pushes) == 3 && (pushes[0] == 0 || pushes[0] == -2) && pushes[2] == 4 {
 				target = va
 			}
 		}
@@ -986,26 +993,8 @@ func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) e
 	}
 	rm.NodeConstants = pathsJSON(rm.Exprs, paths)
 	rm.nodePaths = paths
-	for _, p := range paths {
-		for _, e := range p.Effects {
-			if e.Kind != "call" || e.Fn != "D3DDevice_SetTransform" || len(e.Args) != 2 {
-				continue
-			}
-			st, ok := isConst(e.Args[0])
-			if !ok || st != transformWorld {
-				continue
-			}
-			cr, ok := e.Args[1].(CallResult)
-			if !ok {
-				return fmt.Errorf("xbe: world transform %s is not an accessor call", ExprString(e.Args[1]))
-			}
-			if n, _ := fmt.Sscanf(cr.Fn, "vcall@%X", &rm.WorldSlot); n != 1 {
-				return fmt.Errorf("xbe: world transform comes from %s rather than a virtual accessor", cr.Fn)
-			}
-		}
-	}
 	if rm.WorldSlot == 0 {
-		return fmt.Errorf("xbe: world matrix accessor slot not found in node constant setup")
+		return fmt.Errorf("xbe: no transform setting routine takes the world matrix from a virtual accessor")
 	}
 	return nil
 }
@@ -1039,7 +1028,7 @@ func (rm *RenderModel) deriveClock(d *Disassembly) error {
 			continue
 		}
 		sub := NewExecutorShared(ex)
-		paths, partial, _, _ := sub.RunWithRetries(fnVA, func(s *execState) { s.regs[1] = Ptr{"", int32(thisVA)} }, 6)
+		paths, partial, _, _ := sub.RunWithRetries(fnVA, func(s *execState) { ex.seedThis(s, fnVA, thisVA, 0) }, 6)
 		var effects []Effect
 		for _, p := range paths {
 			effects = append(effects, p.Effects...)

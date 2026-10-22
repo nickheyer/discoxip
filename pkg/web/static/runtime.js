@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { DerivedModel, cloneState, makeBuffer, matMul, SceneObject, VertexBuffer, MatrixStack, bitsFromFloat, TS_WORLD, ARCHIVE_TYPE, HEAP_TYPE } from './derived.js';
+import { DerivedModel, cloneState, makeBuffer, matMul, SceneObject, VertexBuffer, MatrixStack, bitsFromFloat, TS_WORLD, ARCHIVE_TYPE, HEAP_TYPE, ARRAY_ELEMENT } from './derived.js';
 import { DevicePipeline, describeGeometry, describeFVF, primitiveIndices } from './pipeline.js';
 import { VirtualConsole, nativeClasses, dateMembers, NATIVE_DRAW_CLASSES } from './system.js';
 
@@ -188,6 +188,7 @@ class XAPRuntime {
       backBufferWidth: () => this.derived.memory.load(this.presentParamsAddress(), 4),
       backBufferHeight: () => this.derived.memory.load(this.presentParamsAddress() + PRESENT_HEIGHT, 4),
       onClear: (state) => { this.frameClear = state.clear; },
+      onPresent: (state) => this.presentFrame(state),
     };
   }
 
@@ -228,7 +229,9 @@ class XAPRuntime {
     d.hook(d.typeSlot('DynamicTexture', d.draw.texture_slot), (thisVal) => this.dynamicTextureHandle(this.objectOf(thisVal)));
     d.hook(sc.group.draw, (thisVal, args, state, env) => { this.drawChildren(this.objectOf(thisVal), state, env); return 0; });
     d.hook(sc.group.tick, (thisVal, args, state, env) => { this.tickChildren(this.objectOf(thisVal), args[0], state, env); return 0; });
-    d.hook(sc.array_element, (thisVal, args) => this.arrayElement(thisVal, d.int(args[0])));
+    const element = (thisVal, args) => this.arrayElement(thisVal, d.int(args[0]));
+    if (sc.array_element) d.hook(sc.array_element, element);
+    d.hook(ARRAY_ELEMENT, element);
     d.hook(sc.fire_event, (thisVal, args) => this.fireDerivedEvent(args[0], d.string(args[1])));
     d.hook(sc.present, (thisVal, args, state) => { this.presentFrame(state); return 0; });
     d.hook(sc.script_tick, () => 0);

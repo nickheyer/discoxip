@@ -72,7 +72,7 @@ func decodeBuffer(path string) (*buffer.VBReader, scene.Layout, []buffer.Attribu
 	if err != nil {
 		return nil, scene.Layout{}, nil, err
 	}
-	layouts, _, err := scene.LoadLayouts(bufferXBE)
+	layouts, _, err := loadLayouts(bufferXBE)
 	if err != nil {
 		return nil, scene.Layout{}, nil, err
 	}

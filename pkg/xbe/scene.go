@@ -101,7 +101,8 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if sc.Renderer == 0 {
 		return fmt.Errorf("xbe: clock writer %08X is not called on a static object", rm.Clock.Via)
 	}
-	// The tick is the renderer method that advances the clock and then dispatches a virtual call to the scene.
+	// The tick advances the clock and dispatches a virtual call to the scene, from a renderer method or a plain routine
+	writers := map[uint32]bool{}
 	for _, fn := range slices.Sorted(maps.Keys(callers)) {
 		this := callers[fn]
 		if this != sc.Renderer {
@@ -110,18 +111,45 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		if d.reaches(fn, "D3DXMatrixPerspectiveFovLH", 0) && d.reaches(fn, "D3DDevice_Clear", 1) {
 			sc.Frame = fn
 		}
-		if _, err := indirectCallSlot(d, fn); err != nil {
+		if storesGlobal(ex, fn, this, rm.Clock.VA, 8) {
+			writers[fn] = true
+		}
+	}
+	for va, fn := range d.Functions {
+		if fn.Symbol != nil || d.inLibrary(va) {
 			continue
 		}
-		if storesGlobal(ex, fn, this, rm.Clock.VA, 8) {
-			sc.Tick = fn
+		for i := range fn.Instructions {
+			if storesAbsolute(&fn.Instructions[i], rm.Clock.VA, 8) {
+				writers[va] = true
+			}
+		}
+	}
+	group := types["Group"]
+	if group == nil || len(group.Slots) <= int(rm.Draw.Slot/4) {
+		return fmt.Errorf("xbe: Group is not registered with a draw slot")
+	}
+	// The scene dispatch is the one slot a group hands on to its children unchanged, which the draw slot is not
+	for _, fn := range slices.Sorted(maps.Keys(writers)) {
+		for _, slot := range indirectCallSlots(d, fn) {
+			if slot == rm.Draw.Slot || slot < 0 || int(slot/4) >= len(group.Slots) {
+				continue
+			}
+			if s, err := indirectCallSlot(d, group.Slots[slot/4]); err != nil || s != slot {
+				continue
+			}
+			if sc.Tick != 0 {
+				return fmt.Errorf("xbe: both %08X slot %d and %08X slot %d advance the clock %08X and tick the scene", sc.Tick, sc.TickSlot, fn, slot, rm.Clock.VA)
+			}
+			sc.Tick, sc.TickSlot = fn, slot
 		}
 	}
 	if sc.Tick == 0 {
-		return fmt.Errorf("xbe: no renderer method advances the clock %08X and ticks the scene", rm.Clock.VA)
+		return fmt.Errorf("xbe: no routine advances the clock %08X and ticks the scene (writers %X)", rm.Clock.VA, slices.Sorted(maps.Keys(writers)))
 	}
-	for fn := range d.Functions {
-		if d.reaches(fn, "Direct3D_CreateDevice", 0) {
+	// Overlapping entries recovered from pointer tables also reach the device creation, but nothing calls them
+	for fn, f := range d.Functions {
+		if len(f.CalledBy) > 0 && d.reaches(fn, "Direct3D_CreateDevice", 0) {
 			if sc.Init != 0 {
 				return fmt.Errorf("xbe: two routines create the device (%08X, %08X)", sc.Init, fn)
 			}
@@ -142,8 +170,23 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if sc.MainLoad == 0 {
 		return fmt.Errorf("xbe: no startup routine around init %08X names the main scene file", sc.Init)
 	}
+	// Where the optimizer merged the frame loop into the tick, the tick is the loop body and the draw ends it
+	if slices.Contains(d.Functions[sc.Tick].CallTargets, sc.Frame) {
+		entry, stop, err := loopBody(d, sc.Tick, sc.Frame)
+		if err != nil {
+			return err
+		}
+		if d.Functions[entry] == nil {
+			d.Functions[entry] = d.buildFunction(entry, nil)
+		}
+		sc.Tick = entry
+		ex.Stop = map[uint32]bool{stop: true}
+	}
 	// Besides the camera the tick advances the script timers and the audio voices, which the runtime drives itself.
 	for _, c := range d.plainCallees(sc.Tick) {
+		if c == sc.Frame {
+			continue
+		}
 		if this := callers[c]; this != 0 && this != sc.Renderer {
 			sc.Camera, sc.CameraTick = this, c
 		} else {
@@ -155,15 +198,6 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	}
 	if err := sc.deriveMatrixStack(rm); err != nil {
 		return err
-	}
-	slot, err := indirectCallSlot(d, sc.Tick)
-	if err != nil {
-		return err
-	}
-	sc.TickSlot = slot
-	group := types["Group"]
-	if group == nil || len(group.Slots) <= int(rm.Draw.Slot/4) || len(group.Slots) <= int(sc.TickSlot/4) {
-		return fmt.Errorf("xbe: Group is not registered with draw and tick slots")
 	}
 	if err := sc.deriveGroup(d, group.Slots[rm.Draw.Slot/4], group.Slots[sc.TickSlot/4], rm.Draw.Slot, sc.TickSlot); err != nil {
 		return err
@@ -206,10 +240,16 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	for _, h := range hooks {
 		hooked[h] = true
 	}
+	// The frame presents through the XDK swap, which carries a signature in some builds and none in others
 	for _, c := range d.plainCallees(sc.Frame) {
 		if d.reaches(c, "D3DDevice_BlockUntilVerticalBlank", 1) {
 			sc.Present = c
 			hooked[c] = true
+		}
+	}
+	for _, t := range d.Functions[sc.Frame].CallTargets {
+		if fn := d.Functions[t]; fn != nil && fn.Symbol != nil && fn.Symbol.Name == "D3DDevice_Swap" {
+			sc.Present = t
 		}
 	}
 	if sc.Present == 0 {
@@ -253,11 +293,11 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		}
 		paths, err := sub.Run(w.va, func(s *execState) {
 			if w.this != 0 {
-				s.regs[1] = Ptr{"", int32(w.this)}
+				ex.seedThis(s, w.va, w.this, 4)
 			} else {
 				s.regs[1] = Ptr{"this", 0}
+				sub.seedArgs(s, w.va, "arg", 4)
 			}
-			s.pushArgs(Sym{"arg0"}, Sym{"arg1"}, Sym{"arg2"}, Sym{"arg3"})
 		})
 		if err != nil {
 			return fmt.Errorf("scene path %08X: %w", w.va, err)
@@ -598,7 +638,11 @@ func absoluteGlobals(d *Disassembly, va uint32) map[uint32]bool {
 func (sc *SceneModel) deriveArchive(d *Disassembly, types map[string]*NodeType, drawSlot int32) error {
 	goTo := sc.Natives["Level"]["GoTo"]
 	var levelSwitch, deactivate uint32
+	// The switch fires the deactivation through a helper, or itself where the optimizer expanded that helper into it
 	for _, c := range d.plainCallees(goTo) {
+		if fn := d.Functions[c]; fn != nil && pushesWideString(d, fn, "OnDeactivate") {
+			levelSwitch, deactivate = c, c
+		}
 		for _, cc := range d.plainCallees(c) {
 			if fn := d.Functions[cc]; fn != nil && pushesWideString(d, fn, "OnDeactivate") {
 				levelSwitch, deactivate = c, cc
@@ -627,13 +671,14 @@ func (sc *SceneModel) deriveArchive(d *Disassembly, types map[string]*NodeType, 
 	if sc.Loader == 0 {
 		return fmt.Errorf("xbe: level switch %08X shares no archive loader with the inline draw", levelSwitch)
 	}
+	unloaders := 0
 	for _, c := range d.plainCallees(deactivate) {
-		if c != sc.FireEvent {
-			sc.Unloader = c
+		if c != sc.FireEvent && c != sc.Loader {
+			sc.Unloader, unloaders = c, unloaders+1
 		}
 	}
-	if sc.Unloader == 0 {
-		return fmt.Errorf("xbe: level deactivation %08X tail calls no archive unloader", deactivate)
+	if unloaders != 1 {
+		return fmt.Errorf("xbe: level deactivation %08X calls %d archive unloaders", deactivate, unloaders)
 	}
 	// The inline load names the archive by extension and its post load step fires the scene's initialize.
 	for _, c := range d.plainCallees(inline.Slots[drawSlot/4]) {
@@ -720,8 +765,12 @@ func pushesWideString(d *Disassembly, fn *Function, text string) bool {
 	return false
 }
 
-// The matrix stack is the global object the node constant setup asks for its top, passed on the stack COM style
+// The matrix stack is the global object the world transform setup asks for its top, passed on the stack COM style
 func (sc *SceneModel) deriveMatrixStack(rm *RenderModel) error {
+	if rm.matrixStack != 0 {
+		sc.MatrixStack = rm.matrixStack
+		return nil
+	}
 	for _, p := range rm.nodePaths {
 		for _, e := range p.Effects {
 			if e.Kind != "call" || e.Fn != fmt.Sprintf("vcall@%X", rm.WorldSlot) {
@@ -730,6 +779,10 @@ func (sc *SceneModel) deriveMatrixStack(rm *RenderModel) error {
 			for _, a := range e.Args {
 				if l, ok := a.(Load); ok && l.Base == "" && l.Addr == nil && l.Size == 4 {
 					sc.MatrixStack = uint32(l.Off)
+					return nil
+				}
+				if va, ok := globalObjectAddress(a); ok {
+					sc.MatrixStack = va
 					return nil
 				}
 			}
@@ -741,7 +794,7 @@ func (sc *SceneModel) deriveMatrixStack(rm *RenderModel) error {
 // Reports whether a method run on a static object stores a value of the size into a global on any path
 func storesGlobal(ex *Executor, va, this, global uint32, size int) bool {
 	sub := NewExecutorShared(ex)
-	paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) { s.regs[1] = Ptr{"", int32(this)} }, 6)
+	paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) { ex.seedThis(s, va, this, 0) }, 6)
 	var effects []Effect
 	for _, p := range paths {
 		effects = append(effects, p.Effects...)
@@ -755,13 +808,13 @@ func storesGlobal(ex *Executor, va, this, global uint32, size int) bool {
 	return false
 }
 
-// Returns the displacement of the one indirect register relative call in a function
-func indirectCallSlot(d *Disassembly, va uint32) (int32, error) {
+// Lists the ascending displacements of the register relative indirect calls a function makes
+func indirectCallSlots(d *Disassembly, va uint32) []int32 {
 	fn := d.Functions[va]
 	if fn == nil {
-		return 0, fmt.Errorf("xbe: function %08X is not disassembled", va)
+		return nil
 	}
-	slot := int32(-1)
+	slots := map[int32]bool{}
 	for i := range fn.Instructions {
 		in := &fn.Instructions[i]
 		if in.Inst.Op != x86asm.CALL {
@@ -771,15 +824,59 @@ func indirectCallSlot(d *Disassembly, va uint32) (int32, error) {
 		if !ok || m.Base == 0 || m.Index != 0 {
 			continue
 		}
-		if slot >= 0 && slot != int32(m.Disp) {
-			return 0, fmt.Errorf("xbe: function %08X makes virtual calls through slots %d and %d", va, slot, m.Disp)
-		}
-		slot = int32(m.Disp)
+		slots[int32(m.Disp)] = true
 	}
-	if slot < 0 {
+	return slices.Sorted(maps.Keys(slots))
+}
+
+// The loop a merged frame routine runs each frame, from the setup above its back edge to the draw that ends it
+func loopBody(d *Disassembly, va, frame uint32) (uint32, uint32, error) {
+	fn := d.Functions[va]
+	forward := map[uint32]bool{}
+	var back, stop uint32
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op == x86asm.CALL && resolveTarget(in) == frame {
+			stop = in.VA
+		}
+		t := resolveTarget(in)
+		if !isJump(in.Inst.Op) || t == 0 {
+			continue
+		}
+		switch {
+		case t > in.VA:
+			forward[t] = true
+		case isUnconditionalJump(in.Inst.Op):
+			back = t
+		}
+	}
+	if stop == 0 || back == 0 {
+		return 0, 0, fmt.Errorf("xbe: merged frame routine %08X runs no loop around its draw %08X", va, frame)
+	}
+	i := fn.instructionIndex()[back]
+	for i > 0 && !forward[fn.Instructions[i].VA] {
+		p := &fn.Instructions[i-1]
+		if isJump(p.Inst.Op) || p.Inst.Op == x86asm.CALL || p.Inst.Op == x86asm.RET {
+			break
+		}
+		i--
+	}
+	return fn.Instructions[i].VA, stop, nil
+}
+
+// Returns the displacement of the one indirect register relative call in a function
+func indirectCallSlot(d *Disassembly, va uint32) (int32, error) {
+	if d.Functions[va] == nil {
+		return 0, fmt.Errorf("xbe: function %08X is not disassembled", va)
+	}
+	slots := indirectCallSlots(d, va)
+	if len(slots) == 0 {
 		return 0, fmt.Errorf("xbe: function %08X makes no virtual call", va)
 	}
-	return slot, nil
+	if len(slots) > 1 {
+		return 0, fmt.Errorf("xbe: function %08X makes virtual calls through slots %d and %d", va, slots[0], slots[1])
+	}
+	return slots[0], nil
 }
 
 // The group draw walks its child array through an element accessor, testing a byte of each child before its virtual draw
@@ -790,18 +887,16 @@ func (sc *SceneModel) deriveGroup(d *Disassembly, drawVA, tickVA uint32, drawSlo
 	}
 	children, visible := int32(-1), int32(-1)
 	called := int32(-1)
+	inlined := inlinedArrayIndexes(fn)
+	for _, a := range inlined {
+		children = a.off
+	}
 	for i := range fn.Instructions {
 		in := &fn.Instructions[i]
 		switch in.Inst.Op {
 		case x86asm.LEA:
 			if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && m.Base == x86asm.ECX && m.Index == 0 {
 				children = int32(m.Disp)
-			}
-		case x86asm.CMP:
-			if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 {
-				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && imm == 0 {
-					visible = int32(m.Disp)
-				}
 			}
 		case x86asm.CALL:
 			if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 {
@@ -812,9 +907,20 @@ func (sc *SceneModel) deriveGroup(d *Disassembly, drawVA, tickVA uint32, drawSlo
 				}
 			}
 		}
+		// The visible flag is the single byte of a child the draw reads before dispatching to it
+		if in.Inst.MemBytes == 1 {
+			for _, arg := range in.Inst.Args[:argCount(in)] {
+				if m, ok := arg.(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 {
+					visible = int32(m.Disp)
+				}
+			}
+		}
 	}
-	if children < 0 || visible < 0 || called != drawSlot || sc.ArrayElem == 0 {
-		return fmt.Errorf("xbe: Group draw %08X walks no child array (children %d visible %d slot %d accessor %08X)", drawVA, children, visible, called, sc.ArrayElem)
+	if sc.ArrayElem == 0 && len(inlined) == 0 {
+		return fmt.Errorf("xbe: Group draw %08X neither calls nor inlines the child array accessor", drawVA)
+	}
+	if children < 0 || visible < 0 || called != drawSlot {
+		return fmt.Errorf("xbe: Group draw %08X walks no child array (children %d visible %d slot %d)", drawVA, children, visible, called)
 	}
 	tickCall, err := indirectCallSlot(d, tickVA)
 	if err != nil {
@@ -857,4 +963,17 @@ func stringCallee(d *Disassembly, va uint32) (uint32, error) {
 		}
 	}
 	return 0, fmt.Errorf("xbe: native %08X fires no named script event", va)
+}
+
+// Reads the global a typed object pointer was loaded from
+func globalObjectAddress(e Expr) (uint32, bool) {
+	p, ok := e.(Ptr)
+	if !ok || p.Off != 0 || len(p.Base) != 9 || p.Base[0] != 'g' {
+		return 0, false
+	}
+	var va uint32
+	if _, err := fmt.Sscanf(p.Base[1:], "%08X", &va); err != nil {
+		return 0, false
+	}
+	return va, true
 }

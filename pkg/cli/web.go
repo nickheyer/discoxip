@@ -1,7 +1,12 @@
 package cli
 
 import (
+	"fmt"
+	"path/filepath"
+
+	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/nickheyer/discoxip/pkg/web"
+	"github.com/nickheyer/discoxip/pkg/xbe"
 	"github.com/spf13/cobra"
 )
 
@@ -31,5 +36,34 @@ func runWebExport(cmd *cobra.Command, args []string) error {
 	if outputDir == "" {
 		outputDir = inputDir + "_web"
 	}
-	return web.Export(inputDir, outputDir)
+	xbeFiles, err := filepath.Glob(filepath.Join(inputDir, "*.xbe"))
+	if err != nil {
+		return err
+	}
+	if len(xbeFiles) != 1 {
+		return fmt.Errorf("web: expected one .xbe in %s, found %d", inputDir, len(xbeFiles))
+	}
+	d, err := disassemble(xbeFiles[0])
+	if err != nil {
+		return err
+	}
+	return web.Export(inputDir, outputDir, d)
+}
+
+// Opens and disassembles an executable
+func disassemble(path string) (*xbe.Disassembly, error) {
+	img, err := xbe.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return xbe.Disassemble(img)
+}
+
+// Derives the render model and vertex layouts of an executable at a path
+func loadLayouts(path string) (map[uint32]scene.Layout, *xbe.RenderModel, error) {
+	d, err := disassemble(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return scene.LoadLayouts(d)
 }

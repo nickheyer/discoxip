@@ -1,3 +1,6 @@
+
+const FLOAT_BIN_OPS = new Set(['fadd', 'fsub', 'fmul', 'fdiv', 'fmin', 'fmax', 'fmod', 'fpow', 'fatan2']);
+
 // Interpreter for the execution paths derived from the dashboard executable
 // Runs the frame loop, the node draw and tick methods, the material Apply methods,
 // the script natives and the device setup summarized in render.json against scene
@@ -50,6 +53,9 @@ export const ARCHIVE_TYPE = '$archive';
 export const HEAP_TYPE = '$heap';
 // The descriptor and value a scripted field write hands to the class field hook
 const FIELD_TYPE = '$field', VALUE_TYPE = '$value';
+
+// The name a folded counted array index carries, the accessor call the plain build makes
+export const ARRAY_ELEMENT = 'array_element';
 
 // D3D primitive type of the triangle lists the mesh exporter writes
 const PT_TRIANGLELIST = 4;
@@ -672,13 +678,13 @@ export class DerivedModel {
           if (r && r.obj !== undefined) return { obj: r.obj, off: (r.off || 0) + n.off };
           return { res: Number(n.base.slice(3)), off: n.off };
         }
-        if (n.base.startsWith('g')) return u32(parseInt(n.base.slice(1), 16) + n.off);
+        if (n.base.startsWith('g')) return this.globalPointer(env, n.base, n.off);
         return { ptr: n.base, off: n.off };
       case 'sym':
         if (n.name.startsWith('texture:')) return { texture: n.name };
         if (n.name.startsWith('arg')) return env.args[Number(n.name.slice(3))] ?? 0;
         if (n.name.startsWith('ctor.arg')) return env.args[Number(n.name.slice(8))] ?? 0;
-        if (n.name.startsWith('reg.') || n.name.startsWith('clobber.') || n.name.startsWith('fpu.') || n.name === 'ftol.hi' || n.name === 'fsw') return 0;
+        if (n.name.startsWith('reg.') || n.name.startsWith('clobber.') || n.name.startsWith('fpu.') || n.name.startsWith('xmm') || n.name.startsWith('mm') || n.name === 'ftol.hi' || n.name === 'fsw') return 0;
         throw new Error(`unbound symbol ${n.name}`);
       case 'load': return this.evalLoad(n, env);
       case 'bin': return this.evalBin(n, env);
@@ -751,9 +757,25 @@ export class DerivedModel {
     if (n.base === 'stack') return this.entryStack(env, env, n.off, n.size);
     if (n.base.startsWith('res')) return this.entryBuffer(env, Number(n.base.slice(3)), n.off, n.size);
     if (n.base.startsWith('import:')) return u32(this.host.console.kernelVariable(n.base.slice(7), n.off, n.size));
-    if (n.base.startsWith('g')) return this.entryGlobal(env, parseInt(n.base.slice(1), 16) + n.off, n.size);
+    if (n.base.startsWith('g')) {
+      const p = this.globalPointer(env, n.base, n.off);
+      if (p && (p.matrixStack !== undefined || p.vb !== undefined || p.device !== undefined)) return p;
+      return this.loadAt(env, p, n.size);
+    }
     if (env.mat && n.base === env.mat.object) return this.entryMaterial(env, env.mat, n.off, n.size);
     throw new Error(`load from ${n.base}`);
+  }
+
+  // The object a typed global pointer names: the handle the global held when the path started, offset into it
+  globalPointer(env, base, off) {
+    const addr = parseInt(base.slice(1), 16);
+    const v = this.entryGlobal(env, addr, 4);
+    if (typeof v === 'number') return u32(v + off);
+    if (v && v.obj !== undefined) return { obj: v.obj, off: (v.off || 0) + off };
+    if (v && v.res !== undefined) return { res: v.res, off: (v.off || 0) + off };
+    if (v && v.stack !== undefined) return { stack: v.stack + off, frame: v.frame };
+    if (off === 0 && v && typeof v === 'object') return v;
+    throw new Error(`global 0x${addr.toString(16)} holds ${describe(v)} which cannot be offset by ${off}`);
   }
 
   // Reads a word or a float block from the stack frame of the running function
@@ -809,13 +831,18 @@ export class DerivedModel {
 
   evalBin(n, env) {
     const op = n.op;
-    if (op === 'fadd' || op === 'fsub' || op === 'fmul' || op === 'fdiv') {
+    if (FLOAT_BIN_OPS.has(op)) {
       const a = this.scalar(this.eval(n.a, env)), b = this.scalar(this.eval(n.b, env));
       switch (op) {
         case 'fadd': return a + b;
         case 'fsub': return a - b;
         case 'fmul': return a * b;
         case 'fdiv': return a / b;
+        case 'fmin': return Math.min(a, b);
+        case 'fmax': return Math.max(a, b);
+        case 'fmod': return a % b;
+        case 'fpow': return Math.pow(a, b);
+        case 'fatan2': return Math.atan2(a, b);
       }
     }
     const av = this.eval(n.a, env), bv = this.eval(n.b, env);
@@ -839,6 +866,8 @@ export class DerivedModel {
       case 'idiv_rem': return u32((a | 0) % (b | 0));
       case 'udiv': return u32(Math.trunc(a / b));
       case 'udiv_rem': return u32(a % b);
+      case 'imulhi': return u32(Number((BigInt(a | 0) * BigInt(b | 0)) >> 32n));
+      case 'mulhi': return u32(Number((BigInt(a) * BigInt(b)) >> 32n));
     }
     throw new Error(`unknown binary op ${op}`);
   }
@@ -865,6 +894,18 @@ export class DerivedModel {
       case 'fsin': return Math.sin(this.scalar(v));
       case 'fcos': return Math.cos(this.scalar(v));
       case 'fsqrt': return Math.sqrt(this.scalar(v));
+      case 'ftan': return Math.tan(this.scalar(v));
+      case 'ffloor': return Math.floor(this.scalar(v));
+      case 'fceil': return Math.ceil(this.scalar(v));
+      case 'fexp': return Math.exp(this.scalar(v));
+      case 'flog': return Math.log(this.scalar(v));
+      case 'flog10': return Math.log10(this.scalar(v));
+      case 'fatan': return Math.atan(this.scalar(v));
+      case 'fasin': return Math.asin(this.scalar(v));
+      case 'facos': return Math.acos(this.scalar(v));
+      case 'fsinh': return Math.sinh(this.scalar(v));
+      case 'fcosh': return Math.cosh(this.scalar(v));
+      case 'ftanh': return Math.tanh(this.scalar(v));
     }
     throw new Error(`unknown unary op ${n.op}`);
   }
@@ -952,6 +993,24 @@ export class DerivedModel {
     }
     const args = argIdx.map((a) => this.eval(a, env));
     switch (fn) {
+      // The element accessor the optimizer expanded at its call sites, folded back by the derivation
+      case ARRAY_ELEMENT: {
+        const hook = this.hooks.get(ARRAY_ELEMENT);
+        if (!hook) throw new Error('no array element accessor is registered');
+        return hook(thisIdx === undefined ? undefined : this.eval(thisIdx, env), args, env.state, env);
+      }
+      case 'bsearch': {
+        // The material node searches the registry the factory filled, by the material name it holds.
+        const registry = this.model.material_registry;
+        const base = this.int(args[1]);
+        if (!registry || base !== registry.base) throw new Error(`bsearch over 0x${base.toString(16)} is not the material registry`);
+        const name = this.string(args[0]);
+        const m = this.materials.get(name);
+        if (!m) return 0;
+        const slot = new SceneObject(HEAP_TYPE, null);
+        slot.slots.set(0, { material: m });
+        return { obj: slot, off: 0 };
+      }
       case 'wcscmp':
       case '_wcsicmp': {
         const a = this.string(args[0]), b = this.string(args[1]);
@@ -1270,8 +1329,22 @@ export class DerivedModel {
         this.noteBuffer(env, Number(base.slice(3)), off, e.size);
         this.bufferStore(env, Number(base.slice(3)), off, e.size, value);
       } else if (base.startsWith('g')) {
-        this.noteGlobal(env, parseInt(base.slice(1), 16) + off, e.size);
-        this.memory.store(parseInt(base.slice(1), 16) + off, e.size, this.storable(value, e.size));
+        const p = this.globalPointer(env, base, off);
+        if (typeof p === 'number') {
+          this.noteGlobal(env, p, e.size);
+          this.memory.store(p, e.size, this.storable(value, e.size));
+        } else if (p.obj !== undefined) {
+          this.noteField(env, p.obj, p.off, e.size);
+          this.writeField(p.obj, p.off, e.size === 8 ? { f64: this.scalar(value) } : (typeof value === 'object' && value !== null && value.bits === undefined ? value : this.int(value)));
+        } else if (p.stack !== undefined) {
+          this.noteStack(env, p.frame || env, p.stack);
+          (p.frame || env).stack.set(p.stack, value);
+        } else if (p.res !== undefined) {
+          this.noteBuffer(env, p.res, p.off, e.size);
+          this.bufferStore(env, p.res, p.off, e.size, value);
+        } else {
+          throw new Error(`store through ${describe(p)} held by global ${base}`);
+        }
       } else if (env.mat && base === env.mat.object) {
         this.noteMaterial(env, env.mat, off, e.size);
         this.storeMaterialField(env.mat, off, e.size, e.size === 8 && typeof value === 'number' ? { f64: value } : value);
@@ -1369,6 +1442,8 @@ export class DerivedModel {
       state.indices = args[0];
     } else if (fn === 'D3DDevice_SetMaterial') {
       state.material = args[0];
+    } else if (fn === 'D3DDevice_Swap') {
+      this.host.onPresent(state);
     } else if (fn === 'D3DDevice_Clear') {
       state.clear = { flags: this.int(args[2]), color: this.int(args[3]) };
       this.host.onClear(state);

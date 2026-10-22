@@ -37,6 +37,17 @@ type Disassembly struct {
 
 	// All instructions indexed by VA for fast lookup
 	InsnByVA map[uint32]*Instruction
+
+	ctors           map[uint32]ctorInfo
+	clobbers        map[uint32][]x86asm.Reg
+	liveIns         map[uint32][]x86asm.Reg
+	conventions     map[uint32]callConvention
+	probe           *Executor
+	librarySections map[*Section]bool
+	layout          *deviceLayout
+	layoutErr       error
+	layoutBusy      bool
+	biases          map[uint32]int32
 }
 
 // Disassemble performs full recursive disassembly of the XBE image.
@@ -61,6 +72,7 @@ func Disassemble(img *Image) (*Disassembly, error) {
 		}
 		d.linearSweep(sec)
 	}
+	d.resynchronize()
 
 	// Step 3: Discover function boundaries across all code.
 	d.discoverFunctions()
@@ -69,6 +81,9 @@ func Disassemble(img *Image) (*Disassembly, error) {
 	if _, err := d.IdentifyLibraryFunctions(); err != nil {
 		return nil, err
 	}
+
+	// Step 5: Name the compiler's own helpers, which carry no signature of their own.
+	d.nameSecurityCheck()
 
 	return d, nil
 }
@@ -116,6 +131,46 @@ func (d *Disassembly) linearSweep(text *Section) {
 		d.InsnByVA[va] = insn
 
 		offset += inst.Len
+		va += uint32(inst.Len)
+	}
+}
+
+// Decodes again from every call target the sweep passed over misaligned, data in a code section having desynchronized it
+func (d *Disassembly) resynchronize() {
+	for {
+		var missing []uint32
+		for _, insn := range d.InsnByVA {
+			if insn.Inst.Op != x86asm.CALL {
+				continue
+			}
+			if t := resolveTarget(insn); t != 0 && d.InsnByVA[t] == nil && d.sectionOf(t) != nil {
+				missing = append(missing, t)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+		for _, va := range missing {
+			d.decodeFrom(va)
+		}
+	}
+}
+
+// Decodes instructions from an address until reaching code already decoded or the end of the section
+func (d *Disassembly) decodeFrom(va uint32) {
+	sec := d.sectionOf(va)
+	for va < sec.VirtualAddr+sec.VirtualSize && d.InsnByVA[va] == nil {
+		inst, err := x86asm.Decode(sec.Data[va-sec.VirtualAddr:], 32)
+		if err != nil {
+			return
+		}
+		raw := make([]byte, inst.Len)
+		copy(raw, sec.Data[va-sec.VirtualAddr:va-sec.VirtualAddr+uint32(inst.Len)])
+		d.InsnByVA[va] = &Instruction{VA: va, Inst: inst, Raw: raw}
+		if inst.Op == x86asm.RET || inst.Op == x86asm.JMP || inst.Op == x86asm.HLT || inst.Op == x86asm.INT {
+			return
+		}
 		va += uint32(inst.Len)
 	}
 }
@@ -209,8 +264,18 @@ func (d *Disassembly) recoverGaps(entries map[uint32]bool) {
 				va++
 				continue
 			}
-			fn := d.buildFunction(va, entries)
+			fn := d.buildFunctionWithin(va, entries, covered)
 			if fn == nil {
+				va++
+				continue
+			}
+			if !plausibleStart(fn) {
+				// Data decoded as code is skipped whole rather than retried from every byte.
+				for _, in := range fn.Instructions {
+					for b := uint32(0); b < uint32(in.Inst.Len); b++ {
+						covered[in.VA+b] = true
+					}
+				}
 				va++
 				continue
 			}
@@ -227,6 +292,11 @@ func (d *Disassembly) recoverGaps(entries map[uint32]bool) {
 
 // Collects every instruction reachable from entry through jumps and fallthrough
 func (d *Disassembly) buildFunction(entry uint32, entries map[uint32]bool) *Function {
+	return d.buildFunctionWithin(entry, entries, nil)
+}
+
+// Collects the instructions reachable from entry, never entering code another function already owns
+func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool, owned map[uint32]bool) *Function {
 	sec := d.sectionOf(entry)
 	if sec == nil {
 		return nil
@@ -238,7 +308,7 @@ func (d *Disassembly) buildFunction(entry uint32, entries map[uint32]bool) *Func
 		va := work[len(work)-1]
 		work = work[:len(work)-1]
 		for {
-			if seen[va] || va < sec.VirtualAddr || va >= sec.VirtualAddr+sec.VirtualSize {
+			if seen[va] || va < sec.VirtualAddr || va >= sec.VirtualAddr+sec.VirtualSize || (owned != nil && owned[va] && va != entry) {
 				break
 			}
 			insn, ok := d.InsnByVA[va]
@@ -772,4 +842,73 @@ var kernelExports = [379]string{
 	"MmDbgQueryAvailablePages",            // 376
 	"MmDbgReleaseAddress",                 // 377
 	"MmDbgWriteCheck",                     // 378
+}
+
+// Reports whether the first instructions of a recovered function look like compiler output rather than data
+func plausibleStart(fn *Function) bool {
+	for i := 0; i < len(fn.Instructions) && i < 8; i++ {
+		switch fn.Instructions[i].Inst.Op {
+		case x86asm.AAS, x86asm.AAA, x86asm.AAD, x86asm.AAM, x86asm.DAA, x86asm.DAS, x86asm.BOUND, x86asm.IRET, x86asm.IRETD, x86asm.ENTER,
+			x86asm.IN, x86asm.OUT, x86asm.INSB, x86asm.INSD, x86asm.OUTSB, x86asm.OUTSD, x86asm.LODSB, x86asm.HLT, x86asm.ARPL, x86asm.LES, x86asm.LDS, x86asm.INTO, x86asm.XLATB:
+			return false
+		case x86asm.MOV, x86asm.POP:
+			if r, ok := fn.Instructions[i].Inst.Args[0].(x86asm.Reg); ok && r >= x86asm.ES && r <= x86asm.GS {
+				return false
+			}
+		case x86asm.ADD:
+			// Zero bytes decode as add [eax], al, which no compiler emits.
+			if m, ok := fn.Instructions[i].Inst.Args[0].(x86asm.Mem); ok && m.Base == x86asm.EAX && m.Disp == 0 && m.Index == 0 {
+				if r, ok := fn.Instructions[i].Inst.Args[1].(x86asm.Reg); ok && r == x86asm.AL {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// Lists the sections holding signature identified library functions
+func (d *Disassembly) libraries() map[*Section]bool {
+	if d.librarySections == nil {
+		d.librarySections = map[*Section]bool{}
+		for fva, fn := range d.Functions {
+			if fn.Symbol != nil {
+				if s := d.sectionOf(fva); s != nil {
+					d.librarySections[s] = true
+				}
+			}
+		}
+	}
+	return d.librarySections
+}
+
+// Reports whether an address lies in a section holding signature identified library functions other than the entry section
+func (d *Disassembly) inLibrary(va uint32) bool {
+	sec := d.sectionOf(va)
+	if sec == nil || sec == d.sectionOf(d.Image.EntryPoint) {
+		return false
+	}
+	return d.libraries()[sec]
+}
+
+// Reports whether an address lies in a writable section holding neither the dashboard's code nor a library's
+func (d *Disassembly) inPureData(va uint32) bool {
+	sec := d.sectionOf(va)
+	if sec == nil || sec.Flags&0x1 == 0 || sec == d.sectionOf(d.Image.EntryPoint) {
+		return false
+	}
+	return !d.libraries()[sec]
+}
+
+// Names an unidentified library function after the XDK routine the dashboard's use of it reveals
+func (d *Disassembly) nameByUsage(va uint32, name string) {
+	fn := d.Functions[va]
+	if fn == nil || fn.Symbol != nil {
+		return
+	}
+	sym := decorateSymbol(name)
+	sym.VA, sym.Lib = va, "usage"
+	fn.Name, fn.Symbol = sym.Name, &sym
+	delete(d.conventions, va)
+	d.librarySections = nil
 }

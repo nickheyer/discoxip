@@ -1,7 +1,7 @@
 APP       := discoxip
 BUILD_DIR := build
 BIN       := $(BUILD_DIR)/$(APP)
-SRC       ?= sample/5659
+SRC       ?= sample/4304
 OUT       ?= $(BUILD_DIR)/dev
 PORT      ?= 8000
 XBE       ?= $(firstword $(wildcard $(SRC)/*.xbe))

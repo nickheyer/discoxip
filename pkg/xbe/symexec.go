@@ -87,6 +87,10 @@ func (e *ExecError) Error() string {
 
 var debugTrace = os.Getenv("DISCOXIP_TRACE") != ""
 
+var debugNoVResolve = os.Getenv("DISCOXIP_NO_VRESOLVE") != ""
+
+var debugNoKeep = os.Getenv("DISCOXIP_NO_KEEP") != ""
+
 // Execution limits that stop runaway analysis
 const (
 	maxSteps      = 60000
@@ -94,10 +98,13 @@ const (
 	maxInlineSize = 4000
 	maxFrameSteps = 2500
 	maxLoopUnroll = 4
+	maxRepCount   = 1 << 16
 )
 
 type execState struct {
 	regs     [8]Expr
+	xmm      [8][4]Expr
+	mm       [8][2]Expr
 	mem      map[memKey]memVal
 	fpu      []Expr
 	fl       flagState
@@ -135,15 +142,20 @@ type Executor struct {
 	Opaque      map[uint32]bool // functions never inlined
 	ftol        map[uint32]bool
 	errCount    int
-	allocHook   func() Expr     // fresh object pointer for the allocator when set
-	CopyUnknown bool            // keeps rep movs of symbolic length as copy effects instead of failing
-	written     map[uint32]bool // global bytes some instruction stores to directly
-	Results     map[uint32]Expr // fixed return values for opaque functions
-	Allocators  map[uint32]bool // functions whose results are fresh objects
-	savePush    map[uint32]bool // push instructions that save callee owned registers
-	StepLimit   int             // per path instruction budget, zero means the default
-	FrameLimit  int             // per inlined frame budget, negative disables the budget
-	PathLimit   int             // paths one run may enumerate, zero means the default
+	allocHook   func() Expr            // fresh object pointer for the allocator when set
+	CopyUnknown bool                   // keeps rep movs of symbolic length as copy effects instead of failing
+	written     map[uint32]bool        // global bytes some instruction stores to directly
+	Results     map[uint32]Expr        // fixed return values for opaque functions
+	Allocators  map[uint32]bool        // functions whose results are fresh objects
+	savePush    map[uint32]bool        // push instructions that save callee owned registers
+	StepLimit   int                    // per path instruction budget, zero means the default
+	FrameLimit  int                    // per inlined frame budget, negative disables the budget
+	PathLimit   int                    // paths one run may enumerate, zero means the default
+	staticThis  map[uint32]uint32      // functions invoked on a static object, by address
+	thisLoc     map[uint32]argLocation // where each such function takes its object
+	callTarget  uint32                 // library function the opaque call being recorded resolves to
+	arrayIdx    map[uint32]arrayIndex  // counted array indexes the optimizer inlined, by their first instruction
+	Stop        map[uint32]bool        // addresses a path ends at, for a routine the runtime enters and leaves mid function
 }
 
 // NewExecutor prepares an executor with symbol and vtable knowledge.
@@ -160,25 +172,68 @@ func NewExecutor(d *Disassembly) *Executor {
 			ex.ftol[va] = true
 		}
 	}
+	stage("resolve global objects")
 	ex.resolveGlobalObjects()
+	stage("scan written globals")
 	ex.scanWrittenGlobals()
 	ex.scanPrologues()
+	ex.scanArrayIndexes()
+	stage("executor ready")
 	return ex
 }
 
-// Records the register saving pushes in every function prologue
+// Records every counted array index the optimizer inlined, so each runs as the accessor call it expands
+func (ex *Executor) scanArrayIndexes() {
+	ex.arrayIdx = map[uint32]arrayIndex{}
+	for va, fn := range ex.d.Functions {
+		if fn.Symbol != nil || ex.d.inLibrary(va) {
+			continue
+		}
+		for start, a := range inlinedArrayIndexes(fn) {
+			ex.arrayIdx[start] = a
+		}
+	}
+}
+
+// Runs an inlined index as the element accessor call, leaving the element in the register the load reads into
+func (ex *Executor) arrayElement(s *execState, in *Instruction, a arrayIndex) {
+	ptr := asPtr(ex.addr(s, x86asm.Mem{Base: a.base, Disp: int64(a.off)}))
+	index := s.getReg(a.index)
+	ex.seq++
+	res := CallResult{Fn: arrayElementCall, Args: []Expr{index}, Seq: ex.seq, This: ptr}
+	s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: arrayElementCall, Args: []Expr{index}, Seq: ex.seq, This: ptr})
+	s.setReg(a.temp, Sym{fmt.Sprintf("clobber.%s#%d", a.temp, ex.seq)})
+	s.setReg(a.dest, res)
+	s.va = a.exit
+}
+
+// Records the register saving pushes in every function prologue, reading each only as far as the code it owns
 func (ex *Executor) scanPrologues() {
 	ex.savePush = map[uint32]bool{}
-	for _, fn := range ex.d.Functions {
-		for i := range fn.Instructions {
-			in := &fn.Instructions[i]
+	owner := map[uint32]uint32{}
+	for _, va := range ex.d.functionVAs() {
+		for i := range ex.d.Functions[va].Instructions {
+			in := &ex.d.Functions[va].Instructions[i]
+			if _, taken := owner[in.VA]; !taken {
+				owner[in.VA] = va
+			}
+		}
+	}
+	for _, va := range ex.d.functionVAs() {
+		for cur := va; owner[cur] == va; {
+			in := ex.d.InsnByVA[cur]
+			if in == nil {
+				break
+			}
 			switch in.Inst.Op {
 			case x86asm.PUSH:
 				if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI) {
-					ex.savePush[in.VA] = true
+					ex.savePush[cur] = true
+					cur += uint32(in.Inst.Len)
 					continue
 				}
 			case x86asm.MOV, x86asm.LEA, x86asm.SUB, x86asm.AND, x86asm.XOR, x86asm.FLD, x86asm.FLD1, x86asm.FLDZ, x86asm.FSTP:
+				cur += uint32(in.Inst.Len)
 				continue
 			}
 			break
@@ -252,51 +307,120 @@ func isFtol(fn *Function) bool {
 	return false
 }
 
-// Finds functions invoked with a static object address in ecx
+// Finds functions invoked with a static object address in a register they read, keeping that register
 func (ex *Executor) staticThisCallers() map[uint32]uint32 {
-	out := map[uint32]uint32{}
+	if ex.staticThis != nil {
+		return ex.staticThis
+	}
+	ex.staticThis = map[uint32]uint32{}
+	ex.thisLoc = map[uint32]argLocation{}
+	code := ex.d.sectionOf(ex.d.Image.EntryPoint)
+	// An optimized build hands the object on in a register, so each round reveals the callees of the last
+	for round, found := 0, true; found && round < staticThisRounds; round++ {
+		found = ex.scanStaticThis(code)
+	}
+	return ex.staticThis
+}
+
+// Rounds of propagation through routines that pass their object on in the register they received it in
+const staticThisRounds = 8
+
+// Records the static object each routine runs on, reporting whether this round learned anything new
+func (ex *Executor) scanStaticThis(code *Section) bool {
+	found := false
+	record := func(t, addr uint32, loc argLocation) {
+		if a, seen := ex.staticThis[t]; !seen || a != addr || ex.thisLoc[t] != loc {
+			found = true
+		}
+		ex.staticThis[t], ex.thisLoc[t] = addr, loc
+	}
 	for _, va := range ex.d.functionVAs() {
-		ins := ex.d.Functions[va].Instructions
-		var ecxImm uint32
-		for i := range ins {
-			in := &ins[i]
-			if in.Inst.Op == x86asm.MOV && argCount(in) == 2 {
-				if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.ECX {
-					if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && ex.isDataAddress(uint32(imm)) {
-						ecxImm = uint32(imm)
-					} else if src, ok := in.Inst.Args[1].(x86asm.Reg); ok && src == x86asm.ESI && i > 0 {
-						// mov ecx, esi after mov esi, imm keeps the static address
-						ecxImm = staticRegImm(ins, i, x86asm.ESI, ex)
-					} else {
-						ecxImm = 0
+		fn := ex.d.Functions[va]
+		seed := map[x86asm.Reg]uint32{}
+		if addr, ok := ex.staticThis[va]; ok {
+			if loc := ex.thisLoc[va]; loc.Reg != 0 {
+				seed[loc.Reg] = addr
+			}
+		}
+		states := ex.d.staticAddressFlowFrom(fn, seed)
+		for i := range fn.Instructions {
+			in := &fn.Instructions[i]
+			if in.Inst.Op != x86asm.CALL || states[i] == nil {
+				continue
+			}
+			t := resolveTarget(in)
+			callee := ex.d.Functions[t]
+			// Only the dashboard's own unnamed code holds methods of its static objects.
+			if callee == nil || t == 0 || callee.Symbol != nil || ex.d.sectionOf(t) != code {
+				continue
+			}
+			chosen := x86asm.Reg(0)
+			for _, r := range ex.d.liveInRegisters(callee) {
+				if _, ok := states[i][r]; !ok {
+					continue
+				}
+				if chosen == 0 || r == x86asm.ECX {
+					chosen = r
+				}
+			}
+			if chosen != 0 {
+				record(t, states[i][chosen], argLocation{Reg: chosen})
+				continue
+			}
+			// With no register carrying it, the object may be the first stack argument, pushed right before the call.
+			if i > 0 && calleeCleanupOf(callee) > 0 {
+				prev := &fn.Instructions[i-1]
+				if prev.Inst.Op == x86asm.PUSH {
+					if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok && ex.isDataAddress(uint32(imm)) {
+						record(t, uint32(imm), argLocation{Stack: 0})
 					}
 				}
 			}
-			if in.Inst.Op == x86asm.CALL && ecxImm != 0 {
-				if t := resolveTarget(in); t != 0 {
-					out[t] = ecxImm
-				}
-				ecxImm = 0
-			}
 		}
 	}
-	return out
+	return found
 }
 
-// Returns the immediate most recently moved into a register before index i or 0
-func staticRegImm(ins []Instruction, i int, r x86asm.Reg, ex *Executor) uint32 {
-	for j := i - 1; j >= 0 && j > i-16; j-- {
-		in := &ins[j]
-		if in.Inst.Op == x86asm.MOV && argCount(in) == 2 {
-			if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok && dst == r {
-				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && ex.isDataAddress(uint32(imm)) {
-					return uint32(imm)
-				}
-				return 0
-			}
-		}
+// Seeds the static object where the function takes it and numbers the other inputs, registers before the stack
+func (ex *Executor) seedThis(s *execState, fn, addr uint32, stackArgs int) {
+	ex.staticThisCallers()
+	loc, known := ex.thisLoc[fn]
+	if callee := ex.d.Functions[fn]; callee != nil && calleeCleanupOf(callee)/4 > stackArgs {
+		stackArgs = calleeCleanupOf(callee) / 4
 	}
-	return 0
+	this := Expr(Ptr{"", int32(addr)})
+	n := 0
+	next := func() Expr {
+		e := Sym{fmt.Sprintf("arg%d", n)}
+		n++
+		return e
+	}
+	thisReg := x86asm.ECX
+	if known && loc.Reg != 0 {
+		thisReg = loc.Reg
+	}
+	for _, r := range ex.d.registerInputs(fn) {
+		v := next()
+		if r == thisReg {
+			v = this
+		}
+		s.regs[regIndex[r]] = v
+	}
+	if !known || loc.Reg != 0 {
+		s.regs[regIndex[thisReg]] = this
+	}
+	count := stackArgs
+	if known && loc.Reg == 0 && loc.Stack >= count {
+		count = loc.Stack + 1
+	}
+	args := make([]Expr, count)
+	for i := range args {
+		args[i] = next()
+	}
+	if known && loc.Reg == 0 {
+		args[loc.Stack] = this
+	}
+	s.pushArgs(args...)
 }
 
 // Reports whether an address lies in a writable data section
@@ -309,12 +433,53 @@ func (ex *Executor) isDataAddress(va uint32) bool {
 func (ex *Executor) resolveGlobalObjects() {
 	staticThis := ex.staticThisCallers()
 	for _, fnVA := range ex.d.functionVAs() {
+		for _, c := range ex.d.constructions(ex.d.Functions[fnVA]) {
+			if c.vtable == 0 {
+				continue
+			}
+			for _, g := range c.globals {
+				ex.vtables[g] = c.vtable
+			}
+		}
 		ins := ex.d.Functions[fnVA].Instructions
 		bases := map[x86asm.Reg]uint32{}
-		if t, ok := staticThis[fnVA]; ok {
-			bases[x86asm.ECX] = t
+		if t, ok := staticThis[fnVA]; ok && ex.thisLoc[fnVA].Reg != 0 {
+			bases[ex.thisLoc[fnVA].Reg] = t
 		}
+		var pushed []uint32
 		for i, in := range ins {
+			// A library call constructing an object through an out pointer types the address pushed for it.
+			switch in.Inst.Op {
+			case x86asm.PUSH:
+				addr := uint32(0)
+				if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
+					addr = uint32(imm)
+				} else if r, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+					addr = bases[r]
+				}
+				pushed = append(pushed, addr)
+			case x86asm.CALL:
+				if vt, ok := ex.d.outObjectVtable(resolveTarget(&in)); ok {
+					idx := outParams[ex.d.Functions[resolveTarget(&in)].Symbol.Name]
+					if idx < len(pushed) {
+						if addr := pushed[len(pushed)-1-idx]; addr != 0 && ex.isDataAddress(addr) {
+							ex.vtables[addr] = vt
+						}
+					}
+				}
+				pushed = nil
+				delete(bases, x86asm.EAX)
+				delete(bases, x86asm.ECX)
+				delete(bases, x86asm.EDX)
+			case x86asm.LEA:
+				if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+					if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && m.Index == 0 && bases[m.Base] != 0 {
+						bases[dst] = bases[m.Base] + uint32(m.Disp)
+					} else {
+						delete(bases, dst)
+					}
+				}
+			}
 			if in.Inst.Op != x86asm.MOV || argCount(&in) < 2 {
 				continue
 			}
@@ -360,11 +525,8 @@ func (ex *Executor) resolveGlobalObjects() {
 				if !holders[src] {
 					break
 				}
-				t := resolveTarget(jn)
-				if ctor, ok := ex.d.Functions[t]; ok {
-					if vt := ctorVtable(ex.d, ctor); vt != 0 {
-						ex.vtables[globalVA] = vt
-					}
+				if info, ok := ex.d.constructorInfo()[resolveTarget(jn)]; ok {
+					ex.vtables[globalVA] = info.vtable
 				}
 				break
 			}
@@ -383,6 +545,7 @@ func (ex *Executor) LearnGlobalObjects(allocators []uint32, opaque []uint32) {
 			continue
 		}
 		seen[fnVA] = true
+		stage(fmt.Sprintf("learn %08X on %08X in %v", fnVA, thisVA, ex.thisLoc[fnVA]))
 		sub := NewExecutorShared(ex)
 		for _, va := range allocators {
 			sub.Opaque[va] = true
@@ -397,7 +560,7 @@ func (ex *Executor) LearnGlobalObjects(allocators []uint32, opaque []uint32) {
 		}
 		for attempt := 0; attempt < 6; attempt++ {
 			paths, err := sub.Run(fnVA, func(s *execState) {
-				s.regs[1] = Ptr{"", int32(thisVA)}
+				ex.seedThis(s, fnVA, thisVA, 0)
 			})
 			harvest := func(effects []Effect) {
 				objVt := map[string]uint32{}
@@ -462,29 +625,7 @@ func (ex *Executor) RunWithRetries(entry uint32, init func(s *execState), retrie
 
 // NewExecutorShared makes an executor reusing another one's precomputed knowledge.
 func NewExecutorShared(base *Executor) *Executor {
-	return &Executor{d: base.d, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Opaque: map[uint32]bool{}, ftol: base.ftol, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush}
-}
-
-// Returns the vtable a constructor stores at this+0 or 0
-func ctorVtable(d *Disassembly, fn *Function) uint32 {
-	thisRegs := map[x86asm.Reg]bool{x86asm.ECX: true}
-	for _, in := range fn.Instructions {
-		if in.Inst.Op == x86asm.MOV && argCount(&in) == 2 {
-			if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
-				if src, ok := in.Inst.Args[1].(x86asm.Reg); ok && thisRegs[src] {
-					thisRegs[dst] = true
-				}
-			}
-			if mem, ok := in.Inst.Args[0].(x86asm.Mem); ok && thisRegs[mem.Base] && mem.Index == 0 && mem.Disp == 0 {
-				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-					if d.isVtable(uint32(imm)) {
-						return uint32(imm)
-					}
-				}
-			}
-		}
-	}
-	return 0
+	return &Executor{d: base.d, arrayIdx: base.arrayIdx, Stop: base.Stop, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Opaque: map[uint32]bool{}, ftol: base.ftol, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush, staticThis: base.staticThis, thisLoc: base.thisLoc}
 }
 
 // Reports whether a data pointer starts a table of code addresses
@@ -663,6 +804,9 @@ func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 		}
 	}
 	s.mem[memKey{p.Base, p.Off}] = memVal{size, v}
+	if p.Base == "" && !ex.d.layoutBusy && ex.stateStore(s, uint32(p.Off), size, v, va) {
+		return
+	}
 	if p.Base != "stack" {
 		s.effects = append(s.effects, Effect{Kind: "store", VA: va, Base: p.Base, Off: p.Off, Size: size, Value: v})
 	}
@@ -777,11 +921,11 @@ func isFloatExpr(e Expr) bool {
 		return true
 	case Un:
 		switch v.Op {
-		case "f64", "f32", "bits2f", "bits2d", "i2f", "fneg", "fabs", "fsin", "fcos", "fsqrt":
+		case "f64", "f32", "bits2f", "bits2d", "i2f", "fneg", "fabs", "fsin", "fcos", "fsqrt", "ftan", "ffloor", "fceil", "fexp", "flog", "flog10", "fatan", "fasin", "facos", "fsinh", "fcosh", "ftanh":
 			return true
 		}
 	case Bin:
-		return v.Op == "fadd" || v.Op == "fsub" || v.Op == "fmul" || v.Op == "fdiv"
+		return floatBinOps[v.Op]
 	}
 	return false
 }
@@ -914,8 +1058,47 @@ func (ex *Executor) Run(entry uint32, init func(s *execState)) ([]Path, error) {
 	s.push(RetAddr{VA: 0, Clean: 0})
 	s.entry = [][8]Expr{s.regs}
 	ex.paths = nil
-	err := ex.run(s)
-	return ex.paths, err
+	if err := ex.run(s); err != nil {
+		return ex.paths, err
+	}
+	// Dashboard code reads as the XDK calls it makes, the ones the link time optimizer inlined included
+	if fn := ex.d.Functions[entry]; fn != nil && fn.Symbol == nil && !ex.d.inLibrary(entry) {
+		return ex.foldInlinedCreations(ex.paths)
+	}
+	return ex.paths, nil
+}
+
+// Lists the argument registers besides ecx an unnamed dashboard function reads, which its callers fill before the stack
+func (d *Disassembly) registerInputs(va uint32) []x86asm.Reg {
+	fn := d.Functions[va]
+	if fn == nil || fn.Symbol != nil || d.inLibrary(va) {
+		return nil
+	}
+	var out []x86asm.Reg
+	for _, r := range d.liveInRegisters(fn) {
+		if r != x86asm.ECX {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// Seeds a function's inputs with numbered symbols, its register inputs taking the leading numbers before the stack
+func (ex *Executor) seedArgs(s *execState, va uint32, prefix string, stackArgs int) {
+	n := 0
+	next := func() Expr {
+		e := Sym{fmt.Sprintf("%s%d", prefix, n)}
+		n++
+		return e
+	}
+	for _, r := range ex.d.registerInputs(va) {
+		s.regs[regIndex[r]] = next()
+	}
+	args := make([]Expr, stackArgs)
+	for i := range args {
+		args[i] = next()
+	}
+	s.pushArgs(args...)
 }
 
 // Reports whether a push preserves a callee saved register still holding its frame entry value
@@ -954,6 +1137,10 @@ func (ex *Executor) run(s *execState) error {
 		if len(ex.paths) > pathLimit {
 			return &ExecError{VA: s.va, Frames: s.frames, Limit: true, Err: fmt.Errorf("path limit exceeded"), Effects: s.effects}
 		}
+		if ex.Stop[s.va] && len(s.frames) == 0 {
+			ex.finish(s)
+			return nil
+		}
 		in, ok := ex.d.InsnByVA[s.va]
 		if !ok {
 			return &ExecError{VA: s.va, Frames: s.frames, Err: fmt.Errorf("no instruction"), Effects: s.effects}
@@ -973,6 +1160,10 @@ func (ex *Executor) run(s *execState) error {
 		}
 		if debugTrace && (s.steps%5000 == 0 || s.steps < 400) {
 			fmt.Printf("  trace: %08X %-28s esp=%s pushes=%d pending=%v\n", in.VA, in.Inst.String(), ExprString(s.regs[4]), s.pushes, s.pending != nil)
+		}
+		if a, ok := ex.arrayIdx[s.va]; ok {
+			ex.arrayElement(s, in, a)
+			continue
 		}
 		next := s.va + uint32(in.Inst.Len)
 		done, err := ex.step(s, in, next)
@@ -1055,6 +1246,37 @@ func (ex *Executor) branch(s *execState, cond Expr, taken, fall uint32) (bool, e
 	return false, nil
 }
 
+// Continues at the table entry a constant index selects, or forks a path per entry under a guard on a symbolic index
+func (ex *Executor) switchJump(s *execState, index Expr, targets []uint32) (bool, error) {
+	if c, ok := isConst(index); ok {
+		if int(c) >= len(targets) {
+			return false, fmt.Errorf("switch index %d outside its %d entry table", c, len(targets))
+		}
+		s.va = targets[c]
+		return false, nil
+	}
+	for k := 0; k+1 < len(targets); k++ {
+		alt := s.clone()
+		cond := mkCond("eq", index, IConst{uint32(k)})
+		alt.guards = append(alt.guards, cond)
+		alt.guardPos = append(alt.guardPos, len(alt.effects))
+		alt.bindFrom(cond)
+		alt.va = targets[k]
+		if err := ex.run(alt); err != nil {
+			return true, err
+		}
+		s.guards = append(s.guards, mkNot(cond))
+		s.guardPos = append(s.guardPos, len(s.effects))
+	}
+	last := len(targets) - 1
+	cond := mkCond("eq", index, IConst{uint32(last)})
+	s.guards = append(s.guards, cond)
+	s.guardPos = append(s.guardPos, len(s.effects))
+	s.bindFrom(cond)
+	s.va = targets[last]
+	return false, nil
+}
+
 // Fixes an atomic value when a guard pins it to a constant
 func (s *execState) bindFrom(cond Expr) {
 	c, ok := cond.(Cond)
@@ -1123,6 +1345,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	switch op {
 	case x86asm.NOP, x86asm.FWAIT, x86asm.FLDCW, x86asm.FNSTCW, x86asm.FNCLEX, x86asm.FNINIT:
 		return false, nil
+	case x86asm.INT, x86asm.HLT, x86asm.UD2:
+		// A path that traps, such as a failed stack cookie check, never completes and is abandoned.
+		return true, nil
 	case x86asm.MOV, x86asm.MOVZX, x86asm.MOVSX:
 		size := opSize(in, args[1])
 		v := ex.operand(s, in, args[1], size)
@@ -1135,6 +1360,12 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		}
 		if op != x86asm.MOV {
 			size = opSize(in, args[0])
+		}
+		// Linking the stack into the exception chain marks everything pushed so far as the registration record
+		if m, ok := args[0].(x86asm.Mem); ok && m.Segment == x86asm.FS && m.Disp == 0 {
+			if r, ok := args[1].(x86asm.Reg); ok && r == x86asm.ESP {
+				s.pushes = 0
+			}
 		}
 		ex.setOperand(s, in, args[0], opSize(in, args[0]), maskSize(v, opSize(in, args[0])))
 		_ = size
@@ -1208,11 +1439,22 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		r := maskSize(mkBin(name, a, b), size)
 		s.fl = flagState{kind: "alu", a: a, b: b, r: r}
 		ex.setOperand(s, in, args[0], size, r)
-	case x86asm.IMUL:
+	case x86asm.IMUL, x86asm.MUL:
 		size := opSize(in, args[0])
 		switch nargs {
 		case 1:
-			return false, fmt.Errorf("one operand imul unsupported")
+			// The widening product lands in edx:eax.
+			if size != 4 {
+				return false, fmt.Errorf("narrow widening multiply unsupported")
+			}
+			a := s.getReg(x86asm.EAX)
+			b := ex.operand(s, in, args[0], 4)
+			hi := "imulhi"
+			if op == x86asm.MUL {
+				hi = "mulhi"
+			}
+			s.setReg(x86asm.EDX, mkBin(hi, a, b))
+			s.setReg(x86asm.EAX, mkBin("mul", a, b))
 		case 2:
 			a := ex.operand(s, in, args[0], size)
 			b := ex.operand(s, in, args[1], size)
@@ -1246,6 +1488,25 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			s.fl = flagState{kind: "fsw", fsw: s.fcmp}
 			s.fl.a = IConst{0x45}
 		}
+	case x86asm.LAHF:
+		if s.fl.kind == "comiss" {
+			// The ordering flags land in ah exactly where fnstsw puts the condition codes.
+			s.fcmp = &fcmpRec{a: s.fl.a, b: s.fl.b}
+			s.regs[0] = Sym{"fsw"}
+			s.axFSW = true
+			return false, nil
+		}
+		if s.fl.kind == "" {
+			return false, fmt.Errorf("lahf without flags")
+		}
+		zf := mkBin("shl", mkCond("eq", s.fl.r, IConst{0}), IConst{6})
+		sf := mkBin("shl", mkCond("lt", s.fl.r, IConst{0}), IConst{7})
+		var cf Expr = IConst{0}
+		if s.fl.kind == "cmp" || s.fl.kind == "sub" {
+			cf = mkCond("ult", s.fl.a, s.fl.b)
+		}
+		ah := mkBin("or", mkBin("or", zf, sf), mkBin("or", cf, IConst{2}))
+		s.setReg(x86asm.AH, ah)
 	case x86asm.IDIV, x86asm.DIV:
 		size := opSize(in, args[0])
 		if size != 4 {
@@ -1298,6 +1559,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			}
 			return ex.doReturn(s, 0)
 		}
+		// A jump through a table of code addresses is a switch, forked over every case the index may select.
+		if m, ok := args[0].(x86asm.Mem); ok && m.Index != 0 && m.Scale == 4 && m.Base == 0 {
+			if sec := ex.d.sectionOf(in.VA); sec != nil {
+				if targets := ex.d.jumpTableTargets(in, sec); len(targets) > 0 {
+					return ex.switchJump(s, s.getReg(m.Index), targets)
+				}
+			}
+		}
 		// An indirect jump is a tail call followed by a return to the caller.
 		if err := ex.call(s, in, 0); err != nil {
 			return false, err
@@ -1326,6 +1595,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			c, ok := isConst(s.getReg(x86asm.ECX))
 			if !ok {
 				return false, fmt.Errorf("rep stos with symbolic count")
+			}
+			if c > maxRepCount {
+				return false, fmt.Errorf("rep stos count %d exceeds the unroll limit", c)
 			}
 			count = c
 		}
@@ -1361,6 +1633,33 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 				s.setReg(x86asm.ECX, IConst{0})
 				break
 			}
+			if cnt > maxRepCount {
+				return false, fmt.Errorf("rep movs count %d exceeds the unroll limit", cnt)
+			}
+			// A matrix copied straight into or out of the device's transform array is the inlined transform setter or getter.
+			if state, ok := ex.transformCopy(s, s.getReg(x86asm.EDI), cnt*uint32(size)); ok {
+				src := s.getReg(x86asm.ESI)
+				ex.seq++
+				s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: "D3DDevice_SetTransform", Args: []Expr{IConst{state}, src}, Seq: ex.seq})
+				advance := IConst{cnt * uint32(size)}
+				s.setReg(x86asm.EDI, mkBin("add", s.getReg(x86asm.EDI), advance))
+				s.setReg(x86asm.ESI, mkBin("add", src, advance))
+				s.setReg(x86asm.ECX, IConst{0})
+				break
+			}
+			if state, ok := ex.transformCopy(s, s.getReg(x86asm.ESI), cnt*uint32(size)); ok {
+				dst := s.getReg(x86asm.EDI)
+				ex.seq++
+				s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: "D3DDevice_GetTransform", Args: []Expr{IConst{state}, dst}, Seq: ex.seq})
+				if p, ok := asPtr(dst).(Ptr); ok {
+					ex.store(s, p, int(cnt*uint32(size)), CallResult{Fn: "D3DDevice_GetTransform", Args: []Expr{IConst{state}}, Seq: ex.seq}, in.VA)
+				}
+				advance := IConst{cnt * uint32(size)}
+				s.setReg(x86asm.EDI, mkBin("add", dst, advance))
+				s.setReg(x86asm.ESI, mkBin("add", s.getReg(x86asm.ESI), advance))
+				s.setReg(x86asm.ECX, IConst{0})
+				break
+			}
 			for i := uint32(0); i < cnt; i++ {
 				ex.movs(s, in, size)
 			}
@@ -1371,6 +1670,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	default:
 		if isFPU(op) {
 			return false, ex.fpuStep(s, in)
+		}
+		if handled, err := ex.sseStep(s, in); handled {
+			return false, err
 		}
 		return false, fmt.Errorf("unsupported instruction")
 	}
@@ -1406,6 +1708,9 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 	f := s.fl
 	if f.kind == "fsw" {
 		return ex.fswCondition(s, op)
+	}
+	if f.kind == "comiss" {
+		return ex.comissCondition(s, op)
 	}
 	zero := func() Expr { return mkCond("eq", f.r, IConst{0}) }
 	sign := func() Expr { return mkCond("lt", f.r, IConst{0}) }
@@ -1543,7 +1848,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		addrE := asPtr(ex.addr(s, a))
 		if p, ok := addrE.(Ptr); ok && p.Base == "" {
 			if name, ok := ex.d.Imports[uint32(p.Off)]; ok {
-				return ex.opaqueCall(s, in, next, name, -1, false)
+				return ex.importCall(s, in, next, name)
 			}
 			v := ex.load(s, addrE, 4)
 			if c, ok := isConst(v); ok {
@@ -1567,7 +1872,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 			target = c
 		}
 		if p, ok := v.(Ptr); ok && strings.HasPrefix(p.Base, "import:") {
-			return ex.opaqueCall(s, in, next, strings.TrimPrefix(p.Base, "import:"), -1, false)
+			return ex.importCall(s, in, next, strings.TrimPrefix(p.Base, "import:"))
 		}
 	}
 	if target == 0 {
@@ -1577,7 +1882,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		return fmt.Errorf("unresolved call target")
 	}
 	if name, ok := ex.d.Imports[target]; ok {
-		return ex.opaqueCall(s, in, next, name, -1, false)
+		return ex.importCall(s, in, next, name)
 	}
 	fn, ok := ex.d.Functions[target]
 	if !ok {
@@ -1591,11 +1896,32 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		}
 		ex.d.Functions[target] = fn
 	}
+	// A thunk jumping straight to an import is that import, its arguments still on the caller's stack
+	if name, ok := ex.d.importThunk(fn); ok {
+		return ex.importCall(s, in, next, name)
+	}
 	if ex.ftol[target] {
 		s.pushes = 0
 		v := s.fpuPop()
 		s.setReg(x86asm.EAX, mkUn("f2i", v))
 		s.setReg(x86asm.EDX, Sym{"ftol.hi"})
+		return nil
+	}
+	if m, ok := ex.d.mathIntrinsic(target); ok {
+		// The runtime math thunks take their operands on the x87 stack, the first argument below the top.
+		s.pushes = 0
+		s.pending = nil
+		y := s.fpuPop()
+		if m.arity == 1 {
+			s.fpuPush(mkUn(m.op, y))
+		} else {
+			x := s.fpuPop()
+			s.fpuPush(mkFBin(m.op, x, y))
+		}
+		s.setReg(x86asm.EAX, Sym{fmt.Sprintf("clobber.eax#%d", ex.seq)})
+		s.setReg(x86asm.ECX, Sym{fmt.Sprintf("clobber.ecx#%d", ex.seq)})
+		s.setReg(x86asm.EDX, Sym{fmt.Sprintf("clobber.edx#%d", ex.seq)})
+		ex.seq++
 		return nil
 	}
 	if ex.Opaque[target] {
@@ -1606,15 +1932,36 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		if fn.Symbol != nil {
 			name, argBytes, fast, cdecl = fn.Symbol.Name, fn.Symbol.ArgBytes, fn.Symbol.FastCall, fn.Symbol.Cdecl
 		}
+		ecx, edx := s.regs[1], s.regs[2]
+		if fn.Symbol != nil {
+			if done, err := ex.conventionCall(s, in, next, fn); err != nil {
+				return err
+			} else if done {
+				ex.keepUnwritten(s, target, ecx, edx)
+				return nil
+			}
+		}
+		if fn.Symbol == nil {
+			ex.callTarget = target
+		}
 		if err := ex.opaqueCall(s, in, next, name, argBytes, fast, cdecl); err != nil {
 			return err
 		}
+		ex.keepUnwritten(s, target, ecx, edx)
 		if r, ok := ex.Results[target]; ok {
 			s.setReg(x86asm.EAX, r)
 		} else if ex.allocHook != nil && ex.Allocators[target] {
 			s.setReg(x86asm.EAX, ex.allocHook())
 		}
 		return nil
+	}
+	if sym := fn.Symbol; sym != nil && obj != nil {
+		// A library method reached through a vtable stays a virtual call, its arity now known.
+		argBytes := sym.ArgBytes
+		if argBytes < 0 && !sym.Cdecl && !sym.FastCall {
+			argBytes = calleeCleanupOf(fn)
+		}
+		return ex.opaqueCall(s, in, next, fmt.Sprintf("vcall@%X", slot), argBytes, false)
 	}
 	if sym := fn.Symbol; sym != nil {
 		if inlineSymbols[sym.Name] {
@@ -1636,7 +1983,29 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 				argBytes = clean
 			}
 		}
-		return ex.opaqueCall(s, in, next, sym.Name, argBytes, sym.FastCall, sym.Cdecl)
+		ecx, edx := s.regs[1], s.regs[2]
+		if done, err := ex.conventionCall(s, in, next, fn); err != nil {
+			return err
+		} else if done {
+			ex.keepUnwritten(s, target, ecx, edx)
+			return nil
+		}
+		ex.callTarget = target
+		if err := ex.opaqueCall(s, in, next, sym.Name, argBytes, sym.FastCall, sym.Cdecl); err != nil {
+			return err
+		}
+		ex.keepUnwritten(s, target, ecx, edx)
+		return nil
+	}
+	if ex.d.inLibrary(target) {
+		// Unnamed library code stays a call whose register inputs its body reveals, never inlined into dashboard paths.
+		ecx, edx := s.regs[1], s.regs[2]
+		if done, err := ex.conventionCall(s, in, next, fn); err != nil {
+			return err
+		} else if done {
+			ex.keepUnwritten(s, target, ecx, edx)
+			return nil
+		}
 	}
 	if len(fn.Instructions) > maxInlineSize {
 		return fmt.Errorf("callee %08X too large to inline", target)
@@ -1656,10 +2025,67 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 	return nil
 }
 
-// Looks up a vtable for an object pointer loaded from a known global
+// Kernel exports taking a variable argument list, which their callers clean up after
+var kernelCdecl = map[string]bool{"DbgPrint": true, "RtlSprintf": true, "RtlSnprintf": true, "RtlVsprintf": true, "RtlVsnprintf": true}
+
+// Records a kernel export call with everything pushed for it, the caller cleaning up only a variable argument list
+func (ex *Executor) importCall(s *execState, in *Instruction, next uint32, name string) error {
+	return ex.opaqueCall(s, in, next, name, -1, false, kernelCdecl[name])
+}
+
+// Names the import a single jump function forwards to
+func (d *Disassembly) importThunk(fn *Function) (string, bool) {
+	if len(fn.Instructions) != 1 || fn.Instructions[0].Inst.Op != x86asm.JMP {
+		return "", false
+	}
+	m, ok := fn.Instructions[0].Inst.Args[0].(x86asm.Mem)
+	if !ok || m.Base != 0 || m.Index != 0 {
+		return "", false
+	}
+	name, ok := d.Imports[uint32(m.Disp)]
+	return name, ok
+}
+
+// Lists every expression a path holds, in its guards, effects, argument buffers and return
+func pathExprs(p Path) []Expr {
+	out := append([]Expr{}, p.Guards...)
+	for _, e := range p.Effects {
+		out = append(out, e.Value, e.Addr, e.This)
+		out = append(out, e.Args...)
+		for _, b := range e.Buffers {
+			out = append(out, b.Elems...)
+		}
+	}
+	return append(out, p.Return)
+}
+
+// Restores the caller saved registers a known callee never writes after an opaque call clobbered them
+func (ex *Executor) keepUnwritten(s *execState, target uint32, ecx, edx Expr) {
+	if debugNoKeep {
+		return
+	}
+	writes := map[x86asm.Reg]bool{}
+	for _, r := range ex.d.callClobbers(target) {
+		writes[r] = true
+	}
+	if !writes[x86asm.ECX] {
+		s.regs[1] = ecx
+	}
+	if !writes[x86asm.EDX] {
+		s.regs[2] = edx
+	}
+}
+
+// Looks up a vtable for an object pointer loaded from a known global, or for the vtable word read from such an object
 func (ex *Executor) vtableFor(s *execState, obj Expr) uint32 {
 	if l, ok := obj.(Load); ok && l.Base == "" && l.Addr == nil {
 		return ex.vtables[uint32(l.Off)]
+	}
+	if l, ok := obj.(Load); ok && !debugNoVResolve && l.Addr == nil && l.Off == 0 && l.Size == 4 && len(l.Base) == 9 && l.Base[0] == 'g' {
+		var va uint32
+		if _, err := fmt.Sscanf(l.Base[1:], "%08X", &va); err == nil {
+			return ex.vtables[va]
+		}
 	}
 	if p, ok := obj.(Ptr); ok && p.Off == 0 && len(p.Base) == 9 && p.Base[0] == 'g' {
 		var va uint32
@@ -1779,6 +2205,8 @@ func (ex *Executor) writtenWithin(s *execState, p Ptr, size int) bool {
 // Records a call to code outside the analysis with its arguments
 func (ex *Executor) opaqueCall(s *execState, in *Instruction, next uint32, name string, argBytes int, fastcall bool, cdecl ...bool) error {
 	callerCleans := len(cdecl) > 0 && cdecl[0]
+	target := ex.callTarget
+	ex.callTarget = 0
 	var args []Expr
 	if fastcall {
 		args = append(args, s.getReg(x86asm.ECX), s.getReg(x86asm.EDX))
@@ -1810,15 +2238,23 @@ func (ex *Executor) opaqueCall(s *execState, in *Instruction, next uint32, name 
 	var this Expr
 	if !fastcall && strings.HasPrefix(name, "sub_") {
 		this = s.getReg(x86asm.ECX)
+		// A dashboard function compiled to read argument registers takes them before its stack arguments
+		var leading []Expr
+		for _, r := range ex.d.registerInputs(target) {
+			leading = append(leading, s.getReg(r))
+		}
+		args = append(leading, args...)
 	}
-	if argBytes < 0 && len(name) > 6 && name[:6] == "vcall@" {
-		args = append(args, s.getReg(x86asm.ECX))
-		for i := 0; i < s.pushes && i < 8; i++ {
-			v := ex.load(s, mkBin("add", s.regs[4], IConst{uint32(4 * i)}), 4)
-			if _, isRet := v.(RetAddr); isRet {
-				break
+	if len(name) > 6 && name[:6] == "vcall@" {
+		args = append([]Expr{s.getReg(x86asm.ECX)}, args...)
+		if argBytes < 0 {
+			for i := 0; i < s.pushes && i < 8; i++ {
+				v := ex.load(s, mkBin("add", s.regs[4], IConst{uint32(4 * i)}), 4)
+				if _, isRet := v.(RetAddr); isRet {
+					break
+				}
+				args = append(args, v)
 			}
-			args = append(args, v)
 		}
 	} else if argBytes < 0 {
 		for i := 0; i < s.pushes && i < 8; i++ {
@@ -1846,6 +2282,70 @@ func (ex *Executor) opaqueCall(s *execState, in *Instruction, next uint32, name 
 		popBytes = uint32(4 * s.pushes)
 	}
 	s.pushes = 0
+	if target != 0 {
+		if err := ex.normalizeConstantRegister(target, name, args); err != nil {
+			return err
+		}
+	}
+	return ex.recordCall(s, in, next, name, args, this, popBytes)
+}
+
+// Records a library call whose parameter locations were derived from its body
+func (ex *Executor) conventionCall(s *execState, in *Instruction, next uint32, fn *Function) (bool, error) {
+	conv, err := ex.d.convention(fn)
+	if err != nil {
+		return true, err
+	}
+	if !conv.known {
+		return false, nil
+	}
+	args := make([]Expr, len(conv.params))
+	for i, loc := range conv.params {
+		switch {
+		case loc.None:
+			args[i] = nil
+		case loc.Reg != 0:
+			args[i] = s.getReg(loc.Reg)
+		default:
+			args[i] = ex.load(s, mkBin("add", s.regs[4], IConst{uint32(4 * loc.Stack)}), 4)
+		}
+	}
+	s.pending = nil
+	s.pushes = 0
+	name := fmt.Sprintf("sub_%08X", fn.EntryVA)
+	if fn.Symbol != nil {
+		name = fn.Symbol.Name
+	}
+	if err := ex.normalizeConstantRegister(fn.EntryVA, name, args); err != nil {
+		return true, err
+	}
+	return true, ex.recordCall(s, in, next, name, args, nil, uint32(conv.stackBytes))
+}
+
+// Vertex shader constant registers the XDK API numbers from, its setters adding this to reach the hardware index
+const apiConstantBias = 96
+
+// Rewrites the register a constant setter receives into the API numbering its own bias implies
+func (ex *Executor) normalizeConstantRegister(target uint32, name string, args []Expr) error {
+	if !strings.HasPrefix(name, "D3DDevice_SetVertexShaderConstant") || len(args) == 0 {
+		return nil
+	}
+	fn := ex.d.Functions[target]
+	if fn == nil || fn.Symbol == nil {
+		return nil
+	}
+	bias, err := ex.d.constantBias(fn)
+	if err != nil {
+		return err
+	}
+	if delta := bias - apiConstantBias; delta != 0 {
+		args[0] = mkBin("add", args[0], IConst{uint32(delta)})
+	}
+	return nil
+}
+
+// Records a call effect with its arguments, the result and the stack the callee removed
+func (ex *Executor) recordCall(s *execState, in *Instruction, next uint32, name string, args []Expr, this Expr, popBytes uint32) error {
 	ex.seq++
 	var ret Expr
 	bufSize := d3dxBufferSize(name)
@@ -2160,6 +2660,17 @@ func (ex *Executor) fpuStep(s *execState, in *Instruction) error {
 			s.fpuPop()
 		case x86asm.FCOMPP, x86asm.FUCOMPP:
 			s.fpuPop()
+			s.fpuPop()
+		}
+	case x86asm.FCOMI, x86asm.FCOMIP, x86asm.FUCOMI, x86asm.FUCOMIP:
+		i := 1
+		if nargs > 1 {
+			i = stIndex(args[1].(x86asm.Reg))
+		} else if nargs == 1 {
+			i = stIndex(args[0].(x86asm.Reg))
+		}
+		s.fl = flagState{kind: "comiss", a: s.st(0), b: s.st(i)}
+		if op == x86asm.FCOMIP || op == x86asm.FUCOMIP {
 			s.fpuPop()
 		}
 	case x86asm.FNSTSW:

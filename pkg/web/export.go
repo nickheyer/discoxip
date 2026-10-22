@@ -21,8 +21,8 @@ import (
 //go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js static/system.js
 var staticFiles embed.FS
 
-// Export generates a self-contained web application from extracted XIP data and the dashboard executable.
-func Export(inputDir, outputDir string) error {
+// Export generates a self-contained web application from extracted XIP data and the disassembled dashboard executable.
+func Export(inputDir, outputDir string, d *xbe.Disassembly) error {
 	for _, dir := range []string{
 		outputDir,
 		filepath.Join(outputDir, "data", "scenes"),
@@ -43,12 +43,8 @@ func Export(inputDir, outputDir string) error {
 	}
 	fmt.Fprintf(os.Stderr, "Found %d XAP scene(s)\n", len(xapFiles))
 
-	xbeFiles, _ := filepath.Glob(filepath.Join(inputDir, "*.xbe"))
-	if len(xbeFiles) != 1 {
-		return fmt.Errorf("web: expected one .xbe in %s, found %d", inputDir, len(xbeFiles))
-	}
-	fmt.Fprintf(os.Stderr, "Deriving render model from %s\n", filepath.Base(xbeFiles[0]))
-	layouts, model, err := scene.LoadLayouts(xbeFiles[0])
+	fmt.Fprintf(os.Stderr, "Deriving render model from the executable\n")
+	layouts, model, err := scene.LoadLayouts(d)
 	if err != nil {
 		return fmt.Errorf("web: %w", err)
 	}

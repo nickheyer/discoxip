@@ -6,8 +6,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-
-	"golang.org/x/arch/x86/x86asm"
 )
 
 // MaterialObject is one material instance constructed by the dashboard at startup.
@@ -106,6 +104,81 @@ type MaterialSystem struct {
 	Materials        []*MaterialObject
 	TextureProducers []uint32 // dashboard functions that build textures at runtime
 	Allocators       []uint32 // functions whose results become constructed objects
+	Registry         *MaterialRegistry
+}
+
+// MaterialRegistry is the global array of material pointers the factory fills and the count beside it.
+type MaterialRegistry struct {
+	Base  uint32 `json:"base"`
+	Count uint32 `json:"count"`
+}
+
+// Finds the array the factory stores each constructed object into, indexed by a counter global
+func materialRegistry(paths []Path) *MaterialRegistry {
+	counts := map[MaterialRegistry]int{}
+	for _, e := range paths[0].Effects {
+		if e.Kind != "store" || e.Addr == nil || e.Size != 4 {
+			continue
+		}
+		if p, ok := e.Value.(Ptr); !ok || !strings.HasPrefix(p.Base, "obj") || p.Off != 0 {
+			continue
+		}
+		b, ok := e.Addr.(Bin)
+		if !ok || b.Op != "add" {
+			continue
+		}
+		base, isBase := isConst(b.B)
+		scaled, isScaled := b.A.(Bin)
+		if !isBase {
+			base, isBase = isConst(b.A)
+			scaled, isScaled = b.B.(Bin)
+		}
+		if !isBase || !isScaled || scaled.Op != "mul" {
+			continue
+		}
+		counter, ok := counterGlobal(scaled.A)
+		if !ok {
+			continue
+		}
+		counts[MaterialRegistry{Base: base, Count: counter}]++
+	}
+	var best *MaterialRegistry
+	bestN := 0
+	for r, n := range counts {
+		if n > bestN {
+			rr := r
+			best, bestN = &rr, n
+		}
+	}
+	return best
+}
+
+// Finds the global a counter expression counts up from, through any number of increments
+func counterGlobal(e Expr) (uint32, bool) {
+	for {
+		switch v := e.(type) {
+		case Load:
+			if v.Base != "" || v.Addr != nil {
+				return 0, false
+			}
+			return uint32(v.Off), true
+		case Bin:
+			if v.Op != "add" {
+				return 0, false
+			}
+			if _, ok := isConst(v.B); ok {
+				e = v.A
+				continue
+			}
+			if _, ok := isConst(v.A); ok {
+				e = v.B
+				continue
+			}
+			return 0, false
+		default:
+			return 0, false
+		}
+	}
 }
 
 // Keeps the executor from inlining object allocators and texture producers
@@ -140,49 +213,16 @@ func (d *Disassembly) textureProducers() []uint32 {
 	return out
 }
 
-// Finds constructors as functions that install a vtable into this+0
-func (d *Disassembly) findConstructors() map[uint32]uint32 {
-	out := map[uint32]uint32{}
-	for va, fn := range d.Functions {
-		if fn.Symbol != nil {
-			continue
-		}
-		if vt := ctorVtable(d, fn); vt != 0 {
-			out[va] = vt
-		}
-	}
-	return out
-}
-
-// Finds allocators as functions whose result becomes this for a constructor at three or more sites
-func (d *Disassembly) findAllocators(ctors map[uint32]uint32) []uint32 {
+// Finds allocators as functions whose results become constructed objects at three or more sites
+func (d *Disassembly) findAllocators() []uint32 {
 	counts := map[uint32]int{}
+	ctors := d.constructorInfo()
 	for _, fn := range d.Functions {
-		ins := fn.Instructions
-		for i := range ins {
-			if ins[i].Inst.Op != x86asm.CALL {
+		for _, c := range d.constructions(fn) {
+			if ctors[c.ctor].library {
 				continue
 			}
-			if _, isCtor := ctors[resolveTarget(&ins[i])]; !isCtor {
-				continue
-			}
-			thisFromEAX := false
-			for j := i - 1; j >= 0 && j >= i-12; j-- {
-				jn := &ins[j]
-				if jn.Inst.Op == x86asm.MOV && argCount(jn) == 2 {
-					if dst, ok := jn.Inst.Args[0].(x86asm.Reg); ok && dst == x86asm.ECX {
-						if src, ok := jn.Inst.Args[1].(x86asm.Reg); ok && src == x86asm.EAX {
-							thisFromEAX = true
-						}
-					}
-				}
-				if jn.Inst.Op == x86asm.CALL {
-					if t := resolveTarget(jn); t != 0 && thisFromEAX {
-						counts[t]++
-					}
-					break
-				}
-			}
+			counts[c.alloc]++
 		}
 	}
 	var out []uint32
@@ -195,40 +235,19 @@ func (d *Disassembly) findAllocators(ctors map[uint32]uint32) []uint32 {
 	return out
 }
 
-// Finds the factory as the function calling the most constructors with a string argument
-func (d *Disassembly) findMaterialFactory(ctors map[uint32]uint32) (uint32, uint32, error) {
+// Finds the factory as the function building the most named objects, with the allocator those objects come from
+func (d *Disassembly) findMaterialFactory() (uint32, uint32, error) {
 	bestVA, bestCount := uint32(0), 0
 	var bestAlloc uint32
 	for _, va := range d.functionVAs() {
-		fn := d.Functions[va]
-		ins := fn.Instructions
 		count := 0
 		allocs := map[uint32]int{}
-		for i, in := range ins {
-			if in.Inst.Op != x86asm.CALL {
+		for _, c := range d.constructions(d.Functions[va]) {
+			if !c.named || d.constructorInfo()[c.ctor].library {
 				continue
 			}
-			t := resolveTarget(&in)
-			if _, ok := ctors[t]; !ok {
-				continue
-			}
-			hasName := false
-			for j := i - 1; j >= 0 && j >= i-12; j-- {
-				if ins[j].Inst.Op == x86asm.CALL {
-					if prev := resolveTarget(&ins[j]); prev != 0 {
-						allocs[prev]++
-					}
-					break
-				}
-				if ins[j].Inst.Op == x86asm.PUSH {
-					if imm, ok := ins[j].Inst.Args[0].(x86asm.Imm); ok && len(d.Image.ReadUTF16(uint32(imm))) > 0 {
-						hasName = true
-					}
-				}
-			}
-			if hasName {
-				count++
-			}
+			count++
+			allocs[c.alloc]++
 		}
 		if count > bestCount {
 			bestVA, bestCount = va, count
@@ -244,24 +263,26 @@ func (d *Disassembly) findMaterialFactory(ctors map[uint32]uint32) (uint32, uint
 	if bestCount < 8 {
 		return 0, 0, fmt.Errorf("xbe: no material factory found (best candidate constructs %d named objects)", bestCount)
 	}
-	if bestAlloc == 0 {
-		return 0, 0, fmt.Errorf("xbe: material factory %08X has no allocator call before its constructors", bestVA)
-	}
 	return bestVA, bestAlloc, nil
 }
 
 // DeriveMaterials constructs every material symbolically and traces each Apply method.
 func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
+	stage("constructors")
 	ctors := d.findConstructors()
-	factory, alloc, err := d.findMaterialFactory(ctors)
+	stage("factory")
+	factory, alloc, err := d.findMaterialFactory()
 	if err != nil {
 		return nil, err
 	}
 	ms := &MaterialSystem{FactoryVA: factory, AllocatorVA: alloc, Ctors: ctors}
-	allocators := d.findAllocators(ctors)
+	stage("allocators")
+	allocators := d.findAllocators()
 	ms.Allocators = allocators
 
+	stage("executor")
 	ex := NewExecutor(d)
+	stage("run factory")
 	ex.Opaque[alloc] = true
 	ex.Allocators[alloc] = true
 	for _, va := range allocators {
@@ -283,6 +304,8 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 	if len(paths) != 1 {
 		return nil, fmt.Errorf("material factory %08X has %d execution paths, expected one", factory, len(paths))
 	}
+	stage(fmt.Sprintf("factory done with %d objects", len(objects)))
+	ms.Registry = materialRegistry(paths)
 	// Rebuild object memory from the recorded stores.
 	objMem := map[string]map[int32]memVal{}
 	for _, e := range paths[0].Effects {
@@ -294,6 +317,27 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 		}
 		objMem[e.Base][e.Off] = memVal{e.Size, e.Value}
 	}
+	// The name field is the offset at which the most constructed objects hold a wide string pointer.
+	nameCounts := map[int32]int{}
+	for _, obj := range objects {
+		if _, ok := objMem[obj][0]; !ok {
+			continue
+		}
+		for off, mv := range objMem[obj] {
+			if c, ok := isConst(mv.v); ok && mv.size == 4 && d.namesObject(c) {
+				nameCounts[off]++
+			}
+		}
+	}
+	nameOff, nameN := int32(0), 0
+	for _, off := range slices.Sorted(maps.Keys(nameCounts)) {
+		if nameCounts[off] > nameN {
+			nameOff, nameN = off, nameCounts[off]
+		}
+	}
+	if nameN == 0 {
+		return nil, fmt.Errorf("material factory %08X constructs no object holding a name", factory)
+	}
 	for _, obj := range objects {
 		fields := objMem[obj]
 		vt, ok := fields[0]
@@ -304,9 +348,9 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 		if !ok || !d.isVtable(vtVA) {
 			return nil, fmt.Errorf("material %s has no concrete vtable", obj)
 		}
-		nameVal, ok := fields[4]
+		nameVal, ok := fields[nameOff]
 		if !ok {
-			return nil, fmt.Errorf("material %s has no name pointer at +4", obj)
+			return nil, fmt.Errorf("material %s has no name pointer at +%X", obj, nameOff)
 		}
 		nameVA, ok := isConst(nameVal.v)
 		if !ok {
@@ -337,10 +381,13 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 	}
 	sort.Slice(ms.Materials, func(i, j int) bool { return ms.Materials[i].Object < ms.Materials[j].Object })
 
+	stage("texture producers")
 	producers := d.textureProducers()
 	ms.TextureProducers = producers
+	stage("learn global objects")
 	ex.LearnGlobalObjects(allocators, producers)
 	for _, m := range ms.Materials {
+		stage("material " + m.Name)
 		fields := objMem[m.Object]
 		ax := NewExecutorShared(ex)
 		ax.Opaque[alloc] = true

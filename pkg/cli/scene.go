@@ -17,7 +17,7 @@ var sceneXBE string
 
 // Loads the vertex layouts the dashboard executable declares
 func sceneLayouts() (map[uint32]scene.Layout, error) {
-	layouts, _, err := scene.LoadLayouts(sceneXBE)
+	layouts, _, err := loadLayouts(sceneXBE)
 	return layouts, err
 }
 

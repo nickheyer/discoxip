@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -161,7 +162,7 @@ func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, err
 		if err != nil {
 			return nil, err
 		}
-		flag, err := pushedFlag(d, va)
+		flag, err := launchFlag(d, va)
 		if err != nil {
 			return nil, err
 		}
@@ -170,14 +171,22 @@ func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, err
 	return sm, nil
 }
 
-// The disc drive constructor names the disc type through a string table indexed by the drive's type code
+// The disc drive constructor or its initializer names the disc type through a string table indexed by type code
 func (sm *SystemModel) deriveDiscTypes(d *Disassembly, types map[string]*NodeType) error {
 	drive := types["DiscDrive"]
 	if drive == nil || d.Functions[drive.Ctor] == nil {
 		return fmt.Errorf("xbe: DiscDrive constructor is not disassembled")
 	}
-	base, ok := scaledTableBase(d.Functions[drive.Ctor], 4)
-	if !ok {
+	var base uint32
+	for _, va := range append([]uint32{drive.Ctor}, d.plainCallees(drive.Ctor)...) {
+		if b, ok := scaledTableBase(d.Functions[va], 4); ok {
+			if base != 0 && base != b {
+				return fmt.Errorf("xbe: DiscDrive constructor %08X indexes two tables (%08X, %08X)", drive.Ctor, base, b)
+			}
+			base = b
+		}
+	}
+	if base == 0 {
 		return fmt.Errorf("xbe: DiscDrive constructor %08X indexes no disc type table", drive.Ctor)
 	}
 	for i := uint32(0); ; i++ {
@@ -197,7 +206,7 @@ func (sm *SystemModel) deriveDiscTypes(d *Disassembly, types map[string]*NodeTyp
 	return nil
 }
 
-// The text draw's clock formatter is its callee naming the time formats, the meridiem strings carrying no conversion
+// The clock formatter is the text draw callee naming both date orders and both hour formats plus the meridiem words
 func (sm *SystemModel) deriveClockFormats(d *Disassembly, types map[string]*NodeType) error {
 	text := types["Text"]
 	if text == nil || len(text.Slots) <= 16 {
@@ -212,39 +221,70 @@ func (sm *SystemModel) deriveClockFormats(d *Disassembly, types map[string]*Node
 		if fn == nil || fn.Symbol != nil {
 			continue
 		}
-		var formats, plain []string
-		for i := range fn.Instructions {
-			in := &fn.Instructions[i]
-			for _, a := range in.Inst.Args {
-				var va uint32
-				switch v := a.(type) {
-				case x86asm.Imm:
-					va = uint32(v)
-				case x86asm.Mem:
-					if v.Base == 0 && v.Index == 0 {
-						va = uint32(v.Disp)
-					}
-				}
-				if va == 0 {
-					continue
-				}
-				str := d.Image.ReadWideString(va)
-				if str == "" || !isPrintable(str) {
-					continue
-				}
-				if strings.Contains(str, "%") {
-					formats = append(formats, str)
-				} else {
-					plain = append(plain, str)
-				}
+		roles := map[string]string{}
+		var meridiem []string
+		for _, str := range wideStringsOf(d, fn) {
+			role := ""
+			switch {
+			case strings.HasPrefix(str, "%d%c"):
+				role = "ymd"
+			case strings.HasPrefix(str, "%02d%c"):
+				role = "dmy"
+			case strings.Contains(str, ":") && strings.Contains(str, "%s"):
+				role = "time12"
+			case strings.Contains(str, ":") && strings.Contains(str, "%"):
+				role = "time24"
+			case !strings.Contains(str, "%") && strings.IndexFunc(str, unicode.IsLetter) >= 0:
+				meridiem = append(meridiem, str)
+				continue
+			default:
+				continue
 			}
+			if prev, dup := roles[role]; dup && prev != str {
+				return fmt.Errorf("xbe: clock formatter %08X names two %s formats (%q, %q)", t, role, prev, str)
+			}
+			roles[role] = str
 		}
-		if len(formats) >= 4 && len(plain) == 2 {
-			sm.Clock = ClockFormats{Formats: formats, Meridiem: plain}
-			return nil
+		if len(roles) != 4 {
+			continue
 		}
+		if len(meridiem) != 2 {
+			return fmt.Errorf("xbe: clock formatter %08X names %d meridiem wordings (%q)", t, len(meridiem), meridiem)
+		}
+		sm.Clock = ClockFormats{Formats: []string{roles["ymd"], roles["dmy"], roles["time12"], roles["time24"]}, Meridiem: meridiem}
+		return nil
 	}
 	return fmt.Errorf("xbe: Text draw %08X calls no clock formatter", text.Slots[16])
+}
+
+// Lists the distinct printable wide strings a function addresses, in instruction order
+func wideStringsOf(d *Disassembly, fn *Function) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		for _, a := range in.Inst.Args {
+			var va uint32
+			switch v := a.(type) {
+			case x86asm.Imm:
+				va = uint32(v)
+			case x86asm.Mem:
+				if v.Base == 0 && v.Index == 0 {
+					va = uint32(v.Disp)
+				}
+			}
+			if va == 0 {
+				continue
+			}
+			str := d.Image.ReadWideString(va)
+			if str == "" || !isPrintable(str) || seen[str] {
+				continue
+			}
+			seen[str] = true
+			out = append(out, str)
+		}
+	}
+	return out
 }
 
 // The grid selection natives store the clock into the global the pulsing materials phase from
@@ -273,16 +313,69 @@ func (sm *SystemModel) deriveSelectionClock(d *Disassembly, va uint32) error {
 	return fmt.Errorf("xbe: selectDown native %08X stores the clock into no global", va)
 }
 
-// Reads the launch flag a force-set native pushes to its shared check
-func pushedFlag(d *Disassembly, va uint32) (int, error) {
-	b, ok := d.Image.ReadBytes(va, 2)
-	if !ok || b[0] != 0x6A {
-		return 0, fmt.Errorf("xbe: native %08X does not start by pushing a flag", va)
+// Runs a native taking no inputs and returns the one constant every path of it returns
+func constantResult(d *Disassembly, va uint32) (int, error) {
+	ex := NewExecutorShared(d.baseExecutor())
+	paths, err := ex.Run(va, func(s *execState) {})
+	if err != nil {
+		return 0, fmt.Errorf("native %08X: %w", va, err)
 	}
-	return int(b[1]), nil
+	n := -1
+	for _, p := range paths {
+		c, ok := isConst(p.Return)
+		if !ok {
+			return 0, fmt.Errorf("xbe: native %08X returns %s rather than a constant", va, ExprString(p.Return))
+		}
+		if n >= 0 && int(c) != n {
+			return 0, fmt.Errorf("xbe: native %08X returns both %d and %d", va, n, c)
+		}
+		n = int(c)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("xbe: native %08X returns on no path", va)
+	}
+	return n, nil
 }
 
-// The version native pushes its four numbers last first before the format string
+// Reads the launch flag a force-set native tests against the launch data, itself or through its shared check
+func launchFlag(d *Disassembly, va uint32) (int, error) {
+	ex := NewExecutorShared(d.baseExecutor())
+	paths, err := ex.Run(va, func(s *execState) {})
+	if err != nil {
+		return 0, fmt.Errorf("force-set native %08X: %w", va, err)
+	}
+	flags := map[uint32]bool{}
+	for _, p := range paths {
+		for _, g := range p.Guards {
+			mapExpr(g, func(e Expr) (Expr, bool) {
+				b, ok := e.(Bin)
+				if !ok || b.Op != "and" {
+					return nil, false
+				}
+				for _, side := range [][2]Expr{{b.A, b.B}, {b.B, b.A}} {
+					c, isC := isConst(side[0])
+					set := map[string]bool{}
+					exprSyms(side[1], set)
+					for name := range set {
+						if isC && strings.HasPrefix(name, "@") {
+							flags[c] = true
+						}
+					}
+				}
+				return nil, false
+			})
+		}
+	}
+	if len(flags) != 1 {
+		return 0, fmt.Errorf("xbe: force-set native %08X tests %d launch flags against a global", va, len(flags))
+	}
+	for flag := range flags {
+		return int(flag), nil
+	}
+	return 0, nil
+}
+
+// The version native pushes its four numbers last first in a row right before the format string
 func (sm *SystemModel) deriveDashboardVersion(d *Disassembly, va uint32) error {
 	fn := d.Functions[va]
 	if fn == nil {
@@ -291,14 +384,12 @@ func (sm *SystemModel) deriveDashboardVersion(d *Disassembly, va uint32) error {
 	var pushes []int
 	for i := range fn.Instructions {
 		in := &fn.Instructions[i]
-		if in.Inst.Op != x86asm.PUSH {
-			continue
-		}
 		imm, ok := in.Inst.Args[0].(x86asm.Imm)
-		if !ok {
+		if in.Inst.Op != x86asm.PUSH || !ok {
+			pushes = nil
 			continue
 		}
-		if d.Image.ReadWideString(uint32(imm)) != "" {
+		if s := d.Image.ReadWideString(uint32(imm)); s != "" && isPrintable(s) && strings.Contains(s, "%") {
 			break
 		}
 		pushes = append(pushes, int(imm))
@@ -333,84 +424,101 @@ func (sm *SystemModel) deriveLanguageCodes(d *Disassembly, va uint32) error {
 	return nil
 }
 
-// The recovery key helper hashes the disk key with a fixed key and maps digest words through a letter table
+// The recovery key native or its helper hashes the disk key with a fixed key and maps digest words to letters
 func (sm *SystemModel) deriveRecoveryKey(d *Disassembly, va uint32) error {
 	fn := d.Functions[va]
 	if fn == nil {
 		return fmt.Errorf("xbe: GetRecoveryKey native %08X is not disassembled", va)
 	}
-	var helper *Function
-	for _, t := range fn.CallTargets {
-		if c := d.Functions[t]; c != nil && c.Symbol == nil {
-			helper = c
-			break
+	var failures []string
+	for _, c := range append([]uint32{va}, d.plainCallees(va)...) {
+		rk, err := recoveryKeyOf(d, c)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		sm.RecoveryKey = rk
+		return nil
+	}
+	return fmt.Errorf("xbe: GetRecoveryKey native %08X reveals no recovery key (%s)", va, strings.Join(failures, "; "))
+}
+
+// Runs a routine with its callees kept as calls and reads the hashing key, letter table, modulus and word count
+func recoveryKeyOf(d *Disassembly, va uint32) (RecoveryKey, error) {
+	ex := NewExecutorShared(d.baseExecutor())
+	for _, c := range d.plainCallees(va) {
+		ex.Opaque[c] = true
+	}
+	paths, err := ex.Run(va, func(s *execState) {
+		s.regs[1] = Ptr{"this", 0}
+		ex.seedArgs(s, va, "arg", 2)
+	})
+	if err != nil {
+		return RecoveryKey{}, fmt.Errorf("%08X: %w", va, err)
+	}
+	var keyPtr, keyLen, table, modulus uint32
+	lookups := map[string]bool{}
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "call" || e.Fn != "XcHMAC" || len(e.Args) < 2 {
+				continue
+			}
+			k, ok1 := isConst(e.Args[0])
+			n, ok2 := isConst(e.Args[1])
+			if !ok1 || !ok2 {
+				return RecoveryKey{}, fmt.Errorf("%08X hashes with the symbolic key %s of length %s", va, ExprString(e.Args[0]), ExprString(e.Args[1]))
+			}
+			keyPtr, keyLen = k, n
+		}
+		for _, x := range pathExprs(p) {
+			mapExpr(x, func(e Expr) (Expr, bool) {
+				if t, m, ok := letterLookup(e); ok {
+					table, modulus = t, m
+					lookups[ExprString(e)] = true
+				}
+				return nil, false
+			})
 		}
 	}
-	if helper == nil {
-		return fmt.Errorf("xbe: GetRecoveryKey native %08X calls no hashing helper", va)
-	}
-	var pushes []uint32
-	var keyPtr, keyLen, modulus, table uint32
-	for i := range helper.Instructions {
-		in := &helper.Instructions[i]
-		switch in.Inst.Op {
-		case x86asm.PUSH:
-			if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
-				pushes = append(pushes, uint32(imm))
-			} else {
-				pushes = append(pushes, 0)
-			}
-		case x86asm.CALL:
-			if keyPtr == 0 && len(pushes) >= 2 {
-				keyPtr, keyLen = pushes[len(pushes)-1], pushes[len(pushes)-2]
-			}
-		case x86asm.IDIV, x86asm.DIV:
-			if len(pushes) > 0 {
-				modulus = pushes[len(pushes)-1]
-			}
-		case x86asm.MOV:
-			if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 && m.Disp > 0x10000 {
-				table = uint32(m.Disp)
-			}
-		}
-	}
-	if keyPtr == 0 || keyLen == 0 || modulus == 0 || table == 0 {
-		return fmt.Errorf("xbe: recovery key helper %08X reveals key %08X/%d modulus %d table %08X", helper.EntryVA, keyPtr, keyLen, modulus, table)
+	if keyPtr == 0 || keyLen == 0 || modulus == 0 || table == 0 || len(lookups) == 0 {
+		return RecoveryKey{}, fmt.Errorf("%08X reveals key %08X/%d modulus %d table %08X over %d digest words", va, keyPtr, keyLen, modulus, table, len(lookups))
 	}
 	key, ok := d.Image.ReadBytes(keyPtr, int(keyLen))
 	if !ok {
-		return fmt.Errorf("xbe: recovery key constant at %08X lies outside the image", keyPtr)
+		return RecoveryKey{}, fmt.Errorf("recovery key constant at %08X lies outside the image", keyPtr)
 	}
 	alphabet, ok := d.Image.ReadBytes(table, int(modulus))
 	if !ok {
-		return fmt.Errorf("xbe: recovery letter table at %08X lies outside the image", table)
+		return RecoveryKey{}, fmt.Errorf("recovery letter table at %08X lies outside the image", table)
 	}
-	letters := 0
-	for i := range helper.Instructions {
-		in := &helper.Instructions[i]
-		imm, ok := in.Inst.Args[0].(x86asm.Imm)
-		if in.Inst.Op != x86asm.PUSH || !ok || imm <= 0 || imm >= 8 {
+	rk := RecoveryKey{HMACKey: []int{}, Alphabet: string(alphabet), Letters: len(lookups)}
+	for _, b := range key {
+		rk.HMACKey = append(rk.HMACKey, int(b))
+	}
+	return rk, nil
+}
+
+// Reads the table and modulus of a byte loaded from a letter table at the remainder of a digest word
+func letterLookup(e Expr) (table, modulus uint32, ok bool) {
+	l, isLoad := e.(Load)
+	if !isLoad || l.Size != 1 || l.Addr == nil {
+		return 0, 0, false
+	}
+	b, isBin := l.Addr.(Bin)
+	if !isBin || b.Op != "add" {
+		return 0, 0, false
+	}
+	for _, side := range [][2]Expr{{b.A, b.B}, {b.B, b.A}} {
+		base, isC := isConst(side[0])
+		rem, isRem := side[1].(Bin)
+		if !isC || !isRem || !strings.HasSuffix(rem.Op, "_rem") {
 			continue
 		}
-		for j := i + 1; j < len(helper.Instructions) && j <= i+4; j++ {
-			next := &helper.Instructions[j]
-			if next.Inst.Op != x86asm.POP {
-				continue
-			}
-			if r, ok := next.Inst.Args[0].(x86asm.Reg); ok && r == x86asm.ECX {
-				letters = int(imm) + 1
-			}
-			break
+		if m, ok := isConst(rem.B); ok {
+			return base, m, true
 		}
 	}
-	if letters == 0 {
-		return fmt.Errorf("xbe: recovery key helper %08X reveals no letter count", helper.EntryVA)
-	}
-	sm.RecoveryKey = RecoveryKey{HMACKey: []int{}, Alphabet: string(alphabet), Letters: letters}
-	for _, b := range key {
-		sm.RecoveryKey.HMACKey = append(sm.RecoveryKey.HMACKey, int(b))
-	}
-	return nil
+	return 0, 0, false
 }
 
 // Returns the native implementing a script method of a class
@@ -422,13 +530,14 @@ func (sm *SystemModel) function(class, name string) (uint32, error) {
 	return va, nil
 }
 
-// Finds every registration record store: the name pointer written to a record and the native copied into it
+// Finds each record's name pointer store and its native, copied from the stack, stored directly or staged in a register
 func (d *Disassembly) methodRecordStores() (map[uint32]string, map[uint32]uint32) {
 	names := map[uint32]string{}
 	fns := map[uint32]uint32{}
 	for _, va := range d.functionVAs() {
 		fn := d.Functions[va]
 		var pending, dest uint32
+		held := map[x86asm.Reg]uint32{}
 		ins := fn.Instructions
 		for i := range ins {
 			in := &ins[i]
@@ -438,14 +547,21 @@ func (d *Disassembly) methodRecordStores() (map[uint32]string, map[uint32]uint32
 				continue
 			}
 			if in.Inst.Op != x86asm.MOV || argCount(in) != 2 {
+				for _, r := range d.writtenBy(in) {
+					delete(held, r)
+				}
 				continue
 			}
 			imm, isImm := in.Inst.Args[1].(x86asm.Imm)
-			if !isImm {
-				continue
-			}
+			src, isReg := in.Inst.Args[1].(x86asm.Reg)
 			switch a := in.Inst.Args[0].(type) {
 			case x86asm.Mem:
+				if !isImm {
+					if v, ok := held[wideRegister(src)]; isReg && ok && a.Base == 0 && a.Index == 0 {
+						fns[uint32(a.Disp)] = v
+					}
+					continue
+				}
 				if a.Base == x86asm.EBP && a.Index == 0 && d.InsnByVA[uint32(imm)] != nil {
 					pending = uint32(imm)
 				}
@@ -453,10 +569,20 @@ func (d *Disassembly) methodRecordStores() (map[uint32]string, map[uint32]uint32
 					if s := d.Image.ReadWideString(uint32(imm)); s != "" && isPrintable(s) {
 						names[uint32(a.Disp)] = s
 					}
+					if d.InsnByVA[uint32(imm)] != nil {
+						fns[uint32(a.Disp)] = uint32(imm)
+					}
 				}
 			case x86asm.Reg:
+				delete(held, wideRegister(a))
+				if !isImm {
+					continue
+				}
 				if a == x86asm.EDI {
 					dest = uint32(imm)
+				}
+				if d.InsnByVA[uint32(imm)] != nil {
+					held[wideRegister(a)] = uint32(imm)
 				}
 			}
 		}
@@ -764,22 +890,28 @@ func unescapeTranslation(s []uint16) ([]uint16, error) {
 	return out, nil
 }
 
-// The time zone text native scales the index by the entry size, the count native pushes the count
+// The text native scales the zone by the entry size into the table, the count native returning the count
 func (sm *SystemModel) deriveTimeZones(d *Disassembly, textVA, countVA uint32) error {
 	text, count := d.Functions[textVA], d.Functions[countVA]
 	if text == nil || count == nil {
 		return fmt.Errorf("xbe: time zone natives %08X and %08X are not disassembled", textVA, countVA)
 	}
 	var stride, base uint32
+	var scaled x86asm.Reg
 	for i := range text.Instructions {
 		in := &text.Instructions[i]
 		if in.Inst.Op == x86asm.IMUL && argCount(in) == 3 {
-			if imm, ok := in.Inst.Args[2].(x86asm.Imm); ok {
-				stride = uint32(imm)
+			imm, isImm := in.Inst.Args[2].(x86asm.Imm)
+			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && isImm {
+				stride, scaled = uint32(imm), wideRegister(r)
 			}
+			continue
 		}
-		if in.Inst.Op == x86asm.PUSH {
-			if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 && m.Disp > 0 {
+		if scaled == 0 || base != 0 {
+			continue
+		}
+		for _, a := range in.Inst.Args {
+			if m, ok := a.(x86asm.Mem); ok && m.Base == scaled && m.Index == 0 && m.Disp > 0 {
 				base = uint32(m.Disp)
 			}
 		}
@@ -787,17 +919,9 @@ func (sm *SystemModel) deriveTimeZones(d *Disassembly, textVA, countVA uint32) e
 	if stride == 0 || base == 0 {
 		return fmt.Errorf("xbe: time zone text native %08X reveals no table (stride %d base %08X)", textVA, stride, base)
 	}
-	n := -1
-	for i := range count.Instructions {
-		in := &count.Instructions[i]
-		if in.Inst.Op == x86asm.PUSH {
-			if imm, ok := in.Inst.Args[0].(x86asm.Imm); ok {
-				n = int(imm)
-			}
-		}
-	}
-	if n < 0 {
-		return fmt.Errorf("xbe: time zone count native %08X pushes no count", countVA)
+	n, err := constantResult(d, countVA)
+	if err != nil {
+		return fmt.Errorf("xbe: time zone count native: %w", err)
 	}
 	for i := 0; i < n; i++ {
 		e := base + uint32(i)*stride
