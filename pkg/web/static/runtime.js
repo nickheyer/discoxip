@@ -16,6 +16,9 @@ const _log = _console.log.bind(console);
 const _warn = _console.warn.bind(console);
 const _error = _console.error.bind(console);
 
+// Script objects the engine runs as the host's own, their members the ones the executable registers
+const SCRIPT_OBJECT_PROTOTYPES = { Date: Date.prototype, Array: Array.prototype };
+
 // Scene file field types as the executable's field tables number them
 const FIELD_INT = 1, FIELD_BOOL = 2, FIELD_NUMBER = 3, FIELD_VEC3 = 5, FIELD_ROTATION = 6, FIELD_COLOR = 8, FIELD_NODE = 9, FIELD_STRING = 10;
 const HOOKED_FIELD_TYPES = new Set([FIELD_INT, FIELD_BOOL, FIELD_NUMBER, FIELD_VEC3, FIELD_ROTATION, FIELD_COLOR, FIELD_NODE, FIELD_STRING]);
@@ -95,6 +98,7 @@ class XAPRuntime {
     this.playingClips = new Set();
     this.screenSaver = null;
     this.textRenderers = [];
+    this.meshLoads = [];
 
     // Input
     this.joysticks = [];       // every node with event handlers, DEF named or not
@@ -130,9 +134,14 @@ class XAPRuntime {
 
       const renderResp = await fetch(`${DATA_BASE}/render.json`);
       const renderModel = await renderResp.json();
+      const memoryResp = await fetch(`${DATA_BASE}/${renderModel.memory.file}`);
+      const startupMemory = new Uint8Array(await memoryResp.arrayBuffer());
       this.console = new VirtualConsole(renderModel.system);
+      // The partition the dashboard runs from is the one the build was given, files and font version included
+      this.console.files = this.config.files || [];
+      this.console.fontVersion = this.config.font_version | 0;
       installDate(this.console);
-      this.derived = new DerivedModel(renderModel, this.deviceHost());
+      this.derived = new DerivedModel(renderModel, this.deviceHost(), startupMemory);
       this.pipeline = new DevicePipeline(THREE, renderModel, { resolve: (h) => this.resolveTextureHandle(h) });
       this.device = cloneState(this.derived.defaults);
       this.derived.onDraw = (state, env, quad) => this.onDerivedDraw(state, env, quad);
@@ -146,6 +155,7 @@ class XAPRuntime {
         // The producer's pixels were captured at derivation, so the call hands back the exported texture.
         this.derived.hook(t.va, () => ({ texture: key }));
       }
+      _log(`[XBE] ${(startupMemory.length / 1024) | 0} KB of startup memory in ${renderModel.memory.sections.length} sections`);
       _log(`[XBE] ${renderModel.materials.length} materials, ${Object.keys(renderModel.programs).length} vertex programs, ${renderModel.textures.length} procedural textures, ${Object.keys(renderModel.draw.functions).length} routines`);
 
       await this.loadFonts();
@@ -168,12 +178,23 @@ class XAPRuntime {
       this.executeScripts();
       this.derived.memory.store(this.rootGlobal, 4, { obj: this.root });
       this.runEntryInitialize();
+      // The console's loader fills the scene before the first frame, so no frame draws a mesh still loading
+      await this.settleMeshes();
 
       document.getElementById('loading').classList.add('hidden');
       this.animate();
     } catch (err) {
       _error('Runtime start failed:', err);
       document.getElementById('loading').textContent = 'Error: ' + err.message;
+    }
+  }
+
+  // Waits for the meshes the scenes being built asked for, the ones they start in turn included
+  async settleMeshes() {
+    while (this.meshLoads.length) {
+      const pending = this.meshLoads;
+      this.meshLoads = [];
+      await Promise.allSettled(pending);
     }
   }
 
@@ -241,17 +262,24 @@ class XAPRuntime {
       if (slots && slots.tick && slots.tick !== sc.group.tick) d.hook(slots.tick, () => 0);
     }
     for (const va of sc.tick_hooks || []) if (va !== sc.timers.advance) d.hook(va, () => 0);
-    for (const va of sc.timer_hooks || []) if (va !== sc.timers.remove) d.hook(va, () => 0);
+    // The controllers are read by the runtime's own input system, so the executable's input layer has nothing to do
+    for (const va of sc.input || []) d.hook(va, () => 0);
     d.hook(sc.timers.advance, (thisVal, args, state, env) => { this.advanceTimers(state, env); return 0; });
     d.hook(sc.timers.remove, (thisVal, args) => { this.removeTimers(args[0]); return 0; });
-    d.hook(sc.loader, (thisVal, args) => this.loadArchive(d.string(args[0])));
+    d.hook(sc.loader, (thisVal, args) => this.loadArchive(this.stringOf(thisVal, args)));
     d.hook(sc.unloader, () => 0);
     for (const va of sc.image_load || []) d.hook(va, () => 0);
     d.hook(sc.scene_load.reset, () => 0);
-    d.hook(sc.scene_load.resolve, (thisVal, args, state, env) => { d.storeString(args[0], d.string(args[1]), env); return args[0]; });
-    d.hook(sc.scene_load.populate, (thisVal) => { this.populateInline(this.objectOf(thisVal).node); return 1; });
-    d.hook(sc.scene_load.new_scope, (thisVal) => ({ obj: new SceneObject(SCOPE_TYPE, this.objectOf(thisVal).node), off: 0 }));
+    d.hook(sc.scene_load.join.va, (thisVal, args, state, env) => this.joinPath(thisVal, args, env));
+    d.hook(sc.scene_load.populate, (thisVal, args) => { this.populateInline(this.receiverOf(thisVal, args).node); return 1; });
+    d.hook(sc.scene_load.new_scope, (thisVal, args) => ({ obj: new SceneObject(SCOPE_TYPE, this.receiverOf(thisVal, args).node), off: 0 }));
     d.hook(sc.scene_load.attach, () => 0);
+    // The runtime loads geometry itself, so a node's load hands back the buffer it holds and nothing else
+    for (const nt of Object.values(d.types)) {
+      const slots = nt.slots || [];
+      const va = slots[d.draw.load_slot / 4];
+      if (va) d.hook(va, (thisVal) => this.objectOf(thisVal).slots.get(d.accessor.offset) || 0);
+    }
     // Allocators hand back fresh zeroed memory the paths then fill by field offset.
     for (const va of d.model.allocators) d.hook(va, () => ({ obj: new SceneObject(HEAP_TYPE, null), off: 0 }));
     // The device creation keeps the present parameters the init filled in.
@@ -262,16 +290,53 @@ class XAPRuntime {
         const params = d.eval(argIdx[4], env);
         if (typeof params !== 'number') throw new Error(`device created with present parameters at ${JSON.stringify(params)}`);
         this.presentParams = params;
+        this.createDevice();
         return 0;
       }
       return perform(fn, argIdx, thisIdx, env, seq);
     };
   }
 
+  // The creation fills the static device's surfaces, a build using the XDK getters instead keeping no device layout
+  createDevice() {
+    const d = this.derived, layout = d.model.device;
+    if (!layout.global) return;
+    d.memory.store(layout.global, 4, layout.object);
+    for (const field of layout.surfaces) d.memory.store(layout.object + field, 4, { device: 'surface', field });
+  }
+
   objectOf(v) {
     if (v && v.obj !== undefined) return v.obj;
     if (v instanceof SceneObject) return v;
     throw new Error(`hook called on ${JSON.stringify(v)} which is no scene object`);
+  }
+
+  // Joins the path a helper was handed onto its base and writes the result where its output points
+  joinPath(thisVal, args, env) {
+    const d = this.derived, j = d.scene.scene_load.join;
+    const input = (i) => (i === 0 ? thisVal : args[i - 1]);
+    const base = input(j.base);
+    const joined = joinPaths(d.string(input(j.src)), typeof base === 'number' && base === 0 ? null : d.string(base));
+    d.storeString(input(j.out), joined, env);
+    return input(j.out);
+  }
+
+  // The string a helper was handed, in the register or the argument its build's convention passes it in
+  stringOf(thisVal, args) {
+    for (const v of [thisVal, ...(args || [])]) {
+      const s = this.derived.stringOrNull(v);
+      if (s !== null) return s;
+    }
+    throw new Error(`hook called with no string in ${JSON.stringify(args)}`);
+  }
+
+  // The object a helper was handed, in the register or the argument its build's convention passes it in
+  receiverOf(thisVal, args) {
+    for (const v of [thisVal, ...(args || [])]) {
+      if (v && v.obj !== undefined) return v.obj;
+      if (v instanceof SceneObject) return v;
+    }
+    throw new Error(`hook called on ${JSON.stringify(thisVal)} which is no scene object`);
   }
 
   // The children a group object draws, in scene order
@@ -325,22 +390,21 @@ class XAPRuntime {
     return handled === undefined ? 0 : 1;
   }
 
-  // Steps every field interpolation record on the executable's list, unlinking the finished ones
+  // Steps every field interpolation record on the list through its walk, moving the cursor past the ones it leaves linked
   advanceTimers(state, env) {
     const d = this.derived, t = d.scene.timers;
-    let prev = null;
-    let record = d.memory.load(t.head, 4);
-    while (record && record.obj !== undefined) {
-      const next = d.readField(record.obj, t.next, 4);
-      const running = d.int(d.run(t.step, record.obj, [], state, env)) & 0xFF;
-      if (!running) {
-        if (prev) d.writeField(prev.obj, t.next, next);
-        else d.memory.store(t.head, 4, next);
-      } else {
-        prev = record;
-      }
-      record = next;
+    let cursor = t.head;
+    for (let record = this.timerRecord(cursor); record && record.obj !== undefined; record = this.timerRecord(cursor)) {
+      d.run(t.walk, null, [cursor], state, env);
+      const link = this.timerRecord(cursor);
+      if (link && link.obj === record.obj) cursor = { obj: record.obj, off: (record.off || 0) + t.next };
     }
+  }
+
+  // The record a cursor points at, the cursor being the list head or a record's link field
+  timerRecord(cursor) {
+    const d = this.derived;
+    return cursor.obj === undefined ? d.memory.load(cursor, 4) : d.readField(cursor.obj, cursor.off, 4);
   }
 
   // Unlinks the interpolation records that write into a node's fields
@@ -624,7 +688,7 @@ class XAPRuntime {
     const material = this.pipeline.createMaterial();
 
     if (geomFields.url && typeof geomFields.url === 'string' && geomFields.url.match(/\.xm$/i)) {
-      this.loadMesh(geomFields.url, archiveName).then(geometry => {
+      this.meshLoads.push(this.loadMesh(geomFields.url, archiveName).then(geometry => {
         if (!geometry) throw new Error(`mesh ${geomFields.url} is packed in no extracted archive`);
         const mesh = new THREE.Mesh(geometry, material);
         mesh.name = geomData.def || geomFields.url;
@@ -638,7 +702,7 @@ class XAPRuntime {
         }
       }).catch(e => {
         _warn(`[XAP] Mesh load failed: ${geomFields.url}`, e.message);
-      });
+      }));
       return;
     }
 
@@ -1053,14 +1117,15 @@ class XAPRuntime {
     return d.run(va, node.derivedObject(), bits, this.device, parent);
   }
 
-  // Every method a class registers must be implemented, Date's own members counting as implemented
+  // Every method a class registers must be implemented, the script object classes being the engine's own
   checkNatives(methods) {
     const missing = [];
     for (const [cls, names] of Object.entries(methods)) {
       for (const name of names) {
         const impl = this.natives[cls] && this.natives[cls][name];
         if (impl) continue;
-        if (cls === 'Date' && typeof Date.prototype[name] === 'function') continue;
+        const script = SCRIPT_OBJECT_PROTOTYPES[cls];
+        if (script && typeof script[name] === 'function') continue;
         missing.push(`${cls}.${name}`);
       }
     }
@@ -2039,6 +2104,26 @@ function indexCountFor(indices, vertexCount) {
 
 // Text glyph geometry carries positions only, drawn through the fixed function path
 const TEXT_GEOMETRY = describeGeometry({ format: 0, stride: 28, attributes: [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3 }, { register: 3, semantic: 'diffuse', type: 'FLOAT4', offset: 12, comps: 4 }] });
+
+// Joins a path onto a base the way the executable's helper does, parent steps cutting the base at its separators
+function joinPaths(src, base) {
+  const absolute = src.includes(':') || src.startsWith('\\\\');
+  if (absolute || base === null || (!base.includes(':') && !base.includes('/'))) return src;
+  const lastSeparator = (s) => { const i = s.lastIndexOf('/'); return i >= 0 ? i : s.lastIndexOf('\\'); };
+  let out = base, rest = src;
+  let sep = lastSeparator(out);
+  if (sep < 0) throw new Error(`base path ${JSON.stringify(base)} holds no separator to join ${JSON.stringify(src)} after`);
+  while (rest.startsWith('../') || rest.startsWith('..\\')) {
+    rest = rest.slice(3);
+    out = out.slice(0, sep);
+    sep = lastSeparator(out);
+    if (sep >= 0) continue;
+    if (!out.length) throw new Error(`parent steps of ${JSON.stringify(src)} climb past the start of ${JSON.stringify(base)}`);
+    sep = out.length - 1;
+    break;
+  }
+  return out.slice(0, sep) + '/' + rest;
+}
 
 // Three must not cull by or flip winding from a mesh world matrix the derived shaders ignore
 function detachFromThree(mesh) {

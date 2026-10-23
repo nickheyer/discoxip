@@ -23,6 +23,7 @@ type SystemModel struct {
 	LanguageCodes    []string            `json:"language_codes"`
 	RecoveryKey      RecoveryKey         `json:"recovery_key"`
 	SelectionClock   uint32              `json:"selection_clock"`
+	CameraNoise      uint32              `json:"camera_noise"`
 	Clock            ClockFormats        `json:"clock"`
 	ForceSetFlags    map[string]int      `json:"force_set_flags"`
 	DiscTypes        []string            `json:"disc_types"`
@@ -149,6 +150,11 @@ func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, err
 	}
 	if err := sm.deriveSelectionClock(d, selectFn); err != nil {
 		return nil, err
+	}
+	if va, ok := sm.methodFunctions["Config"]["ToggleNoisyCamera"]; ok {
+		if err := sm.deriveCameraNoise(d, va); err != nil {
+			return nil, err
+		}
 	}
 	if err := sm.deriveClockFormats(d, types); err != nil {
 		return nil, err
@@ -311,6 +317,31 @@ func (sm *SystemModel) deriveSelectionClock(d *Disassembly, va uint32) error {
 		}
 	}
 	return fmt.Errorf("xbe: selectDown native %08X stores the clock into no global", va)
+}
+
+// The camera toggle leaves its state in the global the scene reads to shake the camera
+func (sm *SystemModel) deriveCameraNoise(d *Disassembly, va uint32) error {
+	fn := d.Functions[va]
+	if fn == nil {
+		return fmt.Errorf("xbe: ToggleNoisyCamera native %08X is not disassembled", va)
+	}
+	found := uint32(0)
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		m, ok := in.Inst.Args[0].(x86asm.Mem)
+		if !ok || in.Inst.Op != x86asm.MOV || m.Base != 0 || m.Index != 0 || in.Inst.MemBytes != 1 {
+			continue
+		}
+		if found != 0 && uint32(m.Disp) != found {
+			return fmt.Errorf("xbe: ToggleNoisyCamera native %08X stores into globals %08X and %08X", va, found, uint32(m.Disp))
+		}
+		found = uint32(m.Disp)
+	}
+	if found == 0 {
+		return fmt.Errorf("xbe: ToggleNoisyCamera native %08X stores its state into no global", va)
+	}
+	sm.CameraNoise = found
+	return nil
 }
 
 // Runs a native taking no inputs and returns the one constant every path of it returns

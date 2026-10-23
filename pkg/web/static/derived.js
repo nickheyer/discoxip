@@ -51,11 +51,15 @@ export const BUFFER_TYPE = '$buffer';
 export const ARCHIVE_TYPE = '$archive';
 // Memory the executable allocates while running, read and written by field offset
 export const HEAP_TYPE = '$heap';
+
 // The descriptor and value a scripted field write hands to the class field hook
 const FIELD_TYPE = '$field', VALUE_TYPE = '$value';
 
 // The name a folded counted array index carries, the accessor call the plain build makes
 export const ARRAY_ELEMENT = 'array_element';
+
+// Characters the executable's own path buffers hold, past which a global is no string
+const WIDE_STRING_LIMIT = 0x800;
 
 // D3D primitive type of the triangle lists the mesh exporter writes
 const PT_TRIANGLELIST = 4;
@@ -133,15 +137,45 @@ function keep(v) {
   return v instanceof Float32Array ? v.slice() : v;
 }
 
-// The executable's writable globals as the derived paths read and write them, image bytes underneath
+// The memory the console starts the executable with, the loaded image under the words the paths write
 class GlobalMemory {
-  constructor(model) {
-    this.image = new Map();
-    for (const [off, g] of Object.entries(model.globals)) {
-      const base = Number(off);
-      for (let i = 0; i < g.init.length; i++) this.image.set(base + i, g.init[i]);
-    }
+  constructor(memory, image) {
+    this.sections = memory.sections.map((s) => ({ name: s.name, va: s.va, end: s.va + s.size, off: s.off, writable: !!s.writable }));
+    const last = this.sections[this.sections.length - 1];
+    if (!last || image.length < last.off + (last.end - last.va)) throw new Error(`startup memory of ${image.length} bytes is shorter than the ${this.sections.length} sections laid out in it`);
+    this.image = image;
     this.words = new Map();
+  }
+
+  // The loaded section a range lies in, or null where the image maps no memory
+  sectionOf(addr, size) {
+    let lo = 0, hi = this.sections.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1, s = this.sections[mid];
+      if (addr < s.va) hi = mid - 1;
+      else if (addr >= s.end) lo = mid + 1;
+      else return addr + size <= s.end ? s : null;
+    }
+    return null;
+  }
+
+  // Reports whether the image maps the address
+  mapped(addr) {
+    return this.sectionOf(addr, 1) !== null;
+  }
+
+  // The wide string a writable global holds, or null where the memory holds no terminated printable text
+  wideString(addr) {
+    const s = this.sectionOf(addr, 2);
+    if (s === null || !s.writable) return null;
+    let out = '';
+    for (let a = addr; a + 2 <= s.end && out.length <= WIDE_STRING_LIMIT; a += 2) {
+      const unit = this.load(a, 2);
+      if (unit === 0) return out;
+      if (unit < 0x20 && unit !== 9 && unit !== 10 && unit !== 13) return null;
+      out += String.fromCharCode(unit);
+    }
+    return null;
   }
 
   // Finds the stored word covering an address
@@ -153,17 +187,29 @@ class GlobalMemory {
     return null;
   }
 
+  // The image bytes of a range no stored word overlaps
+  imageRange(off, size) {
+    for (let a = off - 63; a < off + size; a++) {
+      const w = this.words.get(a);
+      if (w && a + w.size > off) return null;
+    }
+    const s = this.sectionOf(off, size);
+    return s === null ? null : this.image.subarray(s.off + off - s.va, s.off + off - s.va + size);
+  }
+
   byteAt(addr) {
     const c = this.covering(addr);
     if (c) return wordByte(c.w, addr - c.off);
-    const b = this.image.get(addr);
-    if (b === undefined) throw new Error(`global 0x${addr.toString(16)} has no derived start value`);
-    return b;
+    const s = this.sectionOf(addr, 1);
+    if (s === null) throw new Error(`0x${addr.toString(16)} is outside the memory the image loads into`);
+    return this.image[s.off + addr - s.va];
   }
 
   load(off, size) {
     const exact = this.words.get(off);
     if (exact && exact.size === size) return exact.value;
+    const direct = this.imageRange(off, size);
+    if (direct !== null) return valueFromBytes(direct, size);
     const bytes = new Uint8Array(size);
     for (let i = 0; i < size; i++) bytes[i] = this.byteAt(off + i);
     return valueFromBytes(bytes, size);
@@ -235,7 +281,7 @@ function valueBits(v) {
 }
 
 export class DerivedModel {
-  constructor(model, host) {
+  constructor(model, host, image) {
     this.model = model;
     this.host = host;
     this.nodes = model.exprs.nodes;
@@ -245,7 +291,7 @@ export class DerivedModel {
       m._fields = new Map();
       for (const [off, b] of Object.entries(m.fields)) m._fields.set(Number(off), b);
     }
-    this.memory = new GlobalMemory(model);
+    this.memory = new GlobalMemory(model.memory, image);
     this.hierarchyAlpha = 1;
     this.stateNames = model.render_state_names;
     this.stageNames = model.texture_stage_names;
@@ -673,6 +719,7 @@ export class DerivedModel {
         if (n.base === 'this') return this.thisPointer(env, n.off);
         if (n.base === '') return u32(n.off);
         if (n.base === 'stack') return { stack: n.off, frame: env };
+        if (n.base.startsWith('new')) return { obj: this.allocatedObject(env, n.base), off: n.off };
         if (n.base.startsWith('res')) {
           const r = env.results.get(Number(n.base.slice(3)));
           if (r && r.obj !== undefined) return { obj: r.obj, off: (r.off || 0) + n.off };
@@ -731,9 +778,10 @@ export class DerivedModel {
     if (v && v.f64 !== undefined) return u32(Math.trunc(v.f64));
     if (v && v.obj !== undefined) return u32(v.obj.id * 4096 + (v.off || 0));
     if (v && v.vb !== undefined) return u32(0x40000000 + v.vb.id);
+    // A float block read as a word is the bits of its first element, the way the executable copies it
+    if (v instanceof Float32Array) return bitsFromFloat(v[0]);
     if (v && (v.ptr !== undefined || v.texture !== undefined || v.program !== undefined || v.str !== undefined || v.material !== undefined || v.vertices !== undefined || v.indices !== undefined || v.xapTexture !== undefined || v.stack !== undefined || v.matrixStack !== undefined || v.buffer !== undefined || v.res !== undefined || v.device !== undefined)) return 1;
     if (v && v.call !== undefined) return 0;
-    if (v instanceof Float32Array) return 1;
     throw new Error(`expected an integer, got ${describe(v)}`);
   }
 
@@ -748,6 +796,7 @@ export class DerivedModel {
       if (typeof addr === 'number') return this.entryGlobal(env, addr, n.size);
       if (addr && addr.stack !== undefined) return this.entryStack(env, addr.frame || env, addr.stack, n.size);
       if (addr && addr.res !== undefined) return this.entryBuffer(env, addr.res, addr.off, n.size);
+      if (addr && addr.str !== undefined) return this.stringWord(addr, n.size);
       if (addr && typeof addr.ptr === 'string' && addr.ptr.startsWith('import:')) return u32(this.host.console.kernelVariable(addr.ptr.slice(7), addr.off || 0, n.size));
       throw new Error(`load through ${describe(addr)} from ${this.show(n.addr)}`);
     }
@@ -755,6 +804,7 @@ export class DerivedModel {
     if (n.base === 'this') return this.loadThis(env, n.off, n.size);
     if (n.base === 'node') return this.entryField(env, env.node, n.off, n.size);
     if (n.base === 'stack') return this.entryStack(env, env, n.off, n.size);
+    if (n.base.startsWith('new')) return this.readField(this.allocatedObject(env, n.base), n.off, n.size);
     if (n.base.startsWith('res')) return this.entryBuffer(env, Number(n.base.slice(3)), n.off, n.size);
     if (n.base.startsWith('import:')) return u32(this.host.console.kernelVariable(n.base.slice(7), n.off, n.size));
     if (n.base.startsWith('g')) {
@@ -764,6 +814,32 @@ export class DerivedModel {
     }
     if (env.mat && n.base === env.mat.object) return this.entryMaterial(env, env.mat, n.off, n.size);
     throw new Error(`load from ${n.base}`);
+  }
+
+  // The address a number of bytes past a pointer, whatever kind of memory it names
+  offsetPointer(p, delta) {
+    if (typeof p === 'number') return u32(p + delta);
+    if (p && p.obj !== undefined) return { obj: p.obj, off: (p.off || 0) + delta };
+    if (p && p.stack !== undefined) return { stack: p.stack + delta, frame: p.frame };
+    if (p && p.res !== undefined) return { res: p.res, off: (p.off || 0) + delta };
+    throw new Error(`no address ${delta} bytes past ${describe(p)}`);
+  }
+
+  // Exchanges two runs of bytes, which is how the library sort moves its elements
+  swapBytes(a, b, size, env) {
+    for (let i = 0; i < size; i++) {
+      const pa = this.offsetPointer(a, i), pb = this.offsetPointer(b, i);
+      const va = this.loadAt(env, pa, 1), vb = this.loadAt(env, pb, 1);
+      this.storeThrough(pa, 1, vb, env);
+      this.storeThrough(pb, 1, va, env);
+    }
+  }
+
+  // An object a constructor allocated besides the one it builds, the same one for the whole run that made it
+  allocatedObject(env, base) {
+    if (!env.allocated) env.allocated = new Map();
+    if (!env.allocated.has(base)) env.allocated.set(base, new SceneObject(HEAP_TYPE, null));
+    return env.allocated.get(base);
   }
 
   // The object a typed global pointer names: the handle the global held when the path started, offset into it
@@ -821,6 +897,8 @@ export class DerivedModel {
   bufferLoad(env, seq, off, size) {
     const r = env.results.get(seq);
     if (r && r.obj !== undefined) return this.readField(r.obj, (r.off || 0) + off, size);
+    // A call handing back an address is read through, the memory it names being the image's own
+    if (typeof r === 'number') return this.memory.load(u32(r + off), size);
     if (!r || !r.buffer) throw new Error(`load from the result of call ${seq} which is no locked buffer`);
     const view = r.buffer.view;
     if (size === 4) return view.getUint32(off, true);
@@ -920,6 +998,11 @@ export class DerivedModel {
       if (n.op === 'ne') return !same;
       if (zero) { const eq = false; switch (n.op) { case 'lt': case 'le': return isHandle(bv) ? true : eq; case 'gt': case 'ge': return isHandle(av) ? true : eq; } }
     }
+    // A block stands for the memory holding it, which is never the null pointer
+    if ((av instanceof Float32Array && bv === 0) || (bv instanceof Float32Array && av === 0)) {
+      if (n.op === 'eq') return false;
+      if (n.op === 'ne') return true;
+    }
     const ia = this.int(av), ib = this.int(bv);
     switch (n.op) {
       case 'eq': return ia === ib;
@@ -999,6 +1082,18 @@ export class DerivedModel {
         if (!hook) throw new Error('no array element accessor is registered');
         return hook(thisIdx === undefined ? undefined : this.eval(thisIdx, env), args, env.state, env);
       }
+      case 'qsort': {
+        // The library sort, ordering an array in memory by the routine the caller hands it
+        const count = this.int(args[1]), size = this.int(args[2]);
+        const compare = this.int(args[3]);
+        if (!this.functions.has(compare)) throw new Error(`qsort orders by ${hex8(compare)} which is not summarized`);
+        const at = (i) => this.offsetPointer(args[0], i * size);
+        const order = (a, b) => (this.int(this.run(compare, null, [a, b], env.state, env)) | 0);
+        for (let i = 1; i < count; i++) {
+          for (let j = i; j > 0 && order(at(j - 1), at(j)) > 0; j--) this.swapBytes(at(j - 1), at(j), size, env);
+        }
+        return 0;
+      }
       case 'bsearch': {
         // The material node searches the registry the factory filled, by the material name it holds.
         const registry = this.model.material_registry;
@@ -1071,7 +1166,10 @@ export class DerivedModel {
       case 'D3DXMatrixPerspectiveFovLH': return matPerspectiveFovLH(this.floatArg(argIdx[1], env), this.floatArg(argIdx[2], env), this.floatArg(argIdx[3], env), this.floatArg(argIdx[4], env));
       case 'D3DXMatrixOrthoLH': return matOrthoLH(this.floatArg(argIdx[1], env), this.floatArg(argIdx[2], env), this.floatArg(argIdx[3], env), this.floatArg(argIdx[4], env));
       case 'D3DXVec3TransformNormal': return vec3TransformNormal(this.vector(args[1], 12, env), this.matrix(args[2], env));
-      case 'D3DXQuaternionNormalize': return vecNormalize(this.vector(args[1], 16, env));
+      case 'D3DXQuaternionNormalize':
+      case 'D3DXVec4Normalize': return vecNormalize(this.vector(args[1], 16, env));
+      case 'D3DXVec3CatmullRom': return vecCatmullRom(this.vector(args[1], 12, env), this.vector(args[2], 12, env), this.vector(args[3], 12, env), this.vector(args[4], 12, env), this.floatArg(argIdx[5], env), 3);
+      case 'D3DXVec2CatmullRom': return vecCatmullRom(this.vector(args[1], 8, env), this.vector(args[2], 8, env), this.vector(args[3], 8, env), this.vector(args[4], 8, env), this.floatArg(argIdx[5], env), 2);
       case 'D3DXQuaternionRotationAxis': return quatRotationAxis(this.vector(args[1], 12, env), this.floatArg(argIdx[2], env));
       case 'D3DXQuaternionSlerp': return quatSlerp(this.vector(args[1], 16, env), this.vector(args[2], 16, env), this.floatArg(argIdx[3], env));
       case 'D3DXQuaternionMultiply': return quatMultiply(this.vector(args[1], 16, env), this.vector(args[2], 16, env));
@@ -1092,22 +1190,49 @@ export class DerivedModel {
       case 'CreateThread': return { ptr: fn, off: seq };
       case 'D3DDevice_CreateVertexShader': return { program: this.int(args[1]), declaration: this.int(args[0]) };
       case 'D3DDevice_CreateVertexBuffer': return { vb: this.host.createVertexBuffer(this.int(args[0]), this.int(args[2])) };
-      case 'D3DVertexBuffer_Lock': {
+      // The vertex format of a buffer the executable makes this way comes from the shader the draw sets
+      case 'D3DDevice_CreateVertexBuffer2': return { vb: this.host.createVertexBuffer(this.int(args[0]), 0) };
+      case 'D3DVertexBuffer_Lock':
+      case 'D3DVertexBuffer_Lock2': {
         const vb = args[0] && args[0].vb ? args[0].vb : null;
         if (!vb) throw new Error(`lock of ${describe(args[0])} which is no vertex buffer`);
         vb.version++;
         return { buffer: vb };
       }
+      // The console's allocator, whose blocks the executable reads and writes by field offset
+      case 'XMemAlloc': return { obj: new SceneObject(HEAP_TYPE, null), off: 0 };
+      case 'XMemFree': return 0;
       case 'Direct3DCreate8': return { device: 'd3d' };
       case 'Direct3D_CreateDevice': return 0;
       case 'D3DDevice_GetBackBuffer': return { device: 'backbuffer' };
       case 'D3DSurface_GetDesc': {
+        if (!deviceSurface(args[0])) throw new Error(`surface description of ${describe(args[0])} which is no surface of the device`);
         if (!args[1] || args[1].stack === undefined) throw new Error(`surface description read into ${describe(args[1])}`);
         (args[1].frame || env).stack.set(args[1].stack + SURFACE_DESC_WIDTH, this.host.backBufferWidth(env.state));
         (args[1].frame || env).stack.set(args[1].stack + SURFACE_DESC_HEIGHT, this.host.backBufferHeight(env.state));
         return 0;
       }
+      // The compiler's own frame check, which passes on a frame the runtime never corrupts
+      case '_security_check_cookie': return 0;
+      // The runtime keeps every resource it hands out alive, so a reference taken on one is the only one
+      case 'D3DResource_AddRef': return 1;
       case 'D3DResource_Release': return 0;
+      case 'PixelJar::Get2DSurfaceDesc': {
+        // Every surface the device creation made has the frame's size, which the host keeps
+        if (!args.some(deviceSurface)) throw new Error(`surface description of ${args.map(describe).join(', ')} which is no surface of the device`);
+        const out = args.find((a) => a && a.stack !== undefined);
+        if (!out) throw new Error('a surface description is read into no stack buffer');
+        (out.frame || env).stack.set(out.stack + SURFACE_DESC_WIDTH, this.host.backBufferWidth(env.state));
+        (out.frame || env).stack.set(out.stack + SURFACE_DESC_HEIGHT, this.host.backBufferHeight(env.state));
+        return 0;
+      }
+      case 'XNetRandom': {
+        // The network stack's random bytes come from the host
+        const count = this.int(args[1]);
+        const bytes = this.host.console.randomBytes(count);
+        for (let i = 0; i < count; i++) this.storeThrough(this.offsetPointer(args[0], i), 1, bytes[i], env);
+        return 0;
+      }
       case 'XGetVideoFlags': return u32(this.host.console.videoFlags());
       case 'XGetVideoStandard': return u32(this.host.console.videoStandard());
       case 'XQueryValue': return u32(this.host.console.queryValue(this.int(args[0]), args[1], args[2], env));
@@ -1134,7 +1259,7 @@ export class DerivedModel {
   // Runs an ID3DXMatrixStack method on the executable's stack
   matrixStackCall(slot, stack, args, env) {
     const matrixArg = () => {
-      const m = args.find((a) => a instanceof Float32Array || (typeof a === 'number' && a > 0x10000 && this.model.globals[String(a)] !== undefined) || (a && a.matrixStack === undefined && (a.obj !== undefined || a.stack !== undefined)));
+      const m = args.find((a) => a instanceof Float32Array || (typeof a === 'number' && this.memory.mapped(a)) || (a && a.matrixStack === undefined && (a.obj !== undefined || a.stack !== undefined)));
       if (m === undefined) throw new Error(`matrix stack slot 0x${slot.toString(16)} called without a matrix`);
       return this.matrix(m, env);
     };
@@ -1176,7 +1301,27 @@ export class DerivedModel {
   }
 
   string(v) {
-    if (v && v.chars !== undefined) return this.string({ ...v, chars: undefined }).slice(v.chars);
+    const s = this.stringOrNull(v);
+    if (s === null) throw new Error(`expected a string, got ${describe(v)}`);
+    return s;
+  }
+
+  // The bytes a path reads through a string pointer, the characters it holds being sixteen bits each
+  stringWord(v, size) {
+    const s = this.string(v);
+    let out = 0;
+    for (let i = 0; i < size && i < 4; i += 2) {
+      out |= (i / 2 < s.length ? s.charCodeAt(i / 2) : 0) << (8 * i);
+    }
+    return u32(out);
+  }
+
+  // The characters a value holds, or null when it holds no string
+  stringOrNull(v) {
+    if (v && v.chars !== undefined) {
+      const whole = this.stringOrNull({ ...v, chars: undefined });
+      return whole === null ? null : whole.slice(v.chars);
+    }
     if (v && v.str !== undefined) return v.str;
     if (v && v.stack !== undefined) {
       const held = v.frame ? v.frame.stack.get(v.stack) : undefined;
@@ -1187,12 +1332,13 @@ export class DerivedModel {
       if (s !== undefined) return s;
       const g = this.memory.words.get(v);
       if (g && g.value && g.value.str !== undefined) return g.value.str;
+      return this.memory.wideString(v);
     }
     if (v && v.obj !== undefined) {
       const f = this.readField(v.obj, v.off, 4);
       if (f && f.str !== undefined) return f.str;
     }
-    throw new Error(`expected a string, got ${describe(v)}`);
+    return null;
   }
 
   // Resolves a matrix argument: a value, a global, an object field or a stack buffer
@@ -1248,7 +1394,8 @@ export class DerivedModel {
     try {
       this.runPaths(paths, env, state);
     } catch (err) {
-      if (!err.routine) { err.routine = hex8(va); err.message = `${hex8(va)}: ${err.message}`; }
+      if (!err.routine) { err.routine = hex8(va); err.message = `${hex8(va)}: ${err.message}`; err.callers = []; }
+      else if (err.callers.length < 12) { err.callers.push(hex8(va)); err.message += ` < ${hex8(va)}`; }
       throw err;
     }
     return env.state.returned;
@@ -1277,8 +1424,16 @@ export class DerivedModel {
   matchPath(node, env) {
     this.applyEffects(node.effects, env);
     for (const item of node.items) {
+      this.applyEffects(item.effects, env);
       if (item.path) return item.path;
-      if (!this.truthy(this.eval(item.guard, env))) continue;
+      let holds;
+      try {
+        holds = this.truthy(this.eval(item.guard, env));
+      } catch (err) {
+        if (!err.guard) { err.guard = item.guard; err.message = `${err.message} (in guard ${this.show(item.guard)})`; }
+        throw err;
+      }
+      if (!holds) continue;
       const found = this.matchPath(item.node, env);
       if (found) return found;
     }
@@ -1345,6 +1500,10 @@ export class DerivedModel {
         } else {
           throw new Error(`store through ${describe(p)} held by global ${base}`);
         }
+      } else if (base.startsWith('new')) {
+        const obj = this.allocatedObject(env, base);
+        this.noteField(env, obj, off, e.size);
+        this.writeField(obj, off, e.size === 8 ? { f64: this.scalar(value) } : (typeof value === 'object' && value !== null && value.bits === undefined ? value : this.int(value)));
       } else if (env.mat && base === env.mat.object) {
         this.noteMaterial(env, env.mat, off, e.size);
         this.storeMaterialField(env.mat, off, e.size, e.size === 8 && typeof value === 'number' ? { f64: value } : value);
@@ -1356,8 +1515,18 @@ export class DerivedModel {
     if (e.kind === 'copy') throw new Error(`copy of unknown length into ${e.base}+0x${(e.off || 0).toString(16)} is not interpreted`);
     const fn = e.fn;
     this.materializeBuffers(e, env);
-    // Value producers were folded into the expressions that use their results.
-    if (fn.startsWith('D3DX') || fn.startsWith('XG') || fn.startsWith('D3DDevice_Create') || fn.startsWith('Direct3D') || fn.startsWith('D3D::') || fn === 'D3DDevice_GetBackBuffer' || fn === 'D3DResource_Release') return;
+    // Value producers were folded into the expressions that use their results, except where a path reads
+    // the block back through the pointer the routine filled.
+    if (fn.startsWith('D3DX') || fn.startsWith('XG') || fn.startsWith('D3DDevice_Create') || fn === 'Direct3DCreate8' || fn.startsWith('D3D::') || fn === 'D3DDevice_GetBackBuffer' || fn === 'D3DResource_Release') {
+      const first = (e.args || [])[0];
+      const dst = first === undefined ? undefined : this.eval(first, env);
+      if (dst && (dst.stack !== undefined || dst.obj !== undefined || dst.res !== undefined)) {
+        if (!env.results.has(e.seq)) env.results.set(e.seq, this.performCall(fn, e.args || [], e.has_this ? e.this : undefined, env, e.seq));
+        const v = env.results.get(e.seq);
+        if (v instanceof Float32Array) this.storeThrough(dst, v.length * 4, v, env);
+      }
+      return;
+    }
     if (fn.startsWith('vcall@') || fn.startsWith('sub_') || !fn.startsWith('D3DDevice_')) {
       // Methods, helpers and library calls run once, their results being memoized by call sequence.
       if (!env.results.has(e.seq)) env.results.set(e.seq, this.performCall(fn, e.args || [], e.has_this ? e.this : undefined, env, e.seq));
@@ -1404,8 +1573,11 @@ export class DerivedModel {
       else state.textures[stage] = args[1];
     } else if (fn === 'D3DDevice_SetVertexShader') {
       state.program = args[0];
-    } else if (fn === 'D3DDevice_SetVertexShaderConstant') {
-      const reg = this.int(args[0]), count = this.int(args[2]);
+    } else if (fn.startsWith('D3DDevice_SetVertexShaderConstant')) {
+      // The optimizer's own setters carry the register count in their name, the plain one takes it as an argument
+      const rows = fn.slice('D3DDevice_SetVertexShaderConstant'.length);
+      if (rows !== '' && !/^[0-9]+$/.test(rows)) throw new Error(`device call ${fn} is not mapped`);
+      const reg = this.int(args[0]), count = rows === '' ? this.int(args[2]) : Number(rows);
       const buf = e.buffers && e.buffers.find((b) => b.index === 1);
       if (!buf) throw new Error('vertex shader constant without a captured buffer');
       const elems = [];
@@ -1435,6 +1607,8 @@ export class DerivedModel {
       if (!m) throw new Error(`transform ${which} read before it was set`);
       if (!args[1] || args[1].stack === undefined) throw new Error(`transform ${which} read into ${describe(args[1])}`);
       for (let i = 0; i < 16; i++) (args[1].frame || env).stack.set(args[1].stack + 4 * i, bitsFromFloat(m[i]));
+      // The matrix the device handed back is what the path's later reads of the call stand for
+      env.results.set(e.seq, Float32Array.from(m));
     } else if (fn === 'D3DDevice_SetStreamSource') {
       state.stream = args[1];
       state.streamStride = this.int(args[2]);
@@ -1457,7 +1631,8 @@ export class DerivedModel {
   // Writes the stack memory a call's pointer arguments refer to, which the path kept as expressions
   materializeBuffers(e, env) {
     for (const b of e.buffers || []) {
-      const p = this.eval((e.args || [])[b.index], env);
+      const held = b.index < 0 ? e.this : (e.args || [])[b.index];
+      const p = this.eval(held, env);
       if (!p || p.stack === undefined) continue;
       const stack = (p.frame || env).stack;
       let off = p.stack;
@@ -1493,6 +1668,7 @@ export class DerivedModel {
   bufferStore(env, seq, off, size, value) {
     const r = env.results.get(seq);
     if (r && r.obj !== undefined) { this.writeField(r.obj, (r.off || 0) + off, size === 8 ? { f64: this.scalar(value) } : (typeof value === 'object' && value !== null && value.bits === undefined ? value : this.int(value))); return; }
+    if (typeof r === 'number') { this.memory.store(u32(r + off), size, this.storable(value, size)); return; }
     if (!r || !r.buffer) throw new Error(`store into the result of call ${seq} which is no locked buffer`);
     const view = r.buffer.view;
     if (size === 4) view.setUint32(off, valueBits(value), true);
@@ -1550,17 +1726,28 @@ function buildTrie(paths) {
     let from = 0;
     for (let i = 0; i < p.guards.length; i++) {
       const g = p.guards[i], pos = p.guard_pos[i];
-      node.effects = p.effects.slice(from, pos);
+      const before = p.effects.slice(from, pos);
       from = pos;
       let next = null;
       for (const item of node.items) if (item.guard === g) { next = item.node; break; }
-      if (!next) { next = { items: [], effects: [] }; node.items.push({ guard: g, node: next }); }
+      if (!next) { next = { items: [], effects: [] }; node.items.push({ guard: g, effects: before, node: next }); }
       node = next;
     }
-    node.effects = p.effects.slice(from);
-    node.items.push({ path: p });
+    node.items.push({ path: p, effects: p.effects.slice(from) });
   }
+  hoistEffects(root);
   return root;
+}
+
+// Lifts the effects every item of a node shares onto the node, leaving each item the ones only it runs
+function hoistEffects(node) {
+  let shared = node.items.length ? node.items[0].effects.length : 0;
+  for (const item of node.items) shared = Math.min(shared, item.effects.length);
+  node.effects = node.items.length ? node.items[0].effects.slice(0, shared) : [];
+  for (const item of node.items) {
+    item.effects = item.effects.slice(shared);
+    if (item.node) hoistEffects(item.node);
+  }
 }
 
 // Byte size of a scene field type
@@ -1572,6 +1759,11 @@ function fieldSize(type) {
     case FIELD_BOOL: return 1;
   }
   return 4;
+}
+
+// Reports whether a value is a surface the device creation made, the back buffer the XDK getter hands out included
+function deviceSurface(v) {
+  return !!v && (v.device === 'backbuffer' || v.device === 'surface');
 }
 
 function isHandle(v) {
@@ -1734,6 +1926,15 @@ export function vec3TransformNormal(v, m) {
   const out = new Float32Array(4);
   for (let c = 0; c < 3; c++) out[c] = v[0] * m[c] + v[1] * m[4 + c] + v[2] * m[8 + c];
   out[3] = v.length > 3 ? v[3] : 0;
+  return out;
+}
+
+// D3DXVec3CatmullRom, the spline through four points at a weight between the middle two
+export function vecCatmullRom(p0, p1, p2, p3, s, comps) {
+  const out = new Float32Array(comps);
+  for (let i = 0; i < comps; i++) {
+    out[i] = 0.5 * (2 * p1[i] + (p2[i] - p0[i]) * s + (2 * p0[i] - 5 * p1[i] + 4 * p2[i] - p3[i]) * s * s + (p3[i] - p0[i] + 3 * (p1[i] - p2[i])) * s * s * s);
+  }
   return out;
 }
 

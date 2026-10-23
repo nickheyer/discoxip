@@ -11,9 +11,10 @@ import (
 	"sync"
 )
 
-// Dxbx and D3D8LTCG XDK library signatures in IDA pat form, vendored from cxbx-reloaded
+// Dxbx and D3D8LTCG XDK library signatures in IDA pat form vendored from cxbx-reloaded, and the XboxDev table
+// naming the library function identities the later linkers record in the executable
 //
-//go:embed patterns/dxbx.pat.gz patterns/d3d8ltcg.pat.gz
+//go:embed patterns/dxbx.pat.gz patterns/d3d8ltcg.pat.gz patterns/xtlid.xml.gz
 var patternFS embed.FS
 
 // Pattern is one XDK library function signature.

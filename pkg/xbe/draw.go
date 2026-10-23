@@ -348,11 +348,11 @@ func (d *Disassembly) vtableSlots(vt uint32) []uint32 {
 	return out
 }
 
-// DeriveNodeTypes reads every registered scene node class with its field table and vtable.
-func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
+// DeriveNodeTypes reads every registered scene node class with its field table and vtable and names the registrar
+func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, uint32, error) {
 	registrar, sites, err := d.findRegistrar()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	byDesc := map[uint32]string{}
 	types := map[string]*NodeType{}
@@ -369,7 +369,7 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 				}
 				name := d.Image.ReadUTF16(np)
 				if name == "" || !isPrintable(name) {
-					return nil, fmt.Errorf("xbe: node type %s field %d has no name", r.name, i)
+					return nil, 0, fmt.Errorf("xbe: node type %s field %d has no name", r.name, i)
 				}
 				nt.Fields[int32(off)] = NodeField{Name: name, Type: typ}
 			}
@@ -383,7 +383,7 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 						continue
 					}
 					if nt.Vtable != 0 && nt.Vtable != c.vtable {
-						return nil, fmt.Errorf("xbe: node type %s factory %08X installs vtables %08X and %08X", r.name, nt.Ctor, nt.Vtable, c.vtable)
+						return nil, 0, fmt.Errorf("xbe: node type %s factory %08X installs vtables %08X and %08X", r.name, nt.Ctor, nt.Vtable, c.vtable)
 					}
 					nt.Vtable = c.vtable
 					nt.factory = true
@@ -399,7 +399,7 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 		if r.parent != 0 {
 			parent, ok := byDesc[r.parent]
 			if !ok {
-				return nil, fmt.Errorf("xbe: node type %s has unregistered parent descriptor %08X", r.name, r.parent)
+				return nil, 0, fmt.Errorf("xbe: node type %s has unregistered parent descriptor %08X", r.name, r.parent)
 			}
 			types[r.name].Parent = parent
 		}
@@ -415,7 +415,7 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, error) {
 			}
 		}
 	}
-	return types, nil
+	return types, registrar, nil
 }
 
 // Runs a constructor on a symbolic object and keeps its paths and the constants it stores into fields, a factory
@@ -1319,6 +1319,16 @@ func searchesRegistry(d *Disassembly, va, base uint32) bool {
 }
 
 // Finds the unnamed library routine the paths pass a virtual getter's result to, when the named routine is absent
+// Reports whether a call takes the result of a virtual getter as one of its arguments
+func bindsVirtualResult(e Effect) bool {
+	for _, a := range e.Args {
+		if cr, ok := a.(CallResult); ok && strings.HasPrefix(cr.Fn, "vcall@") {
+			return true
+		}
+	}
+	return false
+}
+
 func usageOf(paths []Path, d *Disassembly, name string) (uint32, bool) {
 	found := uint32(0)
 	for _, p := range paths {
@@ -1326,8 +1336,12 @@ func usageOf(paths []Path, d *Disassembly, name string) (uint32, bool) {
 			if e.Kind != "call" {
 				continue
 			}
+			// A call already carrying the name needs no naming when it is the one binding the getter's result
 			if e.Fn == name {
-				return 0, false
+				if bindsVirtualResult(e) {
+					return 0, false
+				}
+				continue
 			}
 			var va uint32
 			if !scanSub(e.Fn, &va) || !d.inLibrary(va) {

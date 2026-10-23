@@ -47,7 +47,7 @@ func runWebExport(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return web.Export(inputDir, outputDir, d)
+	return web.Export(inputDir, inputDir, outputDir, d)
 }
 
 // Opens and disassembles an executable

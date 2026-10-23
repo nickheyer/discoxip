@@ -196,16 +196,11 @@ func (ms *MaterialSystem) hideFrom(ex *Executor) {
 func (d *Disassembly) textureProducers() []uint32 {
 	var out []uint32
 	for va, fn := range d.Functions {
-		if fn.Symbol != nil {
+		if fn.Symbol != nil || d.inLibrary(va) {
 			continue
 		}
-		locks := false
-		for _, t := range fn.CallTargets {
-			if callee, ok := d.Functions[t]; ok && callee.Symbol != nil && callee.Symbol.Name == "D3DTexture_LockRect" {
-				locks = true
-			}
-		}
-		if locks {
+		creates := d.reaches(va, "D3DXCreateTexture", 1) || d.reaches(va, "D3DDevice_CreateTexture", 1)
+		if creates && d.reaches(va, "XGSwizzleRect", 0) {
 			out = append(out, va)
 		}
 	}

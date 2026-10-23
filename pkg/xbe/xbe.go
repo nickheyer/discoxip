@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"unicode/utf16"
 )
@@ -302,6 +303,41 @@ func (img *Image) ReadWideString(va uint32) string {
 		units = append(units, c)
 	}
 	return string(utf16.Decode(units))
+}
+
+// MemoryFile is the name the exported startup memory is written under
+const MemoryFile = "image.bin"
+
+// ImageSection is where one loaded section sits in the startup memory and in the file holding it
+type ImageSection struct {
+	Name     string `json:"name"`
+	VA       uint32 `json:"va"`
+	Size     uint32 `json:"size"`
+	Off      uint32 `json:"off"`
+	Writable bool   `json:"writable"`
+}
+
+// ImageMemory is the loaded image the runtime reads as the memory the console starts the executable with
+type ImageMemory struct {
+	File     string         `json:"file"`
+	Base     uint32         `json:"base"`
+	Sections []ImageSection `json:"sections"`
+}
+
+// Lays every loaded section out in address order as the memory the console starts the executable with
+func (img *Image) Memory() (ImageMemory, []byte) {
+	order := make([]*Section, 0, len(img.Sections))
+	for i := range img.Sections {
+		order = append(order, &img.Sections[i])
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i].VirtualAddr < order[j].VirtualAddr })
+	mem := ImageMemory{File: MemoryFile, Base: img.BaseAddr}
+	var bytes []byte
+	for _, s := range order {
+		mem.Sections = append(mem.Sections, ImageSection{Name: s.Name, VA: s.VirtualAddr, Size: s.VirtualSize, Off: uint32(len(bytes)), Writable: s.Flags&0x1 != 0})
+		bytes = append(bytes, s.Data...)
+	}
+	return mem, bytes
 }
 
 // FindSection returns the section with the given name, or nil.

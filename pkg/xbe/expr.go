@@ -546,7 +546,8 @@ func mkCond(op string, a, b Expr) Expr {
 		if pb, ok := b.(Ptr); ok && pa.Base == pb.Base {
 			return mkCond(op, IConst{uint32(pa.Off)}, IConst{uint32(pb.Off)})
 		}
-		if bok && bv == 0 && pa.Base != "" {
+		// A pointer to an object the path holds is never null, where a global holds one only once set
+		if _, held := globalObjectAddress(Ptr{pa.Base, 0}); bok && bv == 0 && pa.Base != "" && !held {
 			switch op {
 			case "eq":
 				return IConst{0}
@@ -709,4 +710,66 @@ func sameExprWithin(a, b Expr, budget *int) bool {
 		return ok && x.Seq == y.Seq && x.Fn == y.Fn
 	}
 	return false
+}
+
+// Tree nodes one path's expressions may expand to, past which the pool cannot carry them
+const maxPathNodes = 1 << 21
+
+// Counts the tree nodes of an expression against a budget, stopping once it runs out
+func countNodes(e Expr, budget *int) {
+	if *budget <= 0 {
+		return
+	}
+	*budget--
+	switch v := e.(type) {
+	case Load:
+		countNodes(v.Addr, budget)
+	case Bin:
+		countNodes(v.A, budget)
+		countNodes(v.B, budget)
+	case Un:
+		countNodes(v.A, budget)
+	case Cond:
+		countNodes(v.A, budget)
+		countNodes(v.B, budget)
+	case FCmpSet:
+		countNodes(v.A, budget)
+		countNodes(v.B, budget)
+	case Not:
+		countNodes(v.A, budget)
+	case Elem:
+		countNodes(v.A, budget)
+	case Block:
+		for _, x := range v.Elems {
+			countNodes(x, budget)
+		}
+	case CallResult:
+		countNodes(v.This, budget)
+		for _, a := range v.Args {
+			countNodes(a, budget)
+		}
+	}
+}
+
+// Reports whether a path's expressions expand to more tree nodes than the pool carries
+func pathTooWide(p Path) bool {
+	budget := maxPathNodes
+	for _, g := range p.Guards {
+		countNodes(g, &budget)
+	}
+	for _, e := range p.Effects {
+		countNodes(e.Value, &budget)
+		countNodes(e.Addr, &budget)
+		countNodes(e.This, &budget)
+		for _, a := range e.Args {
+			countNodes(a, &budget)
+		}
+		for _, b := range e.Buffers {
+			for _, x := range b.Elems {
+				countNodes(x, &budget)
+			}
+		}
+	}
+	countNodes(p.Return, &budget)
+	return budget <= 0
 }

@@ -12,6 +12,74 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
+// DeviceObject is the device global, the static device it points at and the device fields holding its surfaces
+type DeviceObject struct {
+	Global   uint32   `json:"global"`
+	Object   uint32   `json:"object"`
+	Surfaces []uint32 `json:"surfaces"`
+}
+
+// The static device the XDK's creation stores into the device global, found by the store of its address
+func (d *Disassembly) deviceObject(global uint32) (uint32, error) {
+	object := uint32(0)
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		for i := range fn.Instructions {
+			in := &fn.Instructions[i]
+			if in.Inst.Op != x86asm.MOV || argCount(in) != 2 {
+				continue
+			}
+			m, isMem := in.Inst.Args[0].(x86asm.Mem)
+			imm, isImm := in.Inst.Args[1].(x86asm.Imm)
+			if !isMem || !isImm || m.Base != 0 || m.Index != 0 || uint32(m.Disp) != global || !d.isDataAddress(uint32(imm)) {
+				continue
+			}
+			if object != 0 && object != uint32(imm) {
+				return 0, fmt.Errorf("xbe: the device global %08X is stored both %08X and %08X", global, object, uint32(imm))
+			}
+			object = uint32(imm)
+		}
+	}
+	if object == 0 {
+		return 0, fmt.Errorf("xbe: nothing stores a static object into the device global %08X", global)
+	}
+	return object, nil
+}
+
+// Routines reading a description off a surface
+var surfaceDescribers = map[string]bool{"PixelJar::Get2DSurfaceDesc": true, "D3DSurface_GetDesc": true, "D3DTexture_GetLevelDesc": true}
+
+// The device fields the init hands to a surface description getter, the back buffer among them
+func (rm *RenderModel) deviceSurfaces(layout *deviceLayout) ([]uint32, error) {
+	fields := map[uint32]bool{}
+	for _, p := range rm.Draw.paths[rm.Scene.Init] {
+		for _, e := range p.Effects {
+			if e.Kind != "call" || !surfaceDescribers[e.Fn] {
+				continue
+			}
+			for _, a := range e.Args {
+				l, ok := a.(Load)
+				if !ok || l.Size != 4 {
+					continue
+				}
+				b, isAdd := l.Addr.(Bin)
+				if !isAdd || b.Op != "add" {
+					continue
+				}
+				global, isLoad := b.A.(Load)
+				off, isOff := isConst(b.B)
+				if isLoad && isOff && global.Addr == nil && global.Base == "" && uint32(global.Off) == layout.device {
+					fields[off] = true
+				}
+			}
+		}
+	}
+	if !fields[layout.backBuffer] {
+		return nil, fmt.Errorf("xbe: the init %08X describes the device surfaces at %v, not the back buffer at +%X", rm.Scene.Init, slices.Sorted(maps.Keys(fields)), layout.backBuffer)
+	}
+	return slices.Sorted(maps.Keys(fields)), nil
+}
+
 // RenderModel is everything the web runtime needs that was derived from the executable.
 type RenderModel struct {
 	XDK            int                           `json:"xdk"`
@@ -20,6 +88,7 @@ type RenderModel struct {
 	Declarations   map[string]*VertexDeclaration `json:"declarations"`
 	FixedFunction  []FFDeclaration               `json:"fixed_function"`
 	Transforms     map[string]string             `json:"transforms"`
+	Device         DeviceObject                  `json:"device"`
 	StateNames     map[uint32]string             `json:"render_state_names"`
 	StageNames     map[uint32]string             `json:"texture_stage_names"`
 	Defaults       []PathJSON                    `json:"render_state_defaults"`
@@ -35,13 +104,14 @@ type RenderModel struct {
 	ShaderTable    []ShaderBinding               `json:"shader_table"`
 	NVStateNames   map[uint32]string             `json:"nv_state_names"`
 	WorldSlot      int32                         `json:"world_accessor_slot"`
-	Globals        map[uint32]GlobalInit         `json:"globals"`
+	Memory         ImageMemory                   `json:"memory"`
 	Types          map[string]*NodeType          `json:"node_types"`
 	Draw           *DrawModel                    `json:"draw"`
 	System         *SystemModel                  `json:"system"`
 	Scene          *SceneModel                   `json:"scene"`
 	Allocators     []uint32                      `json:"allocators"`
 	Registry       *MaterialRegistry             `json:"material_registry"`
+	memory         []byte
 	defaultPaths   []Path
 	nodePaths      []Path
 	shaderLookup   uint32
@@ -60,13 +130,6 @@ type MeshAccessor struct {
 	Global   uint32 `json:"global"`   // global holding the mesh object pointer
 	Offset   int32  `json:"offset"`   // mesh field holding the object the call is made on
 	Slot     int32  `json:"slot"`     // vtable slot returning the format
-}
-
-// GlobalInit is the process start value of a global the exported paths read, with every function storing to it.
-type GlobalInit struct {
-	Size    int      `json:"size"`
-	Init    []int    `json:"init"`
-	Writers []uint32 `json:"writers"`
 }
 
 // ShaderBinding is a vertex program and declaration a material path creates for a format.
@@ -212,7 +275,7 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 		return nil, err
 	}
 	stage("node types")
-	types, err := DeriveNodeTypes(d)
+	types, registrar, err := DeriveNodeTypes(d)
 	if err != nil {
 		return nil, err
 	}
@@ -231,135 +294,39 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	if err := rm.deriveScene(d, ms, types, sm); err != nil {
 		return nil, err
 	}
-	stage("globals")
-	if err := rm.deriveGlobals(d, ms); err != nil {
+	// The device layout comes from the transform setter, which only the builds writing the device directly reveal
+	if layout, err := d.deviceState(); err == nil {
+		surfaces, err := rm.deviceSurfaces(layout)
+		if err != nil {
+			return nil, err
+		}
+		object, err := d.deviceObject(layout.device)
+		if err != nil {
+			return nil, err
+		}
+		rm.Device = DeviceObject{Global: layout.device, Object: object, Surfaces: surfaces}
+	}
+	stage("memory")
+	if err := rm.deriveMemory(d); err != nil {
+		return nil, err
+	}
+	stage("registrations")
+	if err := rm.replayRegistrations(d, registrar, types); err != nil {
 		return nil, err
 	}
 	return rm, nil
 }
 
-// Bytes exported for a constant table a path indexes at run time
-const constantTableBytes = 256
+// The startup memory bytes the model's sections index
+func (rm *RenderModel) MemoryBytes() []byte {
+	return rm.memory
+}
 
-// Records the start value and the writers of every global the exported paths read symbolically
-func (rm *RenderModel) deriveGlobals(d *Disassembly, ms *MaterialSystem) error {
-	reads := map[uint32]int{}
-	var walk func(e Expr)
-	walk = func(e Expr) {
-		switch v := e.(type) {
-		case Load:
-			if v.Addr != nil {
-				walk(v.Addr)
-				// A table indexed at run time is exported from its constant base.
-				if b, ok := v.Addr.(Bin); ok && b.Op == "add" {
-					for _, side := range []Expr{b.A, b.B} {
-						if c, isC := isConst(side); isC && d.sectionOf(c) != nil && d.sectionOf(c).Flags&0x1 == 0 {
-							if prev, ok := reads[c]; !ok || constantTableBytes > prev {
-								reads[c] = constantTableBytes
-							}
-						}
-					}
-				}
-			} else if v.Base == "" {
-				if prev, ok := reads[uint32(v.Off)]; !ok || v.Size > prev {
-					reads[uint32(v.Off)] = v.Size
-				}
-			}
-		case Bin:
-			walk(v.A)
-			walk(v.B)
-		case Un:
-			walk(v.A)
-		case Cond:
-			walk(v.A)
-			walk(v.B)
-		case FCmpSet:
-			walk(v.A)
-			walk(v.B)
-		case Not:
-			walk(v.A)
-		case CallResult:
-			for _, a := range v.Args {
-				walk(a)
-			}
-		case Block:
-			for _, a := range v.Elems {
-				walk(a)
-			}
-		case Elem:
-			walk(v.A)
-		}
-	}
-	var all []Path
-	for _, m := range ms.Materials {
-		all = append(all, m.Paths...)
-	}
-	all = append(all, rm.defaultPaths...)
-	all = append(all, rm.nodePaths...)
-	for _, paths := range rm.Draw.paths {
-		all = append(all, paths...)
-	}
-	for _, nt := range rm.Types {
-		all = append(all, nt.ctorPaths...)
-	}
-	for _, p := range all {
-		for _, g := range p.Guards {
-			walk(g)
-		}
-		for _, e := range p.Effects {
-			if e.Value != nil {
-				walk(e.Value)
-			}
-			// A matrix the device is handed by constant address is read from the image at run time.
-			if e.Kind == "call" && e.Fn == "D3DDevice_SetTransform" && len(e.Args) == 2 {
-				if c, ok := isConst(e.Args[1]); ok && d.sectionOf(c) != nil {
-					reads[c] = 64
-				}
-			}
-			for _, a := range e.Args {
-				walk(a)
-			}
-			for _, b := range e.Buffers {
-				for _, x := range b.Elems {
-					walk(x)
-				}
-			}
-		}
-		walk(p.Return)
-	}
-	owners := map[uint32][]uint32{}
-	for va, fn := range d.Functions {
-		for _, in := range fn.Instructions {
-			owners[in.VA] = append(owners[in.VA], va)
-		}
-	}
-	rm.Globals = map[uint32]GlobalInit{}
-	for va, size := range reads {
-		if rm.Transforms[fmt.Sprintf("%08X", va)] != "" {
-			continue
-		}
-		init, ok := d.Image.ReadBytes(va, size)
-		if !ok {
-			return fmt.Errorf("xbe: global %08X read by a traced path lies outside the image", va)
-		}
-		g := GlobalInit{Size: size, Init: make([]int, size), Writers: []uint32{}}
-		for i, b := range init {
-			g.Init[i] = int(b)
-		}
-		seen := map[uint32]bool{}
-		for _, insn := range d.InsnByVA {
-			if !storesAbsolute(insn, va, size) {
-				continue
-			}
-			for _, fn := range owners[insn.VA] {
-				if !seen[fn] {
-					seen[fn] = true
-					g.Writers = append(g.Writers, fn)
-				}
-			}
-		}
-		sort.Slice(g.Writers, func(i, j int) bool { return g.Writers[i] < g.Writers[j] })
-		rm.Globals[va] = g
+// Maps the loaded image as the memory the runtime starts the executable with
+func (rm *RenderModel) deriveMemory(d *Disassembly) error {
+	rm.Memory, rm.memory = d.Image.Memory()
+	if len(rm.memory) == 0 {
+		return fmt.Errorf("xbe: the image maps no memory for the runtime to start from")
 	}
 	return nil
 }
@@ -683,6 +650,18 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 			return fmt.Errorf("xbe: render state %d is %s in the binary but %s in the XDK %d table", idx, name, ref, rm.XDK)
 		}
 		names[idx] = ref
+	}
+	for _, va := range slices.Sorted(maps.Keys(rm.setterStates)) {
+		fn := d.Functions[va]
+		if shared[fn.Symbol.Name] < 2 {
+			continue
+		}
+		name, ok := names[rm.setterStates[va]]
+		if !ok {
+			return fmt.Errorf("xbe: the setter %08X of render state %d has no name", va, rm.setterStates[va])
+		}
+		fn.Symbol.Name = "D3DDevice_SetRenderState_" + name
+		fn.Name = fn.Symbol.Name
 	}
 	state, value, err := d.wrapperInputs(wrapper)
 	if err != nil {

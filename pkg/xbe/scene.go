@@ -36,7 +36,7 @@ type SceneModel struct {
 	SceneLoad   SceneLoadHelpers             `json:"scene_load"`
 	ScriptTick  uint32                       `json:"script_tick"`
 	TickHooks   []uint32                     `json:"tick_hooks"`
-	TimerHooks  []uint32                     `json:"timer_hooks"`
+	Input       []uint32                     `json:"input"`
 	Timers      TimerList                    `json:"timers"`
 	Control     uint32                       `json:"control_global"`
 	Slots       map[string]SceneSlots        `json:"slots"`
@@ -52,18 +52,28 @@ type SceneSlots struct {
 
 // SceneLoadHelpers are the scene tree loader's steps the runtime performs itself when it builds an inline.
 type SceneLoadHelpers struct {
-	Reset    uint32 `json:"reset"`
-	Resolve  uint32 `json:"resolve"`
-	Populate uint32 `json:"populate"`
-	NewScope uint32 `json:"new_scope"`
-	Attach   uint32 `json:"attach"`
+	Reset    uint32   `json:"reset"`
+	Resolve  uint32   `json:"resolve"`
+	Populate uint32   `json:"populate"`
+	NewScope uint32   `json:"new_scope"`
+	Attach   uint32   `json:"attach"`
+	Join     PathJoin `json:"join"`
+}
+
+// PathJoin is the helper joining a path onto a base path, its inputs numbered as the runtime receives them,
+// the receiver register first, then the argument registers, then the stack
+type PathJoin struct {
+	VA   uint32 `json:"va"`
+	Src  int    `json:"src"`
+	Base int    `json:"base"`
+	Out  int    `json:"out"`
 }
 
 // TimerList is the executable's list of field interpolations the tick advances.
 type TimerList struct {
 	Advance uint32 `json:"advance"`
 	Remove  uint32 `json:"remove"`
-	Step    uint32 `json:"step"`
+	Walk    uint32 `json:"walk"`
 	Head    uint32 `json:"head"`
 	Next    int32  `json:"next"`
 	Node    int32  `json:"node"`
@@ -81,6 +91,46 @@ var sceneTrace = os.Getenv("DISCOXIP_SCENE_TRACE") != ""
 
 // Callee levels below a scene root that are summarized along with it
 const sceneCalleeDepth = 2
+
+// The XDK routines through which the dashboard reaches the controllers, which the runtime drives itself
+var inputRoutines = map[string]bool{"XGetDevices": true, "XGetDeviceChanges": true, "XInputOpen": true, "XInputClose": true, "XInputGetState": true, "XInputPoll": true, "XInputGetCapabilities": true}
+
+// The routines calling the controller routines directly, less those writing a global, which belong to the scene
+func (d *Disassembly) inputLayer() []uint32 {
+	var out []uint32
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil || d.inLibrary(va) || d.storesAbsoluteGlobal(fn) {
+			continue
+		}
+		for _, t := range fn.CallTargets {
+			if c := d.Functions[t]; c != nil && c.Symbol != nil && inputRoutines[c.Symbol.Name] {
+				out = append(out, va)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Reports whether a function stores into a writable global through its address alone
+func (d *Disassembly) storesAbsoluteGlobal(fn *Function) bool {
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		switch in.Inst.Op {
+		case x86asm.CMP, x86asm.TEST, x86asm.PUSH, x86asm.CALL, x86asm.JMP, x86asm.LEA, x86asm.FLD, x86asm.FILD, x86asm.FCOM, x86asm.FCOMP:
+			continue
+		}
+		if argCount(in) == 0 {
+			continue
+		}
+		m, ok := in.Inst.Args[0].(x86asm.Mem)
+		if ok && m.Base == 0 && m.Index == 0 && d.isDataAddress(uint32(m.Disp)) {
+			return true
+		}
+	}
+	return false
+}
 
 // Classes whose draw, tick and field hook must summarize for the dashboard scenes to render
 var requiredSceneClasses = []string{"Node", "Group", "Transform", "Level", "Inline", "Layer", "Waver", "HUD", "Background", "Viewpoint", "NavigationInfo", "Screen", "Shape"}
@@ -182,16 +232,21 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		sc.Tick = entry
 		ex.Stop = map[uint32]bool{stop: true}
 	}
-	// Besides the camera the tick advances the script timers and the audio voices, which the runtime drives itself.
+	// The camera is the static object the tick advances by the clock, the other callees being the script timers,
+	// the audio voices and the input, which the runtime drives itself.
 	for _, c := range d.plainCallees(sc.Tick) {
+		this := callers[c]
 		if c == sc.Frame {
 			continue
 		}
-		if this := callers[c]; this != 0 && this != sc.Renderer {
+		if this != 0 && this != sc.Renderer && absoluteGlobals(d, c)[rm.Clock.VA] {
+			if sc.Camera != 0 {
+				return fmt.Errorf("xbe: tick routine %08X advances the clock into two static objects (%08X, %08X)", sc.Tick, sc.CameraTick, c)
+			}
 			sc.Camera, sc.CameraTick = this, c
-		} else {
-			sc.TickHooks = append(sc.TickHooks, c)
+			continue
 		}
+		sc.TickHooks = append(sc.TickHooks, c)
 	}
 	if sc.Camera == 0 {
 		return fmt.Errorf("xbe: tick routine %08X advances no static camera object", sc.Tick)
@@ -202,12 +257,14 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if err := sc.deriveGroup(d, group.Slots[rm.Draw.Slot/4], group.Slots[sc.TickSlot/4], rm.Draw.Slot, sc.TickSlot); err != nil {
 		return err
 	}
-	for _, class := range []string{"Level", "Transform"} {
-		fns := sm.methodFunctions[class]
-		if len(fns) == 0 {
-			return fmt.Errorf("xbe: class %s registers no script natives", class)
+	// The scene graph classes run their natives out of the executable, the host services being the runtime's own
+	for _, class := range []string{"Level", "Transform", "Background"} {
+		if fns := sm.methodFunctions[class]; len(fns) > 0 {
+			sc.Natives[class] = fns
 		}
-		sc.Natives[class] = fns
+	}
+	if len(sc.Natives["Level"]) == 0 || len(sc.Natives["Transform"]) == 0 {
+		return fmt.Errorf("xbe: the Level and Transform classes register no script natives")
 	}
 	fire, err := stringCallee(d, sc.Natives["Level"]["GoTo"])
 	if err != nil {
@@ -215,6 +272,9 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	}
 	sc.FireEvent = fire
 	if err := sc.deriveArchive(d, types, rm.Draw.Slot); err != nil {
+		return err
+	}
+	if err := sc.derivePathJoin(d, ex); err != nil {
 		return err
 	}
 
@@ -230,8 +290,10 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		return fmt.Errorf("xbe: ImageTexture is not registered with a texture getter")
 	}
 	sc.ImageLoad = d.plainCallees(image.Slots[rm.Draw.TextureSlot/4])
-	hooks := []uint32{rm.Draw.KindCheck, rm.Draw.MeshLoaded, rm.Accessor.Function, rm.shaderLookup, rm.Draw.MaterialLookup, rm.Wrapper, sc.Group.Draw, sc.Group.Tick, sc.ArrayElem, sc.FireEvent, sc.ScriptTick, sc.Loader, sc.Unloader, sc.SceneLoad.Reset, sc.SceneLoad.Resolve, sc.SceneLoad.Populate, sc.SceneLoad.NewScope, sc.SceneLoad.Attach}
+	sc.Input = d.inputLayer()
+	hooks := []uint32{rm.Draw.KindCheck, rm.Draw.MeshLoaded, rm.Accessor.Function, rm.shaderLookup, rm.Draw.MaterialLookup, rm.Wrapper, sc.Group.Draw, sc.Group.Tick, sc.ArrayElem, sc.FireEvent, sc.ScriptTick, sc.Loader, sc.Unloader, sc.SceneLoad.Reset, sc.SceneLoad.Join.VA, sc.SceneLoad.Populate, sc.SceneLoad.NewScope, sc.SceneLoad.Attach}
 	hooks = append(hooks, sc.TickHooks...)
+	hooks = append(hooks, sc.Input...)
 	hooks = append(hooks, sc.ImageLoad...)
 	hooks = append(hooks, d.plainCallees(rm.Draw.MeshLoaded)...)
 	hooks = append(hooks, ms.Allocators...)
@@ -260,8 +322,12 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	queued := map[uint32]bool{}
 	staticCallees := map[uint32]uint32{}
 	enqueue := func(va, this uint32, required bool, depth int) {
-		if va == 0 || hooked[va] || queued[va] || ex.ftol[va] || depth > sceneCalleeDepth {
+		if va == 0 || hooked[va] || queued[va] || ex.ftol[va] {
 			return
+		}
+		// A callee past the depth the chain is followed on the full budget is summarized on the small one
+		if depth > sceneCalleeDepth {
+			required = false
 		}
 		queued[va] = true
 		queue = append(queue, sceneWork{va, this, required, depth})
@@ -358,9 +424,25 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		// The helpers a constructor keeps as calls run when the runtime constructs the class
 		for _, p := range nt.Construct {
 			for _, e := range p.Effects {
+				if e.Kind != "call" {
+					continue
+				}
 				var va uint32
-				if e.Kind == "call" && scanSub(e.Fn, &va) {
+				if scanSub(e.Fn, &va) {
 					enqueue(va, 0, false, 0)
+				}
+			}
+		}
+		// A routine the constructor hands a library call as a callback is run by the runtime as well
+		for _, p := range nt.ctorPaths {
+			for _, e := range p.Effects {
+				if e.Kind != "call" {
+					continue
+				}
+				for _, arg := range e.Args {
+					if c, ok := isConst(arg); ok && d.Functions[c] != nil && d.Functions[c].Symbol == nil && !d.inLibrary(c) {
+						enqueue(c, 0, false, 0)
+					}
 				}
 			}
 		}
@@ -385,52 +467,73 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			enqueue(va, 0, required[name], 0)
 		}
 	}
-	for len(queue) > 0 {
-		w := queue[0]
-		queue = queue[1:]
-		if _, done := rm.Draw.paths[w.va]; !done {
-			if err := summarize(w); err != nil {
-				if w.required {
-					return fmt.Errorf("xbe: %w", err)
-				}
-				sc.Errors[fmt.Sprintf("%08X", w.va)] = err.Error()
+	// A slot the paths dispatch on runs the implementation every class gives it, so each one is summarized too
+	dispatched := map[uint32]bool{}
+	enqueueSlot := func(slot uint32, depth int) {
+		if slot%4 != 0 || dispatched[slot] {
+			return
+		}
+		dispatched[slot] = true
+		for _, name := range names {
+			nt := types[name]
+			if rootType(types, nt) != "Node" || nt.Vtable == 0 || int(slot/4) >= len(nt.Slots) {
 				continue
 			}
-		}
-		for _, c := range d.plainCallees(w.va) {
-			enqueue(c, staticCallees[c], w.required, w.depth+1)
+			enqueue(nt.Slots[slot/4], 0, false, depth)
 		}
 	}
-	// Helpers sharing the timer list globals the tick hooks walk belong to the script timer subsystem.
-	timerGlobals := map[uint32]bool{}
-	for _, va := range sc.TickHooks {
-		for g := range absoluteGlobals(d, va) {
-			timerGlobals[g] = true
-		}
-	}
-	for va := range queued {
-		if _, done := rm.Draw.paths[va]; done {
-			continue
-		}
-		for g := range absoluteGlobals(d, va) {
-			if timerGlobals[g] {
-				sc.TimerHooks = append(sc.TimerHooks, va)
-				delete(sc.Errors, fmt.Sprintf("%08X", va))
-				break
+	drain := func() error {
+		for len(queue) > 0 {
+			w := queue[0]
+			queue = queue[1:]
+			if _, done := rm.Draw.paths[w.va]; !done {
+				if err := summarize(w); err != nil {
+					if w.required {
+						return fmt.Errorf("xbe: %w", err)
+					}
+					sc.Errors[fmt.Sprintf("%08X", w.va)] = err.Error()
+					continue
+				}
+			}
+			for _, c := range d.plainCallees(w.va) {
+				enqueue(c, staticCallees[c], w.required, w.depth+1)
+			}
+			// A routine the dashboard hands a library call as a callback is run by the runtime as well
+			for _, p := range rm.Draw.paths[w.va] {
+				for _, e := range p.Effects {
+					if e.Kind != "call" {
+						continue
+					}
+					var slot uint32
+					if n, _ := fmt.Sscanf(e.Fn, "vcall@%X", &slot); n == 1 {
+						enqueueSlot(slot, w.depth+1)
+					}
+					for _, a := range e.Args {
+						c, ok := isConst(a)
+						if !ok || d.Functions[c] == nil || d.Functions[c].Symbol != nil || d.inLibrary(c) {
+							continue
+						}
+						enqueue(c, staticCallees[c], w.required, w.depth+1)
+					}
+				}
 			}
 		}
+		return nil
 	}
-	sort.Slice(sc.TimerHooks, func(i, j int) bool { return sc.TimerHooks[i] < sc.TimerHooks[j] })
+	if err := drain(); err != nil {
+		return err
+	}
 	candidates := make([]uint32, 0, len(queued))
 	for va := range queued {
 		candidates = append(candidates, va)
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
-	if err := sc.deriveTimers(d, candidates); err != nil {
+	if err := sc.deriveTimers(d, ex, candidates); err != nil {
 		return err
 	}
-	if err := summarize(sceneWork{va: sc.Timers.Step, required: true}); err != nil {
-		return fmt.Errorf("xbe: timer step: %w", err)
+	enqueue(sc.Timers.Walk, 0, true, 0)
+	if err := drain(); err != nil {
+		return err
 	}
 	if err := sc.deriveControl(rm, types, summarize); err != nil {
 		return err
@@ -525,41 +628,115 @@ func fieldOffset(types map[string]*NodeType, class, name string) (int32, bool) {
 	return 0, false
 }
 
-// The timer advance is the tick hook that steps each record of a global list through one callee, the remove
-// helper the one unlinking the records of a node
-func (sc *SceneModel) deriveTimers(d *Disassembly, candidates []uint32) error {
+// The timer advance is the tick hook that walks a global record list and frees the records it finishes
+func (sc *SceneModel) deriveTimers(d *Disassembly, ex *Executor, candidates []uint32) error {
 	for _, va := range sc.TickHooks {
-		callees := d.plainCallees(va)
-		if len(callees) != 1 {
-			continue
-		}
 		head, next := listShape(d, va)
-		if head == 0 || next < 0 {
+		if head == 0 || next < 0 || !freesRecord(d, va) {
 			continue
 		}
-		sc.Timers = TimerList{Advance: va, Step: callees[0], Head: head, Next: next}
+		if sc.Timers.Advance != 0 {
+			return fmt.Errorf("xbe: tick hooks %08X and %08X both walk a record list they free from", sc.Timers.Advance, va)
+		}
+		sc.Timers = TimerList{Advance: va, Head: head, Next: next}
 	}
 	if sc.Timers.Advance == 0 {
-		return fmt.Errorf("xbe: no tick hook walks a record list through a step routine")
+		return fmt.Errorf("xbe: no tick hook walks a record list it frees from")
 	}
+	entry, stop, err := walkBody(d, sc.Timers.Advance)
+	if err != nil {
+		return err
+	}
+	if d.Functions[entry] == nil {
+		if d.Functions[entry] = d.buildFunction(entry, nil); d.Functions[entry] == nil {
+			return fmt.Errorf("xbe: the walk body of %08X at %08X is not disassembled", sc.Timers.Advance, entry)
+		}
+	}
+	if ex.Stop == nil {
+		ex.Stop = map[uint32]bool{}
+	}
+	ex.Stop[stop] = true
+	sc.Timers.Walk = entry
+	// The remove helper is the other walk of that list, the field it tests being the node a record writes into
 	for _, va := range candidates {
-		if va == sc.Timers.Advance {
-			continue
-		}
 		head, _ := listShape(d, va)
-		if head != sc.Timers.Head {
+		if va == sc.Timers.Advance || head != sc.Timers.Head || !freesRecord(d, va) {
 			continue
 		}
-		for _, disp := range loadedDisplacements(d, va) {
+		var fields []int32
+		for _, disp := range fieldDisplacements(d, va) {
 			if disp != sc.Timers.Next && disp > 0 {
-				sc.Timers.Remove, sc.Timers.Node = va, disp
+				fields = append(fields, disp)
 			}
 		}
+		// A walk of the list reading several fields of its own is some other pass over it, not the unlink
+		if len(fields) != 1 {
+			continue
+		}
+		if sc.Timers.Remove != 0 {
+			return fmt.Errorf("xbe: helpers %08X and %08X both unlink records of the timer list %08X", sc.Timers.Remove, va, sc.Timers.Head)
+		}
+		sc.Timers.Remove, sc.Timers.Node = va, fields[0]
 	}
 	if sc.Timers.Remove == 0 {
 		return fmt.Errorf("xbe: no helper unlinks the records of a node from the timer list %08X", sc.Timers.Head)
 	}
 	return nil
+}
+
+// Reports whether a walk ends the life of the records it visits
+func freesRecord(d *Disassembly, va uint32) bool {
+	fn := d.Functions[va]
+	if fn == nil {
+		return false
+	}
+	for _, t := range fn.CallTargets {
+		if c := d.Functions[t]; c != nil && c.Symbol != nil && c.Symbol.Name == "operator_delete" {
+			return true
+		}
+	}
+	return false
+}
+
+// The pass a list walk makes over one record, between the load its back edge returns to and the link test
+func walkBody(d *Disassembly, va uint32) (uint32, uint32, error) {
+	fn := d.Functions[va]
+	if fn == nil {
+		return 0, 0, fmt.Errorf("xbe: list walk %08X is not disassembled", va)
+	}
+	targets := map[uint32]bool{}
+	back := -1
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		t := resolveTarget(in)
+		if !isJump(in.Inst.Op) || t == 0 {
+			continue
+		}
+		targets[t] = true
+		if t >= in.VA {
+			continue
+		}
+		if back >= 0 {
+			return 0, 0, fmt.Errorf("xbe: list walk %08X loops back from both %08X and %08X", va, fn.Instructions[back].VA, in.VA)
+		}
+		back = i
+	}
+	if back < 0 {
+		return 0, 0, fmt.Errorf("xbe: list walk %08X runs no loop over its records", va)
+	}
+	i := back
+	for i > 0 && !targets[fn.Instructions[i].VA] {
+		p := &fn.Instructions[i-1]
+		if isJump(p.Inst.Op) || p.Inst.Op == x86asm.CALL || p.Inst.Op == x86asm.RET {
+			break
+		}
+		i--
+	}
+	entry, stop := resolveTarget(&fn.Instructions[back]), fn.Instructions[i].VA
+	if stop <= entry || !targets[stop] {
+		return 0, 0, fmt.Errorf("xbe: list walk %08X tests its link at %08X, which is not a join below its body at %08X", va, stop, entry)
+	}
+	return entry, stop, nil
 }
 
 // The global a list walk starts from and the record field it follows to the next record
@@ -587,20 +764,22 @@ func listShape(d *Disassembly, va uint32) (uint32, int32) {
 	return head, next
 }
 
-// Displacements of register relative loads in a function
-func loadedDisplacements(d *Disassembly, va uint32) []int32 {
+// The distinct offsets of the object fields a function addresses, leaving out its own frame
+func fieldDisplacements(d *Disassembly, va uint32) []int32 {
 	var out []int32
 	fn := d.Functions[va]
 	if fn == nil {
 		return out
 	}
 	for i := range fn.Instructions {
-		in := &fn.Instructions[i]
-		if in.Inst.Op != x86asm.MOV || argCount(in) != 2 {
-			continue
-		}
-		if m, ok := in.Inst.Args[1].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 {
-			out = append(out, int32(m.Disp))
+		for _, a := range fn.Instructions[i].Inst.Args {
+			m, ok := a.(x86asm.Mem)
+			if !ok || m.Base == 0 || m.Base == x86asm.ESP || m.Base == x86asm.EBP || m.Index != 0 || m.Segment != 0 {
+				continue
+			}
+			if !slices.Contains(out, int32(m.Disp)) {
+				out = append(out, int32(m.Disp))
+			}
 		}
 	}
 	return out
@@ -712,6 +891,88 @@ func (sc *SceneModel) deriveArchive(d *Disassembly, types map[string]*NodeType, 
 		return fmt.Errorf("xbe: inline load %08X has %d helper steps and post load %08X has %d, expected 2 and 3", sc.InlineLoad, len(loadSteps), sc.PostLoad, len(postSteps))
 	}
 	sc.SceneLoad = SceneLoadHelpers{Reset: loadSteps[0], Resolve: loadSteps[1], Populate: postSteps[0], NewScope: postSteps[1], Attach: postSteps[2]}
+	return nil
+}
+
+// The join is the helper the resolver calls twice, its inputs placed by which one each string call reads or fills
+func (sc *SceneModel) derivePathJoin(d *Disassembly, ex *Executor) error {
+	resolve := d.Functions[sc.SceneLoad.Resolve]
+	calls := map[uint32]int{}
+	for i := range resolve.Instructions {
+		in := &resolve.Instructions[i]
+		if in.Inst.Op != x86asm.CALL {
+			continue
+		}
+		if t := resolveTarget(in); t != 0 && d.Functions[t] != nil && d.Functions[t].Symbol == nil {
+			calls[t]++
+		}
+	}
+	join := uint32(0)
+	for _, va := range slices.Sorted(maps.Keys(calls)) {
+		if calls[va] != 2 {
+			continue
+		}
+		if join != 0 {
+			return fmt.Errorf("xbe: resolver %08X calls both %08X and %08X twice", sc.SceneLoad.Resolve, join, va)
+		}
+		join = va
+	}
+	if join == 0 {
+		return fmt.Errorf("xbe: resolver %08X calls no helper twice", sc.SceneLoad.Resolve)
+	}
+	regs := d.registerInputs(join)
+	stackCount := d.stackInputs(d.Functions[join])
+	inputs := 1 + len(regs) + stackCount
+	sub := NewExecutorShared(ex)
+	sub.PathLimit = 256
+	sub.StepLimit = 20000
+	for _, c := range d.plainCallees(join) {
+		sub.Opaque[c] = true
+	}
+	paths, partial, _, _ := sub.RunWithRetries(join, func(s *execState) {
+		s.regs[1] = Sym{"in0"}
+		for i, r := range regs {
+			s.regs[regIndex[r]] = Sym{fmt.Sprintf("in%d", 1+i)}
+		}
+		args := make([]Expr, stackCount)
+		for i := range args {
+			args[i] = Sym{fmt.Sprintf("in%d", 1+len(regs)+i)}
+		}
+		s.pushArgs(args...)
+	}, 0)
+	var effects []Effect
+	for _, p := range paths {
+		effects = append(effects, p.Effects...)
+	}
+	effects = append(effects, partial...)
+	inputOf := func(e Expr) int {
+		var n int
+		if s, ok := e.(Sym); ok {
+			if c, _ := fmt.Sscanf(s.Name, "in%d", &n); c == 1 {
+				return n
+			}
+		}
+		return -1
+	}
+	src, base, out := -1, -1, -1
+	for _, e := range effects {
+		if e.Kind != "call" || len(e.Args) < 2 {
+			continue
+		}
+		first := inputOf(e.Args[0])
+		switch {
+		case e.Fn == "wcschr" && first >= 0 && src < 0:
+			src = first
+		case e.Fn == "wcschr" && first >= 0 && first != src && base < 0:
+			base = first
+		case e.Fn == "wcscpy" && first >= 0 && out < 0 && inputOf(e.Args[1]) >= 0:
+			out = first
+		}
+	}
+	if src < 0 || base < 0 || out < 0 || src == base || src == out || base == out || src >= inputs || base >= inputs || out >= inputs {
+		return fmt.Errorf("xbe: join helper %08X reads its path, base and output in inputs %d, %d and %d of %d", join, src, base, out, inputs)
+	}
+	sc.SceneLoad.Join = PathJoin{VA: join, Src: src, Base: base, Out: out}
 	return nil
 }
 

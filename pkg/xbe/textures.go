@@ -16,7 +16,7 @@ type ProducedTexture struct {
 
 // DeriveTextures executes each texture producer concretely and captures the pixels it writes.
 func DeriveTextures(d *Disassembly, producers []uint32, allocators []uint32) ([]*ProducedTexture, error) {
-	var out []*ProducedTexture
+	out := []*ProducedTexture{}
 	for _, va := range producers {
 		ex := NewExecutor(d)
 		for _, a := range allocators {

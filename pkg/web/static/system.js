@@ -33,6 +33,9 @@ const MISC_AUTO_OFF = 1, MISC_NO_DST = 2;
 const PASSWORD_DIGITS = { u: 1, d: 2, l: 3, r: 4, a: 5, b: 6, x: 7, y: 8, B: 9, W: 10, L: 11, R: 12 };
 const DATE_SEPARATOR_DOT = new Set([0x10002, 0x10005, 0x20002, 0x20003, 0x20005, 0x40002, 0x40003, 0x40005]);
 const COPY_DOT_PERIOD_MS = 500, COPY_DOTS = 3;
+const HARD_DISK_ACCOUNT_SLOTS = 8, MEMORY_UNIT_ACCOUNT_SLOTS = 1;
+const FEATURE_LIVE_TODAY_OFF = 4, FEATURE_LEGAL_ACCEPTED = 8;
+const LIVE_NO_SERVICE = 'CANNOT_ACCESS_SERVICE';
 const ENUMERATE_DELAY_MS = 0;
 const XC_VIDEO_FLAGS = 8, REG_DWORD = 4;
 const TRAY_CLOSED_NO_MEDIA = 0x40, TRAY_CLOSED_MEDIA_PRESENT = 0x60;
@@ -65,6 +68,13 @@ export class VirtualConsole {
     this.savedTitles = { [HARD_DISK_UNIT]: [] };
     this.dataPartition = { totalBytes: config.dataPartitionSectors * SECTOR_BYTES, freeBytes: (config.dataPartitionSectors - config.dataPartitionUsedSectors) * SECTOR_BYTES };
     this.unitNames = {};
+    this.liveAccounts = {};
+    this.files = [];
+    this.fontVersion = 0;
+    this.ethernetLink = 0;
+    this.noisyCamera = 0;
+    this.live = { result: '', lastUser: -1, verified: false, motd: '', icon: false };
+    this.features = 0;
     this.discLocked = false;
     this.started = performance.now();
   }
@@ -131,6 +141,31 @@ export class VirtualConsole {
     const round = (bytes) => Math.floor((bytes + (1 << shift) - 1) / (1 << shift));
     const part = unit === HARD_DISK_UNIT ? this.dataPartition : this.config.memoryUnits[unit];
     return { total: round(part.totalBytes) - 1, free: round(part.freeBytes) };
+  }
+
+  // Random bytes the network stack asks the console for
+  randomBytes(count) {
+    const out = new Uint8Array(count);
+    crypto.getRandomValues(out);
+    return out;
+  }
+
+  // The Xbox Live accounts a device unit holds
+  accountsOn(unit) {
+    return this.liveAccounts[unit] ?? [];
+  }
+
+  // Account slots a unit offers, the hard disk taking the eight the dashboard caps its own display at
+  accountSlots(unit) {
+    if (!this.unitPresent(unit)) return 0;
+    return unit === HARD_DISK_UNIT ? HARD_DISK_ACCOUNT_SLOTS : MEMORY_UNIT_ACCOUNT_SLOTS;
+  }
+
+  // Reports whether the partition the dashboard runs from holds a file, by the path the dashboard names it with
+  fileExists(path) {
+    const p = String(path).toLowerCase().replace(/\//g, '\\');
+    const name = p.replace(/^.*\\partition\d+\\/, '');
+    return (this.files || []).includes(name) ? 1 : 0;
   }
 
   formatBlocks(n) {
@@ -330,6 +365,20 @@ export function nativeClasses(runtime, vc) {
     ForceSetLanguage: () => forceSet(vc, 'ForceSetLanguage'),
     ForceSetTimeZone: () => forceSet(vc, 'ForceSetTimeZone'),
     ForceSetClock: () => forceSet(vc, 'ForceSetClock'),
+    GetFontVersion: () => vc.fontVersion | 0,
+    GetLiveToday: () => bit(vc.features, FEATURE_LIVE_TODAY_OFF) ? 0 : 1,
+    SetLiveToday: (n, b) => { vc.features = setBit(vc.features, FEATURE_LIVE_TODAY_OFF, !b); },
+    GetAcceptedLegalInfo: () => bit(vc.features, FEATURE_LEGAL_ACCEPTED),
+    SetAcceptedLegalInfo: (n, b) => { vc.features = setBit(vc.features, FEATURE_LEGAL_ACCEPTED, b); },
+    FileExists: (n, path) => vc.fileExists(path),
+    NtFileExists: (n, path) => vc.fileExists(path),
+    GetEthernetLinkStatus: () => vc.ethernetLink & 1,
+    ToggleNoisyCamera: () => {
+      vc.noisyCamera = vc.noisyCamera ? 0 : 1;
+      runtime.derived.memory.store(sys.camera_noise, 1, vc.noisyCamera);
+      return vc.noisyCamera;
+    },
+    GoToXOnlineDash: () => vc.reboot(),
     GetRecoveryKey: () => vc.recoveryKey(),
     GetROMVersion: () => version(vc.config.kernelVersion),
     GetXdashVersion: () => version(sys.dashboard_version),
@@ -346,6 +395,7 @@ export function nativeClasses(runtime, vc) {
     TranslateStripColon: (node, key) => { const t = vc.translate(vc.language, key); return t.endsWith(':') ? t.slice(0, -1) : t; },
   };
 
+  classes.LiveAccounts = liveAccountNatives(runtime, vc);
   classes.MemoryMonitor = memoryMonitorNatives(runtime, vc);
   classes.SavedGameGrid = savedGameGridNatives(runtime, vc);
   classes.CopyDestination = copyDestinationNatives(runtime, vc);
@@ -412,6 +462,45 @@ function sortFiles(node, compare) {
   if (Array.isArray(files)) files.sort(compare);
 }
 
+// The accounts the console signs in with, all of them kept on its own units
+function liveAccountNatives(runtime, vc) {
+  const accounts = () => vc.accountsOn(HARD_DISK_UNIT);
+  const at = (i) => accounts()[i | 0];
+  return {
+    GetNumberOfAccounts: () => accounts().length,
+    GetAccountName: (node, i) => { const a = at(i); return a ? a.name : ''; },
+    GetGameInvites: () => 0,
+    GetFriendInvites: () => 0,
+    GetNumberOfFriendsOnline: () => 0,
+    Refresh: () => accounts().length,
+    Logon: (node, i, password) => {
+      // The sign in reaches no service on a console with no link, which is the result the dashboard reports
+      vc.live.result = LIVE_NO_SERVICE;
+      vc.live.verified = false;
+      runtime.fireEvent(node, 'OnLogonFailed');
+      return 0;
+    },
+    Logoff: (node) => { vc.live.result = ''; vc.live.verified = false; return 0; },
+    GetResult: () => vc.live.result,
+    IsPasswordEnabled: (node, i) => { const a = at(i); return a && a.password ? 1 : 0; },
+    VerifyPassword: (node, i, password) => {
+      const a = at(i);
+      vc.live.verified = !!a && a.password === String(password);
+      return vc.live.verified ? 1 : 0;
+    },
+    IsPasswordVerified: () => vc.live.verified ? 1 : 0,
+    PersistUser: (node, i) => { vc.live.lastUser = i | 0; return 0; },
+    GetLastLogonUser: () => vc.live.lastUser,
+    ClearLastLogonUser: () => { vc.live.lastUser = -1; return 0; },
+    LaunchEntryPoint: (node, port, clearPasscode, destination) => vc.reboot(),
+    LaunchDashUpdate: () => vc.reboot(),
+    IsBackFromEntryPoint: () => vc.launch && vc.launch.reason === 5 ? 1 : 0,
+    GetMessageOfTheDayText: () => vc.live.motd,
+    ClearMOTDCache: () => { vc.live.motd = ''; return 0; },
+    ShowIcon: (node, on) => { vc.live.icon = !!on; return 0; },
+  };
+}
+
 // Device units are numbered by controller slot, eight memory units then the hard disk
 function memoryMonitorNatives(runtime, vc) {
   const state = (node) => node._native;
@@ -449,6 +538,10 @@ function memoryMonitorNatives(runtime, vc) {
     return false;
   };
   const blocks = (unit) => vc.diskBlocks(unit);
+  const freeSlots = (node, unit) => {
+    const u = (unit | 0) === -1 ? state(node).curDevUnit : unit | 0;
+    return vc.accountSlots(u) - vc.accountsOn(u).length;
+  };
   const refreshTotals = (node) => {
     const st = state(node);
     const b = blocks(st.curDevUnit);
@@ -522,6 +615,9 @@ function memoryMonitorNatives(runtime, vc) {
       const b = blocks(unit | 0);
       return b ? b.free : unit | 0;
     },
+    FormatTotalSlots: (node, unit) => String(vc.accountSlots((unit | 0) === -1 ? state(node).curDevUnit : unit | 0)),
+    FormatFreeSlots: (node, unit) => String(freeSlots(node, unit)),
+    GetTotalFreeSlots: (node, unit) => freeSlots(node, unit),
     HaveDeviceTop: (node, pad) => pad >= 0 && pad <= 3 && present(pad * 2) ? 1 : 0,
     HaveDeviceBottom: (node, pad) => pad >= 0 && pad <= 3 && present(pad * 2 + 1) ? 1 : 0,
     GetFreeTotalRatio: (node, unit) => {
@@ -556,10 +652,13 @@ function savedGameGridNatives(runtime, vc) {
   const fire = (node, name) => runtime.fireEvent(node, name);
   const selectionChanged = (node) => {
     fire(node, 'OnSelChange');
-    runtime.derived.globals.set(vc.system.selection_clock, { f64: runtime.derived.clock });
+    const clock = runtime.derived.model.clock;
+    runtime.derived.memory.store(vc.system.selection_clock, 8, runtime.derived.memory.load(clock.va, 8));
   };
   const curTitle = (node) => node._fields.curTitle | 0;
-  const curSave = (node) => node._fields.curSavedGame | 0;
+  const itemField = (node) => (node._fields.curGridItem === undefined ? 'curSavedGame' : 'curGridItem');
+  const curSave = (node) => node._fields[itemField(node)] | 0;
+  const setSave = (node, v) => { node._fields[itemField(node)] = v; };
   const perRow = (node) => node._fields.iconsPerRow | 0;
   const titleCount = (node) => {
     const st = state(node);
@@ -573,14 +672,40 @@ function savedGameGridNatives(runtime, vc) {
       st.soundtrackRow = -1;
       st.soundtrackCount = 0;
     }
+    st.accountRow = -1;
+    st.accountCount = vc.accountsOn(unit).length;
+    if (st.accountCount > 0) {
+      st.accountRow = n;
+      n++;
+    }
     return n;
   };
   const savedCount = (node, title) => {
     const st = state(node);
     if (title < 0 || notReady(node, st.curDevUnit)) return 0;
-    if (st.soundtrackRow >= 0 && title >= st.soundtrackRow) return st.soundtrackCount;
+    if (st.accountRow >= 0 && title === st.accountRow) return st.accountCount;
+    if (st.soundtrackRow >= 0 && title === st.soundtrackRow) return st.soundtrackCount;
     const t = titles(st.curDevUnit)[title];
     return t ? t.saves.length : 0;
+  };
+  const onSoundtrackRow = (node) => state(node).soundtrackRow >= 0 && curTitle(node) === state(node).soundtrackRow;
+  const onAccountRow = (node) => state(node).accountRow >= 0 && curTitle(node) === state(node).accountRow;
+  const soundtrackBlocks = (t) => (t.songs || []).reduce((sum, song) => sum + (song.blocks | 0), 0);
+  const selectedItem = (node) => {
+    const st = state(node);
+    const item = curSave(node);
+    if (item < 0) return null;
+    if (onAccountRow(node)) {
+      const a = vc.accountsOn(st.curDevUnit)[item];
+      return a ? { kind: 'account', name: a.name, time: a.time || '', size: 1 } : null;
+    }
+    if (onSoundtrackRow(node)) {
+      const t = vc.soundtracks[item];
+      return t ? { kind: 'soundtrack', name: t.name, time: '', size: soundtrackBlocks(t) } : null;
+    }
+    const t = titles(st.curDevUnit)[curTitle(node)];
+    const save = t && t.saves[item];
+    return save ? { kind: 'save', name: save.name, time: save.time, size: save.blocks } : null;
   };
   const selectTitle = (node, title) => {
     const st = state(node);
@@ -600,17 +725,21 @@ function savedGameGridNatives(runtime, vc) {
     }
     node._fields.nPrefColumn = pref;
     if (pref === -1) {
-      node._fields.curSavedGame = -1;
+      setSave(node, -1);
       node._fields.iconRowScroll = 0;
       return;
     }
     if (curTitle(node) > st.prevTitle) {
-      node._fields.curSavedGame = Math.min(pref, saves - 1);
+      setSave(node, Math.min(pref, saves - 1));
       node._fields.iconRowScroll = 0;
     } else {
-      node._fields.curSavedGame = saves === 0 ? -1 : Math.min(pref + (rows - 1) * cols, saves - 1);
+      setSave(node, saves === 0 ? -1 : Math.min(pref + (rows - 1) * cols, saves - 1));
       node._fields.iconRowScroll = Math.max(rows - 3, 0);
     }
+  };
+  const dlContent = (node, title) => {
+    const t = titles(state(node).curDevUnit)[title];
+    return (t && t.downloads) || [];
   };
   const enumerate = (node, unit) => {
     const st = state(node);
@@ -634,7 +763,7 @@ function savedGameGridNatives(runtime, vc) {
       const row = save === -1 ? 0 : Math.floor(save / cols);
       if (save !== -1 && row > 0) {
         const next = (node._fields.nPrefColumn | 0) + (row - 1) * cols;
-        node._fields.curSavedGame = next;
+        setSave(node, next);
         if (row - 1 < (node._fields.iconRowScroll | 0)) node._fields.iconRowScroll = row - 1;
         node._fields.nPrefColumn = next % cols;
         selectionChanged(node);
@@ -654,7 +783,7 @@ function savedGameGridNatives(runtime, vc) {
         const saves = savedCount(node, curTitle(node));
         const row = Math.floor(save / cols), lastRow = Math.floor((saves + cols - 1) / cols) - 1;
         if (row < lastRow) {
-          node._fields.curSavedGame = Math.min(save + cols, saves - 1);
+          setSave(node, Math.min(save + cols, saves - 1));
           if (row + 1 >= (node._fields.iconRowScroll | 0) + 2) node._fields.iconRowScroll = row - 1;
           node._fields.nPrefColumn = curSave(node) % cols;
           selectionChanged(node);
@@ -672,10 +801,10 @@ function savedGameGridNatives(runtime, vc) {
       if (save >= 0) {
         if ((node._fields.nPrefColumn | 0) === 0) {
           node._fields.nPrefColumn = -1;
-          node._fields.curSavedGame = -1;
+          setSave(node, -1);
           node._fields.iconRowScroll = 0;
         } else {
-          node._fields.curSavedGame = save - 1;
+          setSave(node, save - 1);
           node._fields.nPrefColumn = (save - 1) % perRow(node);
         }
       }
@@ -687,7 +816,7 @@ function savedGameGridNatives(runtime, vc) {
       const saves = savedCount(node, title);
       if (save < saves - 1 && (node._fields.nPrefColumn | 0) < 3) {
         const next = save + 1;
-        node._fields.curSavedGame = next;
+        setSave(node, next);
         node._fields.nPrefColumn = next % cols;
         if (next >= ((node._fields.iconRowScroll | 0) + 3) * cols) node._fields.iconRowScroll = Math.floor(next / cols) - 2;
       }
@@ -732,7 +861,7 @@ function savedGameGridNatives(runtime, vc) {
       } else if (list[curTitle(node)]) {
         if (curSave(node) >= 0) list[curTitle(node)].saves.splice(curSave(node), 1); else list.splice(curTitle(node), 1);
       }
-      node._fields.curSavedGame = -1;
+      setSave(node, -1);
       fire(node, 'OnDeleteEnd');
     },
     DoesSavedGameExists: (node, dest) => {
@@ -752,7 +881,30 @@ function savedGameGridNatives(runtime, vc) {
       const save = t && t.saves[curSave(node)];
       return save && !save.noCopy ? 1 : 0;
     },
-    IsSoundtrackSelected: (node) => state(node).soundtrackRow >= 0 && curTitle(node) === state(node).soundtrackRow ? 1 : 0,
+    IsSoundtrackSelected: (node) => onSoundtrackRow(node) ? 1 : 0,
+    FormatGridItemName: (node) => { const it = selectedItem(node); return it ? it.name : ''; },
+    FormatGridItemTime: (node) => { const it = selectedItem(node); return it ? it.time : ''; },
+    FormatGridItemSize: (node) => { const it = selectedItem(node); return String(it ? it.size : -1); },
+    GetGridItemCount: (node, title) => savedCount(node, title | 0),
+    GetDLContentCount: (node, title) => dlContent(node, title | 0).length,
+    GetXboxLiveAccountsCount: (node, unit) => vc.accountsOn((unit | 0) === -1 ? state(node).curDevUnit : unit | 0).length,
+    IsSavedGameSelected: (node) => { const it = selectedItem(node); return it && it.kind === 'save' ? 1 : 0; },
+    IsDLContentSelected: (node) => {
+      const it = selectedItem(node);
+      return it && it.kind === 'save' && dlContent(node, curTitle(node)).some((c) => c.name === it.name) ? 1 : 0;
+    },
+    IsDLContentPartial: (node) => {
+      const it = selectedItem(node);
+      const content = it ? dlContent(node, curTitle(node)).find((c) => c.name === it.name) : null;
+      return content && content.partial ? 1 : 0;
+    },
+    IsXboxLiveAccountSelected: (node) => onAccountRow(node) ? 1 : 0,
+    StartSavedGameCopy: (node, dest) => natives.StartCopy(node, dest),
+    StartXboxLiveAccountCopy: (node, dest) => natives.StartCopy(node, dest),
+    DoesXboxLiveAccountExists: (node, dest) => {
+      const it = selectedItem(node);
+      return it && vc.accountsOn(dest | 0).some((a) => a.name === it.name) ? 1 : 0;
+    },
     IsDevUnitReady: (node, unit) => notReady(node, unit | 0) ? 0 : 1,
     GetTitleCount: (node) => titleCount(node),
     GetUpdateString: (node) => {
@@ -765,7 +917,7 @@ function savedGameGridNatives(runtime, vc) {
       return vc.translate(vc.language, 'Copying') + '.'.repeat(st.dots);
     },
   };
-  natives.$init = () => ({ curDevUnit: -1, enumerating: {}, soundtrackRow: -1, soundtrackCount: 0, totalBlocks: -1, prevTitle: -1, scrollStart: 0, iconLoaded: false, dots: 0, dotTime: 0, detachedImage: null });
+  natives.$init = () => ({ curDevUnit: -1, enumerating: {}, soundtrackRow: -1, soundtrackCount: 0, accountRow: -1, accountCount: 0, totalBlocks: -1, prevTitle: -1, scrollStart: 0, iconLoaded: false, dots: 0, dotTime: 0, detachedImage: null });
   natives.$props = {
     curDevUnit: { get: (node) => state(node).curDevUnit, set: (node, v) => { const unit = v | 0; if (state(node).curDevUnit !== unit) { state(node).curDevUnit = unit; enumerate(node, unit); } } },
   };

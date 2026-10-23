@@ -64,3 +64,34 @@ func (d *Disassembly) nameSecurityCheck() {
 		d.nameByUsage(va, "__security_check_cookie")
 	}
 }
+
+// Recognizes the stack probe the compiler calls to reserve a frame larger than a page, its size in eax
+func isStackProbe(fn *Function) bool {
+	if len(fn.Instructions) > 40 || fn.Instructions[0].VA != fn.EntryVA {
+		return false
+	}
+	entry := &fn.Instructions[0]
+	if entry.Inst.Op != x86asm.TEST || entry.Inst.Args[0] != x86asm.Arg(x86asm.EAX) || entry.Inst.Args[1] != x86asm.Arg(x86asm.EAX) {
+		return false
+	}
+	swap, page := false, false
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op == x86asm.XCHG && in.Inst.Args[0] == x86asm.Arg(x86asm.ESP) && in.Inst.Args[1] == x86asm.Arg(x86asm.EAX) {
+			swap = true
+		}
+		if opRegImm(in, x86asm.CMP, x86asm.EAX, 0x1000) {
+			page = true
+		}
+	}
+	return swap && page
+}
+
+// Names the stack probe so the frames it reserves are not read as calls the dashboard makes
+func (d *Disassembly) nameStackProbe() {
+	for _, va := range d.functionVAs() {
+		if fn := d.Functions[va]; fn.Symbol == nil && isStackProbe(fn) {
+			d.nameByUsage(va, "_chkstk")
+		}
+	}
+}

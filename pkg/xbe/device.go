@@ -2,15 +2,18 @@ package xbe
 
 import (
 	"fmt"
+
+	"golang.org/x/arch/x86/x86asm"
 )
 
 // deviceLayout is where the XDK keeps device state the dashboard's optimized code writes directly.
 type deviceLayout struct {
-	device    uint32 // global holding the device pointer
-	transform uint32 // offset of the transform matrix array in the device
-	stride    uint32 // bytes per transform matrix
-	textures  *stateArray
-	renders   *stateArray
+	device     uint32 // global holding the device pointer
+	backBuffer uint32 // offset of the surface the device presents
+	transform  uint32 // offset of the transform matrix array in the device
+	stride     uint32 // bytes per transform matrix
+	textures   *stateArray
+	renders    *stateArray
 }
 
 // stateArray is a global table of device state words, indexed by stage and state or by state alone.
@@ -131,8 +134,47 @@ func (d *Disassembly) deviceState() (*deviceLayout, error) {
 		return nil, err
 	}
 	layout.textures = textures
+	back, err := d.backBufferField(layout.device)
+	if err != nil {
+		d.layoutErr = err
+		return nil, err
+	}
+	layout.backBuffer = back
 	d.layout = layout
 	return layout, nil
+}
+
+// The device keeps the surface it presents where the display mode getter reads it from
+func (d *Disassembly) backBufferField(device uint32) (uint32, error) {
+	var fn *Function
+	for _, f := range d.Functions {
+		if f.Symbol != nil && f.Symbol.Name == "D3DDevice_GetDisplayMode" {
+			fn = f
+		}
+	}
+	if fn == nil {
+		return 0, fmt.Errorf("xbe: the XDK display mode getter is not identified")
+	}
+	held := x86asm.Reg(0)
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op != x86asm.MOV || argCount(in) != 2 {
+			continue
+		}
+		r, isReg := in.Inst.Args[0].(x86asm.Reg)
+		m, isMem := in.Inst.Args[1].(x86asm.Mem)
+		if !isReg || !isMem || m.Index != 0 {
+			continue
+		}
+		if m.Base == 0 && uint32(m.Disp) == device {
+			held = r
+			continue
+		}
+		if held != 0 && m.Base == held && m.Disp > 0 {
+			return uint32(m.Disp), nil
+		}
+	}
+	return 0, fmt.Errorf("xbe: the display mode getter reads no surface out of the device at %08X", device)
 }
 
 // Texture stages the hardware offers

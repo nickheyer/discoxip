@@ -44,10 +44,13 @@ type Disassembly struct {
 	conventions     map[uint32]callConvention
 	probe           *Executor
 	librarySections map[*Section]bool
+	resourceRef     map[uint32]resourceRef
+	resources       *resourceCalls
 	layout          *deviceLayout
 	layoutErr       error
 	layoutBusy      bool
 	biases          map[uint32]int32
+	stackIns        map[uint32]int
 }
 
 // Disassemble performs full recursive disassembly of the XBE image.
@@ -82,8 +85,16 @@ func Disassemble(img *Image) (*Disassembly, error) {
 		return nil, err
 	}
 
-	// Step 5: Name the compiler's own helpers, which carry no signature of their own.
+	// Step 5 names the functions the executable identifies itself and the compiler helpers carrying no signature
+	if err := d.nameXTLID(); err != nil {
+		return nil, err
+	}
 	d.nameSecurityCheck()
+	d.nameStackProbe()
+
+	// Step 6: Read the library bodies the optimizer expanded into the dashboard's code as the calls they replaced.
+	d.scanResourceRefs()
+	d.scanResourceCalls()
 
 	return d, nil
 }

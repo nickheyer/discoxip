@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/font"
@@ -22,7 +25,7 @@ import (
 var staticFiles embed.FS
 
 // Export generates a self-contained web application from extracted XIP data and the disassembled dashboard executable.
-func Export(inputDir, outputDir string, d *xbe.Disassembly) error {
+func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
 	for _, dir := range []string{
 		outputDir,
 		filepath.Join(outputDir, "data", "scenes"),
@@ -52,6 +55,7 @@ func Export(inputDir, outputDir string, d *xbe.Disassembly) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "  %d materials, %d vertex programs, %d procedural textures\n", len(model.Materials), len(model.Programs), len(model.Textures))
+	fmt.Fprintf(os.Stderr, "  %d KB of startup memory in %d sections\n", len(model.MemoryBytes())/1024, len(model.Memory.Sections))
 
 	config := buildConfig(xapFiles)
 	meshManifest := make(map[string]meshEntry)
@@ -109,6 +113,8 @@ func Export(inputDir, outputDir string, d *xbe.Disassembly) error {
 	if err := os.WriteFile(filepath.Join(outputDir, "data", "meshes", "manifest.json"), manifestData, 0o644); err != nil {
 		return err
 	}
+	config.Files = consoleFiles(consoleDir)
+	config.Font = fontVersion(consoleDir)
 	config.Missing = missing
 
 	texCount := copyTextures(inputDir, filepath.Join(outputDir, "data", "textures"))
@@ -156,6 +162,9 @@ func writeRenderModel(model *xbe.RenderModel, dataDir string) error {
 	if err := os.WriteFile(filepath.Join(dataDir, "render.json"), data, 0o644); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(dataDir, model.Memory.File), model.MemoryBytes(), 0o644); err != nil {
+		return err
+	}
 	for _, tex := range model.Textures {
 		img := image.NewNRGBA(image.Rect(0, 0, tex.Width, tex.Height))
 		for i, px := range tex.Pixels {
@@ -184,7 +193,45 @@ type exportConfig struct {
 	Archives map[string]string `json:"archives"`
 	Inlines  map[string]string `json:"inlines"`
 	Scenes   []string          `json:"scenes"`
+	Files    []string          `json:"files"`
+	Font     int               `json:"font_version"`
 	Missing  []string          `json:"missing"`
+}
+
+// The version the dashboard reads out of its font file, which is the fourth byte of the magic as a digit
+func fontVersion(dir string) int {
+	for _, name := range []string{filepath.Join("fonts", "Xbox.xtf"), "Xbox.xtf"} {
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		magic := make([]byte, 4)
+		n, _ := io.ReadFull(f, magic)
+		f.Close()
+		if n == 4 {
+			return int(magic[3]) - '0'
+		}
+	}
+	return 0
+}
+
+// The files the console keeps on the partition the dashboard runs from, named the way its own paths do
+func consoleFiles(dir string) []string {
+	var out []string
+	root := filepath.Clean(dir)
+	filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		out = append(out, strings.ToLower(strings.ReplaceAll(rel, string(filepath.Separator), "\\")))
+		return nil
+	})
+	sort.Strings(out)
+	return out
 }
 
 func buildConfig(xapFiles []string) exportConfig {

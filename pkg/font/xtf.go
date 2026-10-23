@@ -48,12 +48,15 @@ type Font struct {
 	FileSize   int64
 }
 
+// Window bits of the LZX streams the later fonts keep their meshes in, as the dashboard sets its decompressor up
+const xtfWindowBits = 17
+
 // ReadXTF parses an XTF vector font file.
 //
 // XTF layout:
 //
-//	0x00  magic "XTF0"
-//	0x04  uint32 name buffer size (always 32)
+//	0x00  magic "XTF0" or "XTF1"
+//	0x04  uint32 cell height
 //	0x08  char[32] font name (null-terminated)
 //	0x28  GLYPHSET:
 //	  0x28  uint32 cbThis       (size of serialized GLYPHSET)
@@ -61,9 +64,12 @@ type Font struct {
 //	  0x30  uint32 cGlyphsSupported
 //	  0x34  uint32 cRanges
 //	  0x38  WCRANGE[cRanges]    (uint16 wcLow, uint16 cGlyphs each)
-//	After GLYPHSET: per-glyph table (cGlyphsSupported entries)
-//	  each: GLYPHMETRICSFLOAT (6 float32) + uint32 mesh offset
-//	Mesh data at absolute offsets:
+//	XTF1 only, uint16[cGlyphsSupported] with the offset of each glyph's mesh inside its decompressed chunk
+//	Per-glyph table of cGlyphsSupported entries
+//	  each GLYPHMETRICSFLOAT (6 float32) + uint32 mesh location, the file offset of the mesh in XTF0
+//	  and of the chunk holding it in XTF1
+//	XTF1 chunk of uint16 compressed size, uint16 decompressed size and an LZX stream with a 128K window
+//	Mesh data
 //	  uint16 indexCount, uint16 vertexCount
 //	  uint16[indexCount] indices (triangle list)
 //	  float32[vertexCount*2] vertices (x,y pairs)
@@ -77,9 +83,10 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		return nil, fmt.Errorf("font: reading: %w", err)
 	}
 
-	if data[0] != 'X' || data[1] != 'T' || data[2] != 'F' || data[3] != '0' {
+	if data[0] != 'X' || data[1] != 'T' || data[2] != 'F' || (data[3] != '0' && data[3] != '1') {
 		return nil, ErrInvalidMagic
 	}
+	chunked := data[3] == '1'
 
 	height := int(binary.LittleEndian.Uint32(data[0x04:]))
 
@@ -115,6 +122,19 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 		return nil, fmt.Errorf("font: range glyph sum %d != header count %d", totalFromRanges, glyphCount)
 	}
 
+	// The chunked format places each glyph inside its chunk with a word between the ranges and the metrics
+	var chunkOffsets []uint16
+	if chunked {
+		if off+glyphCount*2 > len(data) {
+			return nil, ErrTruncatedFile
+		}
+		chunkOffsets = make([]uint16, glyphCount)
+		for i := range chunkOffsets {
+			chunkOffsets[i] = binary.LittleEndian.Uint16(data[off+2*i:])
+		}
+		off += glyphCount * 2
+	}
+
 	// Per-glyph table starts right after ranges
 	glyphTableOff := off
 	const recordSize = 28 // 6 floats (GLYPHMETRICSFLOAT) + 1 uint32 (mesh offset)
@@ -136,35 +156,48 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 	}
 
 	// Parse mesh data for each glyph
+	chunks := map[uint32][]byte{}
 	for i := range glyphs {
-		moff := int(glyphs[i].meshOff)
-		if moff == 0 || moff+4 > len(data) {
+		mesh, at := data, int(glyphs[i].meshOff)
+		if chunked {
+			chunk, err := xtfChunk(data, glyphs[i].meshOff, chunks)
+			if err != nil {
+				return nil, fmt.Errorf("font: glyph %d: %w", i, err)
+			}
+			mesh, at = chunk, int(chunkOffsets[i])
+		} else if at == 0 {
 			continue
 		}
-		icount := int(binary.LittleEndian.Uint16(data[moff:]))
-		vcount := int(binary.LittleEndian.Uint16(data[moff+2:]))
+		if at+4 > len(mesh) {
+			return nil, fmt.Errorf("font: glyph %d mesh at %#x lies outside its %d bytes", i, at, len(mesh))
+		}
+		icount := int(binary.LittleEndian.Uint16(mesh[at:]))
+		vcount := int(binary.LittleEndian.Uint16(mesh[at+2:]))
 		if icount == 0 || vcount == 0 {
 			continue
 		}
 
-		idxStart := moff + 4
+		idxStart := at + 4
 		idxEnd := idxStart + icount*2
 		vertStart := idxEnd
 		vertEnd := vertStart + vcount*8
-		if vertEnd > len(data) {
-			continue
+		if vertEnd > len(mesh) {
+			return nil, fmt.Errorf("font: glyph %d mesh of %d indices and %d vertices runs past its %d bytes", i, icount, vcount, len(mesh))
 		}
 
 		indices := make([]uint16, icount)
 		for j := range icount {
-			indices[j] = binary.LittleEndian.Uint16(data[idxStart+j*2:])
+			indices[j] = binary.LittleEndian.Uint16(mesh[idxStart+j*2:])
+			if int(indices[j]) >= vcount {
+				return nil, fmt.Errorf("font: glyph %d index %d names vertex %d of %d", i, j, indices[j], vcount)
+			}
 		}
 
 		vertices := make([][2]float32, vcount)
 		for j := range vcount {
 			voff := vertStart + j*8
-			vertices[j][0] = math.Float32frombits(binary.LittleEndian.Uint32(data[voff:]))
-			vertices[j][1] = math.Float32frombits(binary.LittleEndian.Uint32(data[voff+4:]))
+			vertices[j][0] = math.Float32frombits(binary.LittleEndian.Uint32(mesh[voff:]))
+			vertices[j][1] = math.Float32frombits(binary.LittleEndian.Uint32(mesh[voff+4:]))
 		}
 
 		glyphs[i].Mesh.Indices = indices
@@ -270,4 +303,26 @@ func unicodeBlockName(cp uint16) string {
 	default:
 		return ""
 	}
+}
+
+// Decompresses the chunk at a file offset once, a sized header leading its LZX stream
+func xtfChunk(data []byte, off uint32, chunks map[uint32][]byte) ([]byte, error) {
+	if chunk, done := chunks[off]; done {
+		return chunk, nil
+	}
+	if int(off)+4 > len(data) {
+		return nil, fmt.Errorf("chunk at %#x lies outside the file", off)
+	}
+	compressed := int(binary.LittleEndian.Uint16(data[off:]))
+	decompressed := int(binary.LittleEndian.Uint16(data[off+2:]))
+	start := int(off) + 4
+	if start+compressed > len(data) {
+		return nil, fmt.Errorf("chunk at %#x of %d bytes runs past the file", off, compressed)
+	}
+	chunk, err := lzxDecompress(data[start:start+compressed], decompressed, xtfWindowBits)
+	if err != nil {
+		return nil, fmt.Errorf("chunk at %#x: %w", off, err)
+	}
+	chunks[off] = chunk
+	return chunk, nil
 }

@@ -147,7 +147,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "\nStep 4: Building web application...\n")
-	if err := web.Export(extractDir, webDir, d); err != nil {
+	if err := web.Export(extractDir, srcDir, webDir, d); err != nil {
 		return fmt.Errorf("web export: %w", err)
 	}
 

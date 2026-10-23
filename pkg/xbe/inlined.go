@@ -2,6 +2,7 @@ package xbe
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -103,8 +104,30 @@ func allocationBase(base string, seqs map[int]bool) bool {
 
 // Folds inlined vertex shader creations back into the XDK call, the filled allocation standing for the handle
 func (ex *Executor) foldInlinedCreations(paths []Path) ([]Path, error) {
+	// An allocation one path fills with a shader is the same one its sibling paths test for failure
+	created := map[int]bool{}
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "call" || e.Fn != declarationParser {
+				continue
+			}
+			for _, a := range e.Args {
+				if s, ok := allocationOf(a); ok {
+					created[s] = true
+				}
+			}
+		}
+	}
+	isCreated := func(e Expr) bool {
+		s, ok := allocationOf(e)
+		return ok && created[s]
+	}
 	var out []Path
 	for _, p := range paths {
+		// The XDK's own out of memory branch is a path the console never runs
+		if emptyHanded(p, isCreated) {
+			continue
+		}
 		folded, keep, err := ex.foldCreations(p)
 		if err != nil {
 			return nil, err
@@ -114,6 +137,16 @@ func (ex *Executor) foldInlinedCreations(paths []Path) ([]Path, error) {
 		}
 	}
 	return out, nil
+}
+
+// Reports whether a path holds an allocation another path fills to zero
+func emptyHanded(p Path, isCreated func(Expr) bool) bool {
+	for _, g := range p.Guards {
+		if zero, tests := handleTest(g, isCreated); tests && zero {
+			return true
+		}
+	}
+	return false
 }
 
 func (ex *Executor) foldCreations(p Path) (Path, bool, error) {
@@ -368,4 +401,284 @@ func inlinedArrayIndexes(fn *Function) map[uint32]arrayIndex {
 		out[start] = a
 	}
 	return out
+}
+
+// Bits of the XDK resource header the reference count helpers test before following its cached data pointer
+const (
+	resourceRefMask  = 0xffff
+	resourceTypeMask = 0x70000
+	resourceCached   = 0x50000
+	resourceBusyMask = 0x780000
+)
+
+// resourceRef is one reference count helper the optimizer expanded inline, standing for the call it replaced
+type resourceRef struct {
+	fn    string
+	exit  uint32
+	base  x86asm.Reg
+	regs  []x86asm.Reg
+	carry []uint32 // instructions the scheduler placed inside the body, which run ahead of the call
+}
+
+// patternWalk reads a fixed instruction pattern, carrying the unrelated instructions scheduled between its steps
+type patternWalk struct {
+	fn     *Function
+	index  map[uint32]int
+	i      int
+	first  int
+	carry  []int
+	closed bool // a branch of the pattern has been read, after which nothing may be carried past it
+	ok     bool
+}
+
+// Reports whether an instruction may run ahead of the folded call, touching neither the flags nor the pattern
+func (w *patternWalk) carries(in *Instruction, deps []x86asm.Reg) bool {
+	if in.Inst.Op != x86asm.MOV && in.Inst.Op != x86asm.LEA {
+		return false
+	}
+	for _, r := range writtenRegisters(in) {
+		if slices.Contains(deps, wideRegister(r)) || r == x86asm.ESP {
+			return false
+		}
+	}
+	m, isMem := in.Inst.Args[0].(x86asm.Mem)
+	return !isMem || (!slices.Contains(deps, m.Base) && !slices.Contains(deps, m.Index))
+}
+
+// Reads the next instruction of the pattern, carrying anything unrelated the scheduler placed before it
+func (w *patternWalk) expect(deps []x86asm.Reg, match func(*Instruction) bool) *Instruction {
+	for w.ok && w.i < len(w.fn.Instructions) {
+		in := &w.fn.Instructions[w.i]
+		if match(in) {
+			w.i++
+			return in
+		}
+		if w.closed || !w.carries(in, deps) {
+			break
+		}
+		w.carry = append(w.carry, w.i)
+		w.i++
+	}
+	w.ok = false
+	return nil
+}
+
+// Reads a conditional jump of the pattern, after which the scheduler may move nothing across
+func (w *patternWalk) expectJump(deps []x86asm.Reg) int {
+	in := w.expect(deps, func(in *Instruction) bool { return isConditionalJump(in.Inst.Op) })
+	if in == nil {
+		return -1
+	}
+	w.closed = true
+	target, known := w.index[resolveTarget(in)]
+	if !known {
+		w.ok = false
+		return -1
+	}
+	return target
+}
+
+// Reads the instruction at an index of the pattern without consuming it
+func (w *patternWalk) at(i int) *Instruction {
+	if !w.ok || i < 0 || i >= len(w.fn.Instructions) {
+		w.ok = false
+		return nil
+	}
+	return &w.fn.Instructions[i]
+}
+
+// Reports whether an instruction applies an immediate to a register
+func opRegImm(in *Instruction, op x86asm.Op, r x86asm.Reg, imm uint32) bool {
+	if in.Inst.Op != op || argCount(in) != 2 {
+		return false
+	}
+	a, isReg := in.Inst.Args[0].(x86asm.Reg)
+	v, isImm := in.Inst.Args[1].(x86asm.Imm)
+	return isReg && isImm && a == r && uint32(v) == imm
+}
+
+// Reports whether an instruction loads a word of the object a register points at
+func opRegLoad(in *Instruction, dst, base x86asm.Reg) bool {
+	if in.Inst.Op != x86asm.MOV || argCount(in) != 2 || in.Inst.MemBytes != 4 {
+		return false
+	}
+	a, isReg := in.Inst.Args[0].(x86asm.Reg)
+	m, isMem := in.Inst.Args[1].(x86asm.Mem)
+	return isReg && isMem && a == dst && m.Base == base && m.Index == 0 && m.Segment == 0
+}
+
+// Reports whether an instruction compares a register with a value, as an immediate or through another register
+func opCompare(in *Instruction, op x86asm.Op, r x86asm.Reg, imm uint32) bool {
+	if opRegImm(in, op, r, imm) {
+		return true
+	}
+	a, isReg := in.Inst.Args[0].(x86asm.Reg)
+	_, other := in.Inst.Args[1].(x86asm.Reg)
+	return in.Inst.Op == op && argCount(in) == 2 && isReg && other && a == r
+}
+
+// Reads the guarded recursion both helpers share, where a cached resource hands its data pointer to the helper,
+// the join being the step past it or negative for the first branch of the body to name it
+func (w *patternWalk) cachedDataCall(v, base x86asm.Reg, join int) (uint32, int) {
+	deps := []x86asm.Reg{v, base}
+	w.expect(deps, func(in *Instruction) bool { return opRegImm(in, x86asm.AND, v, resourceTypeMask) })
+	w.expect(deps, func(in *Instruction) bool { return opRegImm(in, x86asm.CMP, v, resourceCached) })
+	to := w.expectJump(deps)
+	if join < 0 {
+		join = to
+	}
+	if to != join {
+		w.ok = false
+	}
+	w.expect(deps, func(in *Instruction) bool { return opRegLoad(in, v, base) })
+	w.expect(deps, func(in *Instruction) bool {
+		return opCompare(in, x86asm.CMP, v, 0) || (in.Inst.Op == x86asm.TEST && in.Inst.Args[0] == x86asm.Arg(v) && in.Inst.Args[1] == x86asm.Arg(v))
+	})
+	if to := w.expectJump(deps); to != join {
+		w.ok = false
+	}
+	w.expect(deps, func(in *Instruction) bool { return in.Inst.Op == x86asm.PUSH && in.Inst.Args[0] == x86asm.Arg(v) })
+	call := w.expect(deps, func(in *Instruction) bool { return in.Inst.Op == x86asm.CALL && resolveTarget(in) != 0 })
+	if !w.ok || w.i != join {
+		w.ok = false
+		return 0, join
+	}
+	return resolveTarget(call), join
+}
+
+// Reads the reference taking helper: the cached recursion, then the count raised in place
+func matchResourceAddRef(fn *Function, index map[uint32]int, i int) (resourceRef, int, uint32, bool) {
+	w := &patternWalk{fn: fn, index: index, i: i, first: i, ok: true}
+	in := w.at(i)
+	v, isReg := in.Inst.Args[0].(x86asm.Reg)
+	m, isMem := in.Inst.Args[1].(x86asm.Mem)
+	if !w.ok || in.Inst.Op != x86asm.MOV || !isReg || !isMem || m.Base == 0 || m.Index != 0 || m.Disp != 0 || in.Inst.MemBytes != 4 {
+		return resourceRef{}, 0, 0, false
+	}
+	base, deps := m.Base, []x86asm.Reg{v, m.Base}
+	w.i++
+	w.expect(deps, func(in *Instruction) bool { return opRegImm(in, x86asm.TEST, v, resourceRefMask) })
+	join := w.expectJump(deps)
+	target, _ := w.cachedDataCall(v, base, join)
+	bump := w.at(join)
+	if !w.ok {
+		return resourceRef{}, 0, 0, false
+	}
+	bm, isMem := bump.Inst.Args[0].(x86asm.Mem)
+	if bump.Inst.Op != x86asm.INC || !isMem || bm.Base != base || bm.Index != 0 || bm.Disp != 0 {
+		return resourceRef{}, 0, 0, false
+	}
+	return resourceRef{exit: bump.VA + uint32(bump.Inst.Len), base: base, carry: w.carried()}, join, target, true
+}
+
+// Reads the reference dropping helper: the last reference frees the cached data and destroys the resource
+func matchResourceRelease(fn *Function, index map[uint32]int, i int) (resourceRef, int, uint32, bool) {
+	w := &patternWalk{fn: fn, index: index, i: i, first: i, ok: true}
+	in := w.at(i)
+	v, isReg := in.Inst.Args[0].(x86asm.Reg)
+	m, isMem := in.Inst.Args[1].(x86asm.Mem)
+	if !w.ok || in.Inst.Op != x86asm.MOV || !isReg || !isMem || m.Base == 0 || m.Index != 0 || m.Disp != 0 || in.Inst.MemBytes != 4 {
+		return resourceRef{}, 0, 0, false
+	}
+	base := m.Base
+	w.i++
+	count := x86asm.Reg(0)
+	w.expect([]x86asm.Reg{v, base}, func(in *Instruction) bool {
+		r, isReg := in.Inst.Args[0].(x86asm.Reg)
+		if in.Inst.Op != x86asm.MOV || !isReg || in.Inst.Args[1] != x86asm.Arg(v) {
+			return false
+		}
+		count = r
+		return true
+	})
+	deps := []x86asm.Reg{v, base, count}
+	w.expect(deps, func(in *Instruction) bool { return opRegImm(in, x86asm.AND, count, resourceRefMask) })
+	w.expect(deps, func(in *Instruction) bool { return opCompare(in, x86asm.CMP, count, 1) })
+	last := w.expectJump(deps)
+	target, join := w.cachedDataCall(v, base, -1)
+	w.expect(deps, func(in *Instruction) bool { return opRegLoad(in, v, base) })
+	w.expect(deps, func(in *Instruction) bool { return opRegImm(in, x86asm.TEST, v, resourceBusyMask) })
+	if to := w.expectJump(deps); to != last {
+		w.ok = false
+	}
+	w.expect(deps, func(in *Instruction) bool { return in.Inst.Op == x86asm.CALL && resolveTarget(in) != 0 })
+	done := -1
+	if leave := w.expect(deps, func(in *Instruction) bool { return in.Inst.Op == x86asm.JMP }); leave != nil {
+		done = index[resolveTarget(leave)]
+	}
+	drop, store := w.at(last), w.at(last+1)
+	if !w.ok || join < 0 || w.i != last || done != last+2 {
+		return resourceRef{}, 0, 0, false
+	}
+	sm, isMem := store.Inst.Args[0].(x86asm.Mem)
+	if drop.Inst.Op != x86asm.DEC || drop.Inst.Args[0] != x86asm.Arg(v) || !isMem {
+		return resourceRef{}, 0, 0, false
+	}
+	if store.Inst.Op != x86asm.MOV || sm.Base != base || sm.Index != 0 || sm.Disp != 0 {
+		return resourceRef{}, 0, 0, false
+	}
+	return resourceRef{exit: fn.Instructions[done].VA, base: base, carry: w.carried()}, done - 1, target, true
+}
+
+// The addresses of the instructions the scheduler placed inside the body, in the order they run
+func (w *patternWalk) carried() []uint32 {
+	var out []uint32
+	for _, i := range w.carry {
+		out = append(out, w.fn.Instructions[i].VA)
+	}
+	return out
+}
+
+// Reports whether a named helper hands a cached resource's data pointer back to itself, as both count helpers do
+func (d *Disassembly) selfCachedRecursion(target uint32) bool {
+	fn := d.Functions[target]
+	if fn == nil || fn.Symbol == nil {
+		return false
+	}
+	index := fn.instructionIndex()
+	for i := range fn.Instructions {
+		v, isReg := fn.Instructions[i].Inst.Args[0].(x86asm.Reg)
+		if !isReg || !opRegImm(&fn.Instructions[i], x86asm.AND, v, resourceTypeMask) || i+3 >= len(fn.Instructions) {
+			continue
+		}
+		m, isMem := fn.Instructions[i+3].Inst.Args[1].(x86asm.Mem)
+		if !isMem || m.Base == 0 {
+			continue
+		}
+		w := &patternWalk{fn: fn, index: index, i: i, first: i, ok: true}
+		if callee, _ := w.cachedDataCall(v, m.Base, -1); w.ok && callee == target {
+			return true
+		}
+	}
+	return false
+}
+
+// Records every reference count helper the optimizer expanded into the dashboard's own code
+func (d *Disassembly) scanResourceRefs() {
+	d.resourceRef = map[uint32]resourceRef{}
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil || d.inLibrary(va) {
+			continue
+		}
+		index := fn.instructionIndex()
+		for i := range fn.Instructions {
+			r, last, target, ok := matchResourceAddRef(fn, index, i)
+			if !ok {
+				r, last, target, ok = matchResourceRelease(fn, index, i)
+			}
+			if !ok || !d.selfCachedRecursion(target) {
+				continue
+			}
+			r.fn = d.Functions[target].Symbol.Name
+			for j := i; j <= last; j++ {
+				for _, w := range d.writtenBy(&fn.Instructions[j]) {
+					if w != x86asm.ESP && !slices.Contains(r.regs, w) {
+						r.regs = append(r.regs, w)
+					}
+				}
+			}
+			d.resourceRef[fn.Instructions[i].VA] = r
+		}
+	}
 }
