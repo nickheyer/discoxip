@@ -990,51 +990,28 @@ func takesDescriptor(d *Disassembly, caller, callee uint32, descs map[uint32]boo
 
 // Records every immediate argument of a path that addresses a wide string in the image, empty ones included
 func (rm *RenderModel) collectStrings(d *Disassembly, p Path, out map[uint32]string) {
-	var walk func(e Expr)
-	walk = func(e Expr) {
-		switch v := e.(type) {
-		case CallResult:
-			for _, a := range v.Args {
+	seen := map[exprKey]bool{}
+	calls := func(e Expr) {
+		if c, ok := e.(CallResult); ok {
+			for _, a := range c.Args {
 				rm.collectString(d, a, out)
-				walk(a)
-			}
-		case Bin:
-			walk(v.A)
-			walk(v.B)
-		case Un:
-			walk(v.A)
-		case Cond:
-			walk(v.A)
-			walk(v.B)
-		case FCmpSet:
-			walk(v.A)
-			walk(v.B)
-		case Not:
-			walk(v.A)
-		case Sel:
-			walk(v.C)
-			walk(v.A)
-			walk(v.B)
-		case Load:
-			if v.Addr != nil {
-				walk(v.Addr)
 			}
 		}
 	}
 	for _, g := range p.Guards {
-		walk(g)
+		walkExpr(g, seen, calls)
 	}
 	for _, e := range p.Effects {
 		if e.Value != nil {
 			rm.collectString(d, e.Value, out)
-			walk(e.Value)
+			walkExpr(e.Value, seen, calls)
 		}
 		for _, a := range e.Args {
 			rm.collectString(d, a, out)
-			walk(a)
+			walkExpr(a, seen, calls)
 		}
 	}
-	walk(p.Return)
+	walkExpr(p.Return, seen, calls)
 }
 
 // Records a constant that addresses a wide string in the image, an empty one included

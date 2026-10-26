@@ -158,7 +158,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 			s.xmm[dx] = [4]Expr{ex.floatLane(s, in, args[1], 0), FConst{0}, FConst{0}, FConst{0}}
 		}
 		return true, nil
-	case x86asm.MOVSD_XMM, x86asm.MOVQ, x86asm.MOVLPS:
+	case x86asm.MOVSD_XMM, x86asm.MOVQ, x86asm.MOVLPS, x86asm.MOVNTQ:
 		switch {
 		case dstIsMem && srcXMM >= 0:
 			ex.storeLane(s, in, dstMem, 0, s.xmmLane(srcXMM, 0))
@@ -317,9 +317,14 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		default:
 			return false, nil
 		}
-	case x86asm.PUNPCKLWD:
-		d0 := s.mmLane(dm, 0)
-		s0 := ex.bitsLane(s, in, args[1], 0)
+	case x86asm.PUNPCKLWD, x86asm.PUNPCKHWD:
+		// The low or high words of the two operands interleave
+		half := 0
+		if op == x86asm.PUNPCKHWD {
+			half = 1
+		}
+		d0 := s.mmLane(dm, half)
+		s0 := ex.bitsLane(s, in, args[1], half)
 		lo := mkBin("or", mkUn("zx16", d0), mkBin("shl", mkUn("zx16", s0), IConst{16}))
 		hi := mkBin("or", mkBin("shr", d0, IConst{16}), mkBin("and", s0, IConst{0xFFFF0000}))
 		s.mm[dm] = [2]Expr{lo, hi}

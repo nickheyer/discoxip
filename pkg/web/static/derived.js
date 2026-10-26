@@ -2,8 +2,11 @@
 import { ShaContext, hmacSha1 } from './system.js';
 import { ConsoleApi } from './console.js';
 import { GpuRegisters } from './gpu.js';
+import { udiv64, urem64, idiv64, irem64 } from './machine.js';
 
 const FLOAT_BIN_OPS = new Set(['fadd', 'fsub', 'fmul', 'fdiv', 'fmin', 'fmax', 'fmod', 'fpow', 'fatan2', 'frem']);
+// The 64 by 32 bit divisions, each taking the big integer a hilo pair makes of the high and low words
+const WIDE_DIV_OPS = { udiv64: udiv64, udiv64_rem: urem64, idiv64: idiv64, idiv64_rem: irem64 };
 const FLOAT_UN_OPS = new Set(['f32', 'f64', 'bits2f', 'bits2d', 'i2f', 'fneg', 'fabs', 'fsin', 'fcos', 'fsqrt', 'ftan', 'ffloor', 'fceil', 'fexp', 'flog', 'flog10', 'flog2', 'ftrunc', 'fround', 'fatan', 'fasin', 'facos', 'fsinh', 'fcosh', 'ftanh']);
 
 // Interpreter for the execution paths derived from the dashboard executable
@@ -27,7 +30,7 @@ function roundEven(v) {
 
 // Functions the compiled expressions call by name
 const EXPR_HELPERS = {
-  f32, roundEven, bitsFromFloat, floatFromBits, rawLoad, rawStore,
+  f32, roundEven, bitsFromFloat, floatFromBits, rawLoad, rawStore, udiv64, urem64, idiv64, irem64,
   rethrow: (err) => { throw err; },
   bsf: (b) => (b === 0 ? 0 : 31 - Math.clz32(b & -b)),
   bsr: (b) => (b === 0 ? 0 : 31 - Math.clz32(b)),
@@ -535,19 +538,21 @@ const LIFTED_ENTRY_SP = 0x10000;
 const LIFTED_BLOCK_LIMIT = 1 << 24;
 // Effects and blocks a frame may run before it is given up as stuck
 const FRAME_WORK_BUDGET = 8000000;
-// Characters of code one compiled routine may take, past which the routine is interpreted instead
+// Characters of code one compiled lifted routine may take, past which the routine is interpreted instead
 const CODE_BUDGET = 4000000;
 // Marks a routine whose compiled form outgrew the budget, which runs by interpretation
 const INTERPRETED = Symbol('interpreted');
-
-// Raised while compiling a routine whose code outgrows the budget
-class CodeBudgetError extends Error {}
 
 // Xbox D3D primitive type of the triangle lists the mesh exporter writes
 const PT_TRIANGLELIST = 5;
 
 // Where the kernel's processor control region keeps its own address, its processor block's and that block itself
 const KPCR_SELF = 0x1C, KPCR_PRCB = 0x20, KPCR_PRCB_DATA = 0x28;
+// Where the thread information block keeps the stack base, which the XAPI keeps its thread local storage pointer
+// array at, and where the kernel's thread block keeps its thread local storage and the handle naming the thread
+const TIB_STACK_BASE = 0x4, KTHREAD_TLS_DATA = 0x28, ETHREAD_UNIQUE_THREAD = 0x12C;
+// The handle the runtime names the thread the dashboard runs on by
+const MAIN_THREAD_ID = 1;
 
 // D3DXCreateMeshFVF option asking for 32 bit indices
 const D3DXMESH_32BIT = 1;
@@ -766,10 +771,8 @@ class GlobalMemory {
     this.words = new Map();
     // Words wider than a double are few and listed apart, so a lookup scans the starts of narrow words only
     this.wide = new Map();
-    // The loader zero fills the pages it lays the sections in, so the gaps between them and the tail of the last
-    // page are memory too
-    this.lo = this.sections[0].va;
-    this.hi = Math.ceil(last.end / PAGE_BYTES) * PAGE_BYTES;
+    // The loader zero fills the pages it lays each section in, so the tail of a section's last page is memory too
+    for (const s of this.sections) s.pageEnd = Math.ceil(s.end / PAGE_BYTES) * PAGE_BYTES;
     // The physical memory the kernel hands out and the GPU's registers, which the derived model attaches
     this.physical = null;
     this.gpu = null;
@@ -790,7 +793,19 @@ class GlobalMemory {
   // Reports whether the image, physical memory or the GPU's registers map the address
   mapped(addr) {
     addr >>>= 0;
-    return (addr >= this.lo && addr < this.hi) || this.physical.window(addr) || this.gpu.claims(addr);
+    return this.pageOf(addr) !== null || this.physical.window(addr) || this.gpu.claims(addr);
+  }
+
+  // The section whose pages hold an address, the zero filled tail of its last page included
+  pageOf(addr) {
+    let lo = 0, hi = this.sections.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1, s = this.sections[mid];
+      if (addr < s.va) hi = mid - 1;
+      else if (addr >= s.pageEnd) lo = mid + 1;
+      else return s;
+    }
+    return null;
   }
 
   // The section a name the executable loads by names, or null where the image has none
@@ -809,7 +824,7 @@ class GlobalMemory {
   wideString(addr) {
     if (!this.mapped(addr + 1)) return null;
     let out = '';
-    for (let a = addr; a + 2 <= this.hi && out.length <= WIDE_STRING_LIMIT; a += 2) {
+    for (let a = addr; this.mapped(a + 1) && out.length <= WIDE_STRING_LIMIT; a += 2) {
       const unit = this.load(a, 2);
       if (unit === 0) return out;
       if (unit < 0x20 && unit !== 9 && unit !== 10 && unit !== 13) return null;
@@ -998,6 +1013,20 @@ export class DerivedModel {
     this.fs.store(0, 4, 0xFFFFFFFF);
     this.fs.store(KPCR_SELF, 4, { obj: pcr, off: 0 });
     this.fs.store(KPCR_PRCB, 4, { obj: pcr, off: KPCR_PRCB_DATA });
+    // The thread the dashboard runs on, which the processor block names, its thread local storage the block the
+    // image's TLS directory describes, copied from the template and zero filled after it, and the pointer array the
+    // XAPI keeps at the stack base naming that block in the module's slot
+    const thread = new SceneObject(HEAP_TYPE, null);
+    thread.mem.store(ETHREAD_UNIQUE_THREAD, 4, MAIN_THREAD_ID);
+    this.fs.store(KPCR_PRCB_DATA, 4, { obj: thread, off: 0 });
+    if (model.tls) {
+      const tls = new SceneObject(HEAP_TYPE, null);
+      for (let i = 0; i < model.tls.end - model.tls.start; i++) tls.mem.store(i, 1, this.memory.load(model.tls.start + i, 1));
+      thread.mem.store(KTHREAD_TLS_DATA, 4, { obj: tls, off: 0 });
+      const slots = new SceneObject(HEAP_TYPE, null);
+      slots.mem.store(this.memory.load(model.tls.index, 4) * 4, 4, { obj: tls, off: 0 });
+      this.fs.store(TIB_STACK_BASE, 4, { obj: slots, off: 0 });
+    }
     this.hierarchyAlpha = 1;
     this.stateNames = model.render_state_names;
     this.stageNames = model.texture_stage_names;
@@ -1398,7 +1427,7 @@ export class DerivedModel {
       if (found !== undefined) return found;
       const n = nodes[idx];
       let expr;
-      const temp = (code) => { const t = 't' + temps++; out.push(`const ${t} = ${code};`); return t; };
+      const temp = (code) => { const t = 't' + temps++; out.push(`var ${t} = ${code};`); return t; };
       // A literal operand is held in a temp where the code reads a property off it
       const ref = (x) => (/^[-0-9]|^NaN$|^Infinity$/.test(x) ? temp(x) : x);
       const intOf = (t) => `(typeof ${t} === 'number' ? ${t} >>> 0 : d.intOf(${t}, env))`;
@@ -1415,6 +1444,7 @@ export class DerivedModel {
           else if (n.base.startsWith('new')) expr = temp(`{ obj: d.allocatedObject(env, ${JSON.stringify(n.base)}), off: ${off} }`);
           else if (n.base.startsWith('res')) expr = temp(`d.resultPointer(${Number(n.base.slice(3))}, ${off}, env)`);
           else if (n.base.startsWith('g')) expr = temp(`d.globalPointer(env, ${JSON.stringify(n.base)}, ${off})`);
+          else if (n.base.startsWith('import:')) expr = String(u32(this.exportAddress(n.base.slice(7)) + off));
           else expr = temp(`{ ptr: ${JSON.stringify(n.base)}, off: ${off} }`);
           break;
         }
@@ -1442,8 +1472,8 @@ export class DerivedModel {
           if (n.addr === undefined && n.size <= 4 && (n.base === 'stack' || n.base === 'this')) {
             // A stack slot or a field of this reads straight from the frame or the object
             const live = n.base === 'stack' ? `env.stack.load(${n.off || 0}, ${n.size}, 'stack')` : `d.loadThis(env, ${n.off || 0}, ${n.size})`;
-            if (useEnvLoads) out.push(`let ${t} = env.loads.get(${idx});`, `if (${t} === undefined) { const l = ${live}; ${t} = ${narrow('l')}; } else if (${t} instanceof F.EarlyError) throw ${t}.err;`);
-            else out.push(`const l${t} = ${live};`, `const ${t} = ${narrow('l' + t)};`);
+            if (useEnvLoads) out.push(`var ${t} = env.loads.get(${idx});`, `if (${t} === undefined) { const l = ${live}; ${t} = ${narrow('l')}; } else if (${t} instanceof F.EarlyError) throw ${t}.err;`);
+            else out.push(`var l${t} = ${live};`, `var ${t} = ${narrow('l' + t)};`);
             expr = t;
             break;
           }
@@ -1456,11 +1486,11 @@ export class DerivedModel {
           const inner = [];
           scopes.push(new Map());
           let a = emitNode(n.addr, inner);
-          if (/^[-0-9]|^NaN$|^Infinity$/.test(a)) { const t2 = 't' + temps++; inner.push(`const ${t2} = ${a};`); a = t2; }
+          if (/^[-0-9]|^NaN$|^Infinity$/.test(a)) { const t2 = 't' + temps++; inner.push(`var ${t2} = ${a};`); a = t2; }
           scopes.pop();
           const live = `(${a} !== null && typeof ${a} === 'object' && ${a}.raw !== undefined) ? F.rawLoad(${a}.raw, ${a}.off || 0, ${n.size}) : ((${a} !== null && typeof ${a} === 'object' && ${a}.obj !== undefined && ${a}.obj.mem.flat === true ? ${a}.obj.mem.loadWritten(${a}.off || 0, ${n.size}) : undefined) ?? d.loadAddress(${a}, N[${idx}], env))`;
-          if (useEnvLoads) out.push(`let ${t} = env.loads.get(${idx});`, `if (${t} === undefined) { ${inner.join(' ')} ${t} = ${live}; } else if (${t} instanceof F.EarlyError) throw ${t}.err;`);
-          else out.push(`let ${t};`, `{ ${inner.join(' ')} ${t} = ${live}; }`);
+          if (useEnvLoads) out.push(`var ${t} = env.loads.get(${idx});`, `if (${t} === undefined) { ${inner.join(' ')} ${t} = ${live}; } else if (${t} instanceof F.EarlyError) throw ${t}.err;`);
+          else out.push(`var ${t};`, `{ ${inner.join(' ')} ${t} = ${live}; }`);
           expr = t;
           break;
         }
@@ -1490,6 +1520,8 @@ export class DerivedModel {
             expr = temp(`(typeof ${a} === 'number' && typeof ${b} === 'number') ? (${a} ${sign} ${b}) >>> 0 : ((typeof ${b} === 'number' && ${a} !== null && typeof ${a} === 'object' && ${a}.raw !== undefined) ? { raw: ${a}.raw, off: ((${a}.off || 0) ${sign} ${b}) | 0 } : ((typeof ${b} === 'number' && ${a} !== null && typeof ${a} === 'object' && ${a}.obj !== undefined) ? { obj: ${a}.obj, off: ((${a}.off || 0) ${sign} ${b}) | 0 } : d.pointerArith(${JSON.stringify(op)}, ${a}, ${b}, env)))`);
             break;
           }
+          if (op === 'hilo') { const x = temp(intOf(a)), y = temp(intOf(b)); expr = temp(`(BigInt(${x}) << 32n) | BigInt(${y})`); break; }
+          if (op in WIDE_DIV_OPS) { const y = temp(intOf(b)); expr = temp(`F.${WIDE_DIV_OPS[op].name}(${a}, ${y})`); break; }
           const x = temp(intOf(a)), y = temp(intOf(b));
           switch (op) {
             case 'mul': expr = temp(`Math.imul(${x}, ${y}) >>> 0`); break;
@@ -1596,7 +1628,7 @@ export class DerivedModel {
         case 'sel': {
           const c = emitNode(n.c, out);
           const t = 't' + temps++;
-          out.push(`let ${t};`);
+          out.push(`var ${t};`);
           const taken = [], other = [];
           scopes.push(new Map());
           const va = emitNode(n.a, taken);
@@ -1621,9 +1653,16 @@ export class DerivedModel {
       scopes = [new Map()];
       return emitNode(root, out);
     };
+    // Emits a root sharing the subexpressions every root emitted since the scope began, which run in one function
+    const emitShared = (root, out) => {
+      share = true;
+      return emitNode(root, out);
+    };
+    // Begins the scope of one function, past which nothing emitted before is shared
+    const newScope = () => { scopes = [new Map()]; };
     // Sets the loads a block has read early, by pool index, to the locals holding them
     const setPreread = (map) => { preread = map; };
-    return { emit, hasCall, setPreread, nextTemp: () => 't' + temps++ };
+    return { emit, emitShared, newScope, hasCall, setPreread, nextTemp: () => 't' + temps++ };
   }
 
   // Compiles a lifted routine into one function running its blocks, each block's effects, register results and
@@ -1648,6 +1687,7 @@ export class DerivedModel {
       const exprs = [];
       for (const e of b.effects) { for (const x of effectExprs(e)) exprs.push(x); }
       for (const idx of Object.values(b.regs)) exprs.push(idx);
+      if (b.esp !== undefined) exprs.push(b.esp);
       for (const idx of b.fpu) exprs.push(idx);
       for (const idx of Object.values(b.xmm || {})) exprs.push(idx);
       for (const idx of Object.values(b.mm || {})) exprs.push(idx);
@@ -1717,7 +1757,7 @@ export class DerivedModel {
       let mi = 0;
       for (const [name, idx] of Object.entries(b.mm || {})) { const body = []; const v = emitter.emit(idx, body); lines.push(...body); lines.push(`const nm${mi} = ${v};`); after.push(`env.mm[${JSON.stringify(name)}] = nm${mi};`); mi++; }
       const flagParts = [];
-      for (const [name, idx] of Object.entries(b.flags || {})) { if (idx < 0) continue; const body = []; const v = emitter.emit(idx, body); lines.push(...body); lines.push(`const nfl_${name} = ${v};`); flagParts.push(`${name}: nfl_${name}`); }
+      for (const [name, idx] of Object.entries(b.flags || {})) { if (typeof idx !== 'number') { flagParts.push(`${name}: ${JSON.stringify(idx)}`); continue; } if (idx < 0) continue; const body = []; const v = emitter.emit(idx, body); lines.push(...body); lines.push(`const nfl_${name} = ${v};`); flagParts.push(`${name}: nfl_${name}`); }
       after.push(`env.flags = { ${flagParts.join(', ')} };`);
       if (b.fcmp) {
         const ba = [], bb = [];
@@ -1730,6 +1770,7 @@ export class DerivedModel {
       switch (t.kind) {
         case 'return': { const body = []; const v = emitter.emit(t.value, body); lines.push(...body, `state.returned = ${v}; return;`); break; }
         case 'trap': lines.push(`throw new Error('the executable traps here');`); break;
+        case 'noreturn': lines.push(`throw new Error('the routine called last in this block never returns');`); break;
         case 'halt': lines.push(`state.returned = 0; return;`); break;
         case 'jump': to = JSON.stringify(t.target); break;
         case 'branch': { const body = []; const v = emitter.emit(t.cond, body); lines.push(...body, `const cond = ${v};`); to = `((typeof cond === 'number' ? cond !== 0 : !!cond) ? ${JSON.stringify(t.taken)} : ${JSON.stringify(t.fall)})`; break; }
@@ -1738,7 +1779,11 @@ export class DerivedModel {
       }
       if (to !== undefined) {
         lines.push(`const to = ${to};`);
-        lines.push(...assigns, `regs.ESP = { stack: ${b.sp}, frame: env };`, ...after);
+        if (b.esp !== undefined) {
+          const body = [];
+          const v = emitter.emit(b.esp, body);
+          lines.push(...body, `const nESP = ${v};`, ...assigns, `regs.ESP = nESP;`, ...after);
+        } else lines.push(...assigns, `regs.ESP = { stack: ${b.sp}, frame: env };`, ...after);
         lines.push(`if (trace) d.traceBlock(${va}, key, to, env);`);
         lines.push(`key = to; break;`);
       }
@@ -1770,7 +1815,7 @@ export class DerivedModel {
   loadAddress(addr, n, env) {
     let v;
     if (addr && (addr.matrixStack !== undefined || addr.vb !== undefined || addr.ib !== undefined || addr.d3dxMesh !== undefined)) v = addr;
-    else if (addr && typeof addr.ptr === 'string' && addr.ptr.startsWith('import:')) v = u32(this.host.console.kernelVariable(addr.ptr.slice(7), addr.off || 0, n.size));
+    else if (addr && typeof addr.ptr === 'string' && addr.ptr.startsWith('import:')) v = this.memory.load(u32(this.exportAddress(addr.ptr.slice(7)) + (addr.off || 0)), n.size);
     else if (typeof addr === 'number' || (addr && (addr.obj !== undefined || addr.raw !== undefined || addr.stack !== undefined || addr.res !== undefined || addr.str !== undefined))) v = this.loadLive(env, addr, n.size);
     else throw new Error(`load through ${describe(addr)} from ${this.show(n.addr)}`);
     if (typeof v === 'number' && n.size < 4) return v & (n.size === 1 ? 0xFF : 0xFFFF);
@@ -1849,6 +1894,7 @@ export class DerivedModel {
           return { res: Number(n.base.slice(3)), off: n.off };
         }
         if (n.base.startsWith('g')) return this.globalPointer(env, n.base, n.off);
+        if (n.base.startsWith('import:')) return u32(this.exportAddress(n.base.slice(7)) + n.off);
         return { ptr: n.base, off: n.off };
       case 'sym':
         if (n.name.startsWith('texture:')) return { texture: n.name };
@@ -1944,7 +1990,7 @@ export class DerivedModel {
     if (n.addr !== undefined) {
       const addr = this.eval(n.addr, env);
       if (addr && (addr.matrixStack !== undefined || addr.vb !== undefined || addr.ib !== undefined || addr.d3dxMesh !== undefined)) return addr;
-      if (addr && typeof addr.ptr === 'string' && addr.ptr.startsWith('import:')) return u32(this.host.console.kernelVariable(addr.ptr.slice(7), addr.off || 0, n.size));
+      if (addr && typeof addr.ptr === 'string' && addr.ptr.startsWith('import:')) return this.memory.load(u32(this.exportAddress(addr.ptr.slice(7)) + (addr.off || 0)), n.size);
       if (typeof addr === 'number' || (addr && (addr.obj !== undefined || addr.raw !== undefined || addr.stack !== undefined || addr.res !== undefined || addr.str !== undefined))) return this.loadLive(env, addr, n.size);
       throw new Error(`load through ${describe(addr)} from ${this.show(n.addr)}`);
     }
@@ -1959,7 +2005,7 @@ export class DerivedModel {
     if (n.base === 'fs') return this.fs.load(off, n.size, 'fs');
     if (n.base.startsWith('new')) return this.readField(this.allocatedObject(env, n.base), off, n.size);
     if (n.base.startsWith('res')) return this.bufferLoad(env, Number(n.base.slice(3)), off, n.size);
-    if (n.base.startsWith('import:')) return u32(this.host.console.kernelVariable(n.base.slice(7), off, n.size));
+    if (n.base.startsWith('import:')) return this.memory.load(u32(this.exportAddress(n.base.slice(7)) + off), n.size);
     if (n.base.startsWith('g')) {
       const p = this.globalPointer(env, n.base, off);
       if (p && (p.matrixStack !== undefined || p.vb !== undefined || p.ib !== undefined || p.d3dxMesh !== undefined)) return p;
@@ -2061,7 +2107,12 @@ export class DerivedModel {
       }
       if (this.pointerTerms(av, env) || this.pointerTerms(bv, env)) return this.pointerSum(op, av, bv, env);
     }
+    if (op in WIDE_DIV_OPS) {
+      if (typeof av !== 'bigint') throw new Error(`${op} of a dividend that is no hilo pair`);
+      return WIDE_DIV_OPS[op](av, this.int(this.resultNumber(bv, env)));
+    }
     const a = this.int(this.resultNumber(av, env)), b = this.int(this.resultNumber(bv, env));
+    if (op === 'hilo') return (BigInt(a) << 32n) | BigInt(b);
     switch (op) {
       case 'add': return u32(a + b);
       case 'sub': return u32(a - b);
@@ -2258,8 +2309,6 @@ export class DerivedModel {
     if (fn === 'fptr') {
       // A call through a function pointer the executable keeps in memory runs the routine it points at
       const args = argIdx.map((a) => this.eval(a, env));
-      // A pointer loaded from the kernel thunk names an export, which runs as the call it is
-      if (args[0] && typeof args[0].ptr === 'string' && args[0].ptr.startsWith('import:')) return this.performCall(args[0].ptr.slice(7), argIdx.slice(1), thisIdx, env, seq);
       const va = this.int(args[0]);
       // A pointer to a routine the image names runs as the named call it is, through the runtime's stand-in for it
       const name = this.libraryNames.get(va);
@@ -2626,15 +2675,23 @@ export class DerivedModel {
     }
     const served = this.consoleApi.call(fn, args, argIdx, env);
     if (served !== undefined) return served;
-    // A library routine the runtime stands in for nothing runs out of the image
-    if (this.imageRoutine(fn, target) !== undefined) return this.runImageRoutine(fn, args, argIdx, thisIdx === undefined ? undefined : this.eval(thisIdx, env), env, target);
+    // A library routine the runtime stands in for nothing runs out of the image, unless the runtime hooked it by address
+    const bodyVA = this.imageRoutine(fn, target);
+    if (bodyVA !== undefined && !this.hooks.has(bodyVA)) return this.runImageRoutine(fn, args, argIdx, thisIdx === undefined ? undefined : this.eval(thisIdx, env), env, bodyVA);
     if (fn.startsWith('D3DDevice_') || fn.startsWith('D3D::')) return { call: fn };
     throw new Error(`call to ${fn} has no runtime meaning${this.scene.errors[fn] ? ': ' + this.scene.errors[fn] : ''}`);
   }
 
+  // The address a kernel export lives at in the kernel image, the thunk naming it by that name
+  exportAddress(name) {
+    const va = this.model.kernel.exports[name];
+    if (va === undefined) throw new Error(`the kernel exports no ${name}`);
+    return va >>> 0;
+  }
+
   // The address of the library routine a call reaches whose body the model carries, or undefined where it carries none
   imageRoutine(fn, target) {
-    const va = target ?? this.libraryAddresses.get(fn);
+    const va = target ?? this.libraryAddresses.get(fn) ?? this.model.kernel.exports[fn];
     return va !== undefined && this.summarized(va) ? va : undefined;
   }
 
@@ -3132,13 +3189,14 @@ export class DerivedModel {
         const mm = {};
         for (const [name, idx] of Object.entries(b.mm || {})) mm[name] = this.eval(idx, env);
         const flags = {};
-        for (const [name, idx] of Object.entries(b.flags || {})) if (idx >= 0) flags[name] = this.eval(idx, env);
+        for (const [name, idx] of Object.entries(b.flags || {})) if (typeof idx !== 'number') flags[name] = idx; else if (idx >= 0) flags[name] = this.eval(idx, env);
         const fcmp = b.fcmp ? { a: this.eval(b.fcmp.a, env), b: this.eval(b.fcmp.b, env) } : null;
         const t = b.term;
         let to;
         switch (t.kind) {
           case 'return': state.returned = this.eval(t.value, env); return;
           case 'trap': throw new Error('the executable traps here');
+          case 'noreturn': throw new Error('the routine called last in this block never returns');
           case 'halt': state.returned = 0; return;
           case 'jump': to = t.target; break;
           case 'branch': to = this.truthy(this.eval(t.cond, env)) ? t.taken : t.fall; break;
@@ -3151,8 +3209,9 @@ export class DerivedModel {
           default: throw new Error(`block ends with ${t.kind}`);
         }
         if (traceBlocks) this.traceBlock(va, key, to, env);
+        const esp = b.esp !== undefined ? this.eval(b.esp, env) : { stack: b.sp, frame: env };
         Object.assign(env.regs, regs);
-        env.regs.ESP = { stack: b.sp, frame: env };
+        env.regs.ESP = esp;
         env.fpu = fpu;
         Object.assign(env.xmm, xmm);
         Object.assign(env.mm, mm);
@@ -3195,32 +3254,28 @@ export class DerivedModel {
     return state;
   }
 
-  // Compiles a routine's path trie into one function applying its effects and deciding its guards in path order,
-  // the way matching a path runs them
+  // Compiles a path trie into one function per node, a guarded child compiling the first time its guard holds
   compilePaths(paths) {
     const emitter = this.exprEmitter(true);
     const effects = [];
     const guards = [];
-    const lines = [];
-    let size = 0;
-    const emitEffects = (list) => {
+    const nodes = [];
+    const emitEffects = (lines, list) => {
       for (const e of list) {
-        size += lines.length ? lines[lines.length - 1].length : 0;
-        if (size > CODE_BUDGET) throw new CodeBudgetError();
         const k = effects.length;
         effects.push(e);
         lines.push(`if (++d.work > ${FRAME_WORK_BUDGET}) d.budgetExceeded();`);
         if (e._early) lines.push(`d.readEarly(E[${k}]._early, env);`);
         if (e.kind === 'store' && ((e.has_addr && e.size <= 4) || (!e.has_addr && (e.base === 'stack' || e.base === 'this')))) {
           const body = [];
-          const v = emitter.emit(e.value, body);
+          const v = emitter.emitShared(e.value, body);
           lines.push(`try { ${body.join(' ')} let v = ${v};`);
           if (e.size === 8) lines.push(`if (typeof v === 'number') v = { f64: v }; else if (v !== null && typeof v === 'object' && v.bits !== undefined) v = { f64: F.floatFromBits(v.bits) };`);
           else if (this.isFloatExpr(e.value)) lines.push(`if (typeof v === 'number') v = { bits: F.bitsFromFloat(v) };`);
           else lines.push(`if (typeof v === 'number' && !Number.isInteger(v)) v = { bits: F.bitsFromFloat(v) };`);
           if (e.has_addr) {
             const addr = [];
-            const a = emitter.emit(e.addr, addr);
+            const a = emitter.emitShared(e.addr, addr);
             lines.push(`${addr.join(' ')} const a = ${a};`);
             lines.push(`if (typeof v === 'number' && a !== null && typeof a === 'object' && a.raw !== undefined) F.rawStore(a.raw, a.off || 0, ${e.size}, v);`);
             lines.push(`else if (typeof v === 'number' && a !== null && typeof a === 'object' && a.obj !== undefined && a.obj.mem.flat === true) a.obj.mem.setWord(a.off || 0, ${e.size}, v);`);
@@ -3238,38 +3293,48 @@ export class DerivedModel {
         }
       }
     };
-    const emitNode = (node) => {
-      emitEffects(node.effects);
+    // Emits a node's effects and its items up to the unguarded path, each guarded child a call into its own function
+    const emitNode = (lines, node) => {
+      emitEffects(lines, node.effects);
       for (const item of node.items) {
-        emitEffects(item.effects);
+        emitEffects(lines, item.effects);
         if (item.path) {
           const body = [];
-          const v = emitter.emit(item.path.return, body);
-          lines.push(...body, `state.returned = ${v}; return state;`);
-          continue;
+          const v = emitter.emitShared(item.path.return, body);
+          for (const l of body) lines.push(l);
+          lines.push(`state.returned = ${v}; return state;`);
+          return;
         }
         const g = guards.length;
         guards.push(item.guard);
+        const c = nodes.length;
+        nodes.push(pending(item.node, c));
         const body = [];
-        const v = emitter.emit(item.guard, body);
+        const v = emitter.emitShared(item.guard, body);
         lines.push(`{ let g; try { ${body.join(' ')} g = ${v}; } catch (err) { d.guardError(err, G[${g}]); }`);
-        lines.push(`if (typeof g === 'number' ? g !== 0 : !!g) {`);
-        emitNode(item.node);
-        lines.push(`} }`);
+        lines.push(`if (typeof g === 'number' ? g !== 0 : !!g) { const r = C[${c}](env, state); if (r !== undefined) return r; } }`);
       }
+      lines.push(`return undefined;`);
     };
-    try {
-      emitNode(paths._trie);
-      for (const l of lines) size += l.length;
-      if (size > CODE_BUDGET) throw new CodeBudgetError();
-    } catch (err) {
-      if (!(err instanceof CodeBudgetError)) throw err;
-      paths._compiled = INTERPRETED;
-      return INTERPRETED;
-    }
-    lines.push(`throw new Error('no execution path matches' + (env.mat ? ' for material ' + env.mat.name : ''));`);
-    const make = new Function('d', 'N', 'F', 'E', 'G', `return function paths(env, state) {\n${lines.join('\n')}\n};`);
-    const compiled = make(this, this.nodes, EXPR_HELPERS, effects, guards);
+    const compileNode = (node, c) => {
+      const lines = [];
+      emitter.newScope();
+      emitNode(lines, node);
+      const make = new Function('d', 'N', 'F', 'E', 'G', 'C', `return function paths${c}(env, state) {\n${lines.join('\n')}\n};`);
+      return make(this, this.nodes, EXPR_HELPERS, effects, guards, nodes);
+    };
+    // A node stands as a function compiling it on its first run, which then takes its place
+    const pending = (node, c) => (env, state) => {
+      const f = compileNode(node, c);
+      nodes[c] = f;
+      return f(env, state);
+    };
+    nodes.push(pending(paths._trie, 0));
+    const compiled = (env, state) => {
+      const r = nodes[0](env, state);
+      if (r === undefined) throw new Error('no execution path matches' + (env.mat ? ' for material ' + env.mat.name : ''));
+      return r;
+    };
     paths._compiled = compiled;
     return compiled;
   }
@@ -3394,6 +3459,7 @@ export class DerivedModel {
     route.forEach((eff, k) => { for (const x of effectExprs(eff)) this.markEarly(route, x, k); });
     const end = route.length;
     for (const idx of Object.values(b.regs)) this.markEarly(route, idx, end);
+    if (b.esp !== undefined) this.markEarly(route, b.esp, end);
     for (const idx of b.fpu) this.markEarly(route, idx, end);
     for (const idx of Object.values(b.xmm || {})) this.markEarly(route, idx, end);
     for (const idx of Object.values(b.mm || {})) this.markEarly(route, idx, end);
@@ -3605,15 +3671,17 @@ export class DerivedModel {
   runOfElements(e, env) {
     const dst = this.eval(e.addr, env);
     const size = e.size;
+    // The step is the element size, negative where the direction flag ran the instruction backwards
+    const step = this.int(this.eval(e.args[1], env)) | 0;
     if (e.kind === 'copy') {
       const src = this.eval(e.args[0], env);
       const count = this.int(this.eval(e.value, env));
-      for (let i = 0; i < count; i++) this.storeThrough(this.offsetPointer(dst, i * size), size, this.loadLive(env, this.offsetPointer(src, i * size), size), env);
+      for (let i = 0; i < count; i++) this.storeThrough(this.offsetPointer(dst, i * step), size, this.loadLive(env, this.offsetPointer(src, i * step), size), env);
       return;
     }
     const value = this.eval(e.value, env);
     const count = this.int(this.eval(e.args[0], env));
-    for (let i = 0; i < count; i++) this.storeThrough(this.offsetPointer(dst, i * size), size, value, env);
+    for (let i = 0; i < count; i++) this.storeThrough(this.offsetPointer(dst, i * step), size, value, env);
   }
 
   // Writes the stack memory a call's pointer arguments refer to, which the path kept as expressions
@@ -3731,6 +3799,7 @@ function buildTrie(paths) {
 
 // Classes of call effect, a value producer, a routine run once, a device draw or another device call
 const CALL_PRODUCER = 1, CALL_ROUTINE = 2, CALL_DRAW = 3, CALL_DEVICE = 4;
+
 
 // The class a call name falls in, decided once per effect
 function callClass(fn) {

@@ -1,12 +1,15 @@
 package xbe
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/bits"
 	"sort"
 	"strings"
+	"unsafe"
 )
 
 // Expr is a value computed by symbolically executed x86 code.
@@ -103,8 +106,78 @@ func (Block) exprTag()      {}
 func (Elem) exprTag()       {}
 func (Sel) exprTag()        {}
 
-// Serializes an expression tree as nested JSON objects
-func exprJSON(e Expr) map[string]any {
+// exprKey identifies the box an interface value holds, the same wherever one node is shared
+type exprKey struct{ typ, data unsafe.Pointer }
+
+// The identity of a node, read from the two words of the interface value
+func keyOf(e Expr) exprKey {
+	w := (*[2]unsafe.Pointer)(unsafe.Pointer(&e))
+	return exprKey{w[0], w[1]}
+}
+
+// Calls f on each node an expression is built from
+func eachChild(e Expr, f func(Expr)) {
+	switch v := e.(type) {
+	case Load:
+		if v.Addr != nil {
+			f(v.Addr)
+		}
+	case Bin:
+		f(v.A)
+		f(v.B)
+	case Un:
+		f(v.A)
+	case Cond:
+		f(v.A)
+		f(v.B)
+	case FCmpSet:
+		f(v.A)
+		f(v.B)
+	case Not:
+		f(v.A)
+	case CallResult:
+		for _, a := range v.Args {
+			f(a)
+		}
+		if v.This != nil {
+			f(v.This)
+		}
+	case Block:
+		for _, a := range v.Elems {
+			f(a)
+		}
+	case Elem:
+		f(v.A)
+	case Sel:
+		f(v.C)
+		f(v.A)
+		f(v.B)
+	}
+}
+
+// Reports whether an expression is built from other nodes
+func hasChildren(e Expr) bool {
+	found := false
+	eachChild(e, func(Expr) { found = true })
+	return found
+}
+
+// Calls visit once for every node reachable from an expression, nodes met before through seen skipped
+func walkExpr(e Expr, seen map[exprKey]bool, visit func(Expr)) {
+	if e == nil {
+		return
+	}
+	k := keyOf(e)
+	if seen[k] {
+		return
+	}
+	seen[k] = true
+	visit(e)
+	eachChild(e, func(c Expr) { walkExpr(c, seen, visit) })
+}
+
+// Serializes one node as a JSON object, its children replaced by the indices child hands back
+func exprNode(e Expr, child func(Expr) int) map[string]any {
 	switch v := e.(type) {
 	case nil:
 		return map[string]any{"k": "undef"}
@@ -122,30 +195,30 @@ func exprJSON(e Expr) map[string]any {
 	case Load:
 		m := map[string]any{"k": "load", "base": v.Base, "off": v.Off, "size": v.Size}
 		if v.Addr != nil {
-			m["addr"] = exprJSON(v.Addr)
+			m["addr"] = child(v.Addr)
 		}
 		if v.Epoch > 0 {
 			m["e"] = v.Epoch
 		}
 		return m
 	case Bin:
-		return map[string]any{"k": "bin", "op": v.Op, "a": exprJSON(v.A), "b": exprJSON(v.B)}
+		return map[string]any{"k": "bin", "op": v.Op, "a": child(v.A), "b": child(v.B)}
 	case Un:
-		return map[string]any{"k": "un", "op": v.Op, "a": exprJSON(v.A)}
+		return map[string]any{"k": "un", "op": v.Op, "a": child(v.A)}
 	case Cond:
-		return map[string]any{"k": "cond", "op": v.Op, "a": exprJSON(v.A), "b": exprJSON(v.B)}
+		return map[string]any{"k": "cond", "op": v.Op, "a": child(v.A), "b": child(v.B)}
 	case FCmpSet:
-		return map[string]any{"k": "fcmp", "a": exprJSON(v.A), "b": exprJSON(v.B), "set": v.Set}
+		return map[string]any{"k": "fcmp", "a": child(v.A), "b": child(v.B), "set": v.Set}
 	case Not:
-		return map[string]any{"k": "not", "a": exprJSON(v.A)}
+		return map[string]any{"k": "not", "a": child(v.A)}
 	case CallResult:
-		args := make([]any, len(v.Args))
+		args := make([]int, len(v.Args))
 		for i, a := range v.Args {
-			args[i] = exprJSON(a)
+			args[i] = child(a)
 		}
 		m := map[string]any{"k": "call", "fn": v.Fn, "args": args, "seq": v.Seq}
 		if v.This != nil {
-			m["this"] = exprJSON(v.This)
+			m["this"] = child(v.This)
 		}
 		if v.Target != 0 {
 			m["target"] = v.Target
@@ -154,20 +227,20 @@ func exprJSON(e Expr) map[string]any {
 	case RetAddr:
 		return map[string]any{"k": "retaddr", "va": v.VA}
 	case Block:
-		elems := make([]any, len(v.Elems))
+		elems := make([]int, len(v.Elems))
 		for i, a := range v.Elems {
-			elems[i] = exprJSON(a)
+			elems[i] = child(a)
 		}
 		return map[string]any{"k": "block", "elems": elems}
 	case Elem:
-		return map[string]any{"k": "elem", "a": exprJSON(v.A), "i": v.Index}
+		return map[string]any{"k": "elem", "a": child(v.A), "i": v.Index}
 	case Sel:
-		return map[string]any{"k": "sel", "c": exprJSON(v.C), "a": exprJSON(v.A), "b": exprJSON(v.B)}
+		return map[string]any{"k": "sel", "c": child(v.C), "a": child(v.A), "b": child(v.B)}
 	}
-	panic(fmt.Sprintf("exprJSON: %T", e))
+	panic(fmt.Sprintf("exprNode: %T", e))
 }
 
-// ExprPool deduplicates expression trees into an indexed table for compact JSON.
+// ExprPool deduplicates expression graphs into an indexed table for compact JSON
 type ExprPool struct {
 	Nodes []map[string]any `json:"nodes"`
 	index map[string]int
@@ -180,29 +253,34 @@ func NewExprPool() *ExprPool {
 	return pool
 }
 
-// Add interns an expression and returns its node index.
+// Add interns an expression and returns its node index, each node it shares interned once
 func (pool *ExprPool) Add(e Expr) int {
-	return pool.intern(exprJSON(e))
+	return pool.interner().add(e)
 }
 
-// Interns a serialized node after replacing its children with their indices
-func (pool *ExprPool) intern(node map[string]any) int {
-	for _, key := range []string{"a", "b", "c", "addr", "this"} {
-		if child, ok := node[key]; ok {
-			node[key] = pool.intern(child.(map[string]any))
-		}
+// interner remembers the index of every node one structure's walk interned, so a shared node is interned once
+type interner struct {
+	pool *ExprPool
+	memo map[exprKey]int
+}
+
+// Starts the walk interning one structure's expressions
+func (pool *ExprPool) interner() *interner {
+	return &interner{pool: pool, memo: map[exprKey]int{}}
+}
+
+// Interns a node after its children
+func (in *interner) add(e Expr) int {
+	if e == nil {
+		return in.pool.addNode(exprNode(nil, nil))
 	}
-	for _, key := range []string{"args", "elems"} {
-		if list, ok := node[key]; ok {
-			items := list.([]any)
-			refs := make([]int, len(items))
-			for i, it := range items {
-				refs[i] = pool.intern(it.(map[string]any))
-			}
-			node[key] = refs
-		}
+	k := keyOf(e)
+	if idx, ok := in.memo[k]; ok {
+		return idx
 	}
-	return pool.addNode(node)
+	idx := in.pool.addNode(exprNode(e, in.add))
+	in.memo[k] = idx
+	return idx
 }
 
 func (pool *ExprPool) addNode(node map[string]any) int {
@@ -218,6 +296,11 @@ func (pool *ExprPool) addNode(node map[string]any) int {
 
 // String renders an expression in C like notation for the dump output.
 func ExprString(e Expr) string {
+	return formatExpr(e, ExprString)
+}
+
+// Renders one node in the dump notation, child handing back the text of each node it is built from
+func formatExpr(e Expr, child func(Expr) string) string {
 	switch v := e.(type) {
 	case nil:
 		return "undef"
@@ -237,18 +320,18 @@ func ExprString(e Expr) string {
 		return fmt.Sprintf("&%s+0x%X", v.Base, v.Off)
 	case Load:
 		if v.Addr != nil {
-			return fmt.Sprintf("mem%d[%s]", v.Size, ExprString(v.Addr))
+			return fmt.Sprintf("mem%d[%s]", v.Size, child(v.Addr))
 		}
 		if v.Base == "" {
 			return fmt.Sprintf("g%d[0x%X]", v.Size, uint32(v.Off))
 		}
 		return fmt.Sprintf("%s.%d@0x%X", v.Base, v.Size, v.Off)
 	case Bin:
-		return fmt.Sprintf("(%s %s %s)", ExprString(v.A), v.Op, ExprString(v.B))
+		return fmt.Sprintf("(%s %s %s)", child(v.A), v.Op, child(v.B))
 	case Un:
-		return fmt.Sprintf("%s(%s)", v.Op, ExprString(v.A))
+		return fmt.Sprintf("%s(%s)", v.Op, child(v.A))
 	case Cond:
-		return fmt.Sprintf("(%s %s %s)", ExprString(v.A), v.Op, ExprString(v.B))
+		return fmt.Sprintf("(%s %s %s)", child(v.A), v.Op, child(v.B))
 	case FCmpSet:
 		var parts []string
 		for _, p := range []struct {
@@ -259,13 +342,13 @@ func ExprString(e Expr) string {
 				parts = append(parts, p.name)
 			}
 		}
-		return fmt.Sprintf("fcmp(%s, %s)in{%s}", ExprString(v.A), ExprString(v.B), strings.Join(parts, ","))
+		return fmt.Sprintf("fcmp(%s, %s)in{%s}", child(v.A), child(v.B), strings.Join(parts, ","))
 	case Not:
-		return "!" + ExprString(v.A)
+		return "!" + child(v.A)
 	case CallResult:
 		args := make([]string, len(v.Args))
 		for i, a := range v.Args {
-			args[i] = ExprString(a)
+			args[i] = child(a)
 		}
 		return fmt.Sprintf("%s#%d(%s)", v.Fn, v.Seq, strings.Join(args, ", "))
 	case RetAddr:
@@ -273,16 +356,19 @@ func ExprString(e Expr) string {
 	case Block:
 		parts := make([]string, len(v.Elems))
 		for i, a := range v.Elems {
-			parts[i] = ExprString(a)
+			parts[i] = child(a)
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	case Elem:
-		return fmt.Sprintf("%s[%d]", ExprString(v.A), v.Index)
+		return fmt.Sprintf("%s[%d]", child(v.A), v.Index)
 	case Sel:
-		return fmt.Sprintf("(%s ? %s : %s)", ExprString(v.C), ExprString(v.A), ExprString(v.B))
+		return fmt.Sprintf("(%s ? %s : %s)", child(v.C), child(v.A), child(v.B))
 	}
 	return fmt.Sprintf("%T", e)
 }
+
+// Whether a call result added to is taken as the base of an object, which only the path summaries of the dashboard do
+var resultPointers = true
 
 func isConst(e Expr) (uint32, bool) {
 	c, ok := e.(IConst)
@@ -324,13 +410,14 @@ func mkBin(op string, a, b Expr) Expr {
 			}
 		}
 	}
-	// An opaque call result entering pointer arithmetic is an object base, two results added being plain integers
+	// An opaque call result entering pointer arithmetic is an object base, two results added being plain integers,
+	// except in a machine lift where every value is the number it is
 	_, aResult := a.(CallResult)
 	_, bResult := b.(CallResult)
-	if cr, ok := a.(CallResult); ok && !bResult && (op == "add" || op == "sub") {
+	if cr, ok := a.(CallResult); ok && !bResult && (op == "add" || op == "sub") && resultPointers {
 		a = Ptr{fmt.Sprintf("res%d", cr.Seq), 0}
 	}
-	if cr, ok := b.(CallResult); ok && !aResult && op == "add" {
+	if cr, ok := b.(CallResult); ok && !aResult && op == "add" && resultPointers {
 		b = Ptr{fmt.Sprintf("res%d", cr.Seq), 0}
 	}
 	if p, ok := a.(Ptr); ok {
@@ -595,9 +682,9 @@ func mkCond(op string, a, b Expr) Expr {
 		if pb, ok := b.(Ptr); ok && pa.Base == pb.Base {
 			return mkCond(op, IConst{uint32(pa.Off)}, IConst{uint32(pb.Off)})
 		}
-		// A pointer to an object the path holds is never null, where a global holds one only once set and the
-		// receiver is whatever the caller passed, a null among the possibilities
-		if _, held := globalObjectAddress(Ptr{pa.Base, 0}); bok && bv == 0 && pa.Base != "" && pa.Base != "this" && !held {
+		// A pointer to an object the path holds is never null, where a global holds one only once set, the receiver is
+		// whatever the caller passed and a call result is an integer until the call runs, so those stay tests
+		if _, held := globalObjectAddress(Ptr{pa.Base, 0}); bok && bv == 0 && pa.Base != "" && pa.Base != "this" && !held && !strings.HasPrefix(pa.Base, "res") {
 			switch op {
 			case "eq":
 				return IConst{0}
@@ -655,48 +742,18 @@ func mkNot(c Expr) Expr {
 	return Not{c}
 }
 
-// Collects the names of every symbolic input an expression depends on
+// Collects the names of every symbolic input an expression depends on, each shared node visited once
 func exprSyms(e Expr, out map[string]bool) {
-	switch v := e.(type) {
-	case Sym:
-		out[v.Name] = true
-	case Load:
-		if v.Addr != nil {
-			exprSyms(v.Addr, out)
-		} else {
-			out[fmt.Sprintf("%s@%X", v.Base, v.Off)] = true
+	walkExpr(e, map[exprKey]bool{}, func(x Expr) {
+		switch v := x.(type) {
+		case Sym:
+			out[v.Name] = true
+		case Load:
+			if v.Addr == nil {
+				out[fmt.Sprintf("%s@%X", v.Base, v.Off)] = true
+			}
 		}
-	case Bin:
-		exprSyms(v.A, out)
-		exprSyms(v.B, out)
-	case Un:
-		exprSyms(v.A, out)
-	case Cond:
-		exprSyms(v.A, out)
-		exprSyms(v.B, out)
-	case FCmpSet:
-		exprSyms(v.A, out)
-		exprSyms(v.B, out)
-	case Not:
-		exprSyms(v.A, out)
-	case CallResult:
-		for _, a := range v.Args {
-			exprSyms(a, out)
-		}
-		if v.This != nil {
-			exprSyms(v.This, out)
-		}
-	case Block:
-		for _, a := range v.Elems {
-			exprSyms(a, out)
-		}
-	case Elem:
-		exprSyms(v.A, out)
-	case Sel:
-		exprSyms(v.C, out)
-		exprSyms(v.A, out)
-		exprSyms(v.B, out)
-	}
+	})
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -718,10 +775,36 @@ func sameExpr(a, b Expr) bool {
 }
 
 func sameExprWithin(a, b Expr, budget *int) bool {
+	if keyOf(a) == keyOf(b) {
+		return true
+	}
 	*budget--
 	if *budget < 0 {
 		return false
 	}
+	return sameNode(a, b, func(x, y Expr) bool { return sameExprWithin(x, y, budget) })
+}
+
+// Reports whether two expressions are the same structure however large, each pair of shared nodes compared once
+func equalExprs(a, b Expr) bool {
+	return equalExprsWithin(a, b, map[[2]exprKey]bool{})
+}
+
+func equalExprsWithin(a, b Expr, seen map[[2]exprKey]bool) bool {
+	pair := [2]exprKey{keyOf(a), keyOf(b)}
+	if pair[0] == pair[1] {
+		return true
+	}
+	if eq, ok := seen[pair]; ok {
+		return eq
+	}
+	eq := sameNode(a, b, func(x, y Expr) bool { return equalExprsWithin(x, y, seen) })
+	seen[pair] = eq
+	return eq
+}
+
+// Compares two nodes field by field, same deciding each pair of children
+func sameNode(a, b Expr, same func(x, y Expr) bool) bool {
 	switch x := a.(type) {
 	case nil:
 		return b == nil
@@ -729,35 +812,35 @@ func sameExprWithin(a, b Expr, budget *int) bool {
 		return a == b
 	case Load:
 		y, ok := b.(Load)
-		return ok && x.Base == y.Base && x.Off == y.Off && x.Size == y.Size && sameExprWithin(x.Addr, y.Addr, budget)
+		return ok && x.Base == y.Base && x.Off == y.Off && x.Size == y.Size && same(x.Addr, y.Addr)
 	case Bin:
 		y, ok := b.(Bin)
-		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+		return ok && x.Op == y.Op && same(x.A, y.A) && same(x.B, y.B)
 	case Un:
 		y, ok := b.(Un)
-		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget)
+		return ok && x.Op == y.Op && same(x.A, y.A)
 	case Cond:
 		y, ok := b.(Cond)
-		return ok && x.Op == y.Op && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+		return ok && x.Op == y.Op && same(x.A, y.A) && same(x.B, y.B)
 	case FCmpSet:
 		y, ok := b.(FCmpSet)
-		return ok && x.Set == y.Set && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+		return ok && x.Set == y.Set && same(x.A, y.A) && same(x.B, y.B)
 	case Not:
 		y, ok := b.(Not)
-		return ok && sameExprWithin(x.A, y.A, budget)
+		return ok && same(x.A, y.A)
 	case Elem:
 		y, ok := b.(Elem)
-		return ok && x.Index == y.Index && sameExprWithin(x.A, y.A, budget)
+		return ok && x.Index == y.Index && same(x.A, y.A)
 	case Sel:
 		y, ok := b.(Sel)
-		return ok && sameExprWithin(x.C, y.C, budget) && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
+		return ok && same(x.C, y.C) && same(x.A, y.A) && same(x.B, y.B)
 	case Block:
 		y, ok := b.(Block)
 		if !ok || len(x.Elems) != len(y.Elems) {
 			return false
 		}
 		for i := range x.Elems {
-			if !sameExprWithin(x.Elems[i], y.Elems[i], budget) {
+			if !same(x.Elems[i], y.Elems[i]) {
 				return false
 			}
 		}
@@ -767,6 +850,101 @@ func sameExprWithin(a, b Expr, budget *int) bool {
 		return ok && x.Seq == y.Seq && x.Fn == y.Fn
 	}
 	return false
+}
+
+// Digests of the nodes one walk met, each shared node digested once
+type digestMemo map[exprKey]uint64
+
+// A digest of an expression's structure, equal for equal structures and blind to what equalExprs ignores
+func exprDigest(e Expr, memo digestMemo) uint64 {
+	if e == nil {
+		return 0
+	}
+	k := keyOf(e)
+	if d, ok := memo[k]; ok {
+		return d
+	}
+	h := fnv.New64a()
+	var word [8]byte
+	num := func(x uint64) {
+		binary.LittleEndian.PutUint64(word[:], x)
+		h.Write(word[:])
+	}
+	text := func(s string) {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	switch v := e.(type) {
+	case IConst:
+		text("i")
+		num(uint64(v.V))
+	case FConst:
+		text("f")
+		num(math.Float64bits(v.V))
+	case Sym:
+		text("s")
+		text(v.Name)
+	case Ptr:
+		text("p")
+		text(v.Base)
+		num(uint64(uint32(v.Off)))
+	case RetAddr:
+		text("r")
+		num(uint64(v.VA))
+		num(uint64(v.Clean))
+	case Load:
+		text("l")
+		text(v.Base)
+		num(uint64(uint32(v.Off)))
+		num(uint64(v.Size))
+		num(exprDigest(v.Addr, memo))
+	case Bin:
+		text("b")
+		text(v.Op)
+		num(exprDigest(v.A, memo))
+		num(exprDigest(v.B, memo))
+	case Un:
+		text("u")
+		text(v.Op)
+		num(exprDigest(v.A, memo))
+	case Cond:
+		text("c")
+		text(v.Op)
+		num(exprDigest(v.A, memo))
+		num(exprDigest(v.B, memo))
+	case FCmpSet:
+		text("m")
+		num(uint64(v.Set))
+		num(exprDigest(v.A, memo))
+		num(exprDigest(v.B, memo))
+	case Not:
+		text("n")
+		num(exprDigest(v.A, memo))
+	case CallResult:
+		text("k")
+		text(v.Fn)
+		num(uint64(v.Seq))
+	case Block:
+		text("B")
+		num(uint64(len(v.Elems)))
+		for _, x := range v.Elems {
+			num(exprDigest(x, memo))
+		}
+	case Elem:
+		text("e")
+		num(uint64(v.Index))
+		num(exprDigest(v.A, memo))
+	case Sel:
+		text("S")
+		num(exprDigest(v.C, memo))
+		num(exprDigest(v.A, memo))
+		num(exprDigest(v.B, memo))
+	default:
+		panic(fmt.Sprintf("exprDigest: %T", e))
+	}
+	d := h.Sum64()
+	memo[k] = d
+	return d
 }
 
 // Tree nodes one path's expressions may expand to, past which the pool cannot carry them

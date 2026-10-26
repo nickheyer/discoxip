@@ -115,6 +115,8 @@ type RenderModel struct {
 	Scene          *SceneModel                   `json:"scene"`
 	Allocators     []uint32                      `json:"allocators"`
 	Registry       *MaterialRegistry             `json:"material_registry"`
+	Kernel         *KernelModel                  `json:"kernel"`
+	TLS            *TLSDirectory                 `json:"tls"`
 	memory         []byte
 	defaultPaths   []Path
 	nodePaths      []Path // paths of the routines loading the node constants from the matrix stack top
@@ -167,10 +169,10 @@ func stage(name string) {
 	}
 }
 
-// DeriveRender runs every derivation and assembles the render model.
-func DeriveRender(d *Disassembly) (*RenderModel, error) {
+// DeriveRender runs every derivation and assembles the render model, the kernel lifted beside the dashboard.
+func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 	build := int(d.Image.LibBuild("D3D8"))
-	rm := &RenderModel{XDK: build, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Lifted: map[uint32]*LiftedFunction{}}
+	rm := &RenderModel{XDK: build, TLS: d.Image.TLS, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Lifted: map[uint32]*LiftedFunction{}}
 	rm.StageNames = TextureStageStateNames(build)
 	// The render state wrapper comes first so the state tables it writes are known before any path is summarized.
 	stage("render states")
@@ -310,6 +312,10 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	}
 	stage("memory")
 	if err := rm.deriveMemory(d); err != nil {
+		return nil, err
+	}
+	stage("kernel")
+	if err := rm.attachKernel(kernel); err != nil {
 		return nil, err
 	}
 	stage("registrations")

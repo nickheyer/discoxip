@@ -103,7 +103,23 @@ type Image struct {
 	HeadersSize uint32
 	Sections    []Section
 	Libs        []LibVersion
-	raw         []byte // entire file contents for random access
+	TLS         *TLSDirectory // the thread local storage the loader gives each thread, nil where the header names none
+	raw         []byte        // entire file contents for random access
+}
+
+// TLSDirectory is the image's thread local storage directory, the template every thread's block starts as copied
+// from Start to End and ZeroFill more bytes cleared after it, the index word at Index numbering the module's slot
+type TLSDirectory struct {
+	Start     uint32 `json:"start"`
+	End       uint32 `json:"end"`
+	Index     uint32 `json:"index"`
+	Callbacks uint32 `json:"callbacks"`
+	ZeroFill  uint32 `json:"zero_fill"`
+}
+
+// NewImage builds an image from sections already laid out in memory, the header being the bytes at its base
+func NewImage(base, entry uint32, header []byte, sections []Section) *Image {
+	return &Image{BaseAddr: base, EntryPoint: entry, HeadersSize: uint32(len(header)), Sections: sections, raw: header}
 }
 
 // Returns the XDK build number of the named library or 0 when absent
@@ -165,6 +181,18 @@ func Parse(data []byte) (*Image, error) {
 	} else {
 		img.EntryPoint = entry ^ entryRetail
 		img.KernThunk = kthunk ^ kthunkRetail
+	}
+
+	if h.TLSAddr != 0 {
+		off := int(h.TLSAddr - h.BaseAddr)
+		if off < 0 || off+20 > len(data) {
+			return nil, fmt.Errorf("xbe: TLS directory at %08X lies outside the headers", h.TLSAddr)
+		}
+		var t TLSDirectory
+		if err := binary.Read(io.NewSectionReader(readerAt(data), int64(off), 20), binary.LittleEndian, &t); err != nil {
+			return nil, fmt.Errorf("xbe: reading TLS directory: %w", err)
+		}
+		img.TLS = &t
 	}
 
 	// Read section headers.

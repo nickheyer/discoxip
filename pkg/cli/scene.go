@@ -55,6 +55,10 @@ func init() {
 
 	sceneCmd.PersistentFlags().StringVar(&sceneXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
 	sceneCmd.MarkPersistentFlagRequired("xbe")
+	sceneCmd.PersistentFlags().StringVar(&kernelBIOS, "bios", "", "flash image holding the kernel the dashboard runs on (required)")
+	sceneCmd.PersistentFlags().StringVar(&kernelMCPX, "mcpx", "", "MCPX ROM dump holding the 2BL key (required)")
+	sceneCmd.MarkPersistentFlagRequired("bios")
+	sceneCmd.MarkPersistentFlagRequired("mcpx")
 	sceneCmd.AddCommand(buildCmd, exportCmd, infoCmd)
 	rootCmd.AddCommand(sceneCmd)
 }

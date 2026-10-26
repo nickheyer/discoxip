@@ -22,9 +22,11 @@ type LiftedFunction struct {
 // LiftedBlock is one straight run of instructions, ending where the routine jumps, branches or returns.
 type LiftedBlock struct {
 	VA      uint32         `json:"va"`
+	Insns   int            `json:"n,omitempty"`
 	Effects []EffectJSON   `json:"effects"`
 	Regs    map[string]int `json:"regs"`
 	SP      int32          `json:"sp"`
+	ESP     int            `json:"esp,omitempty"`
 	FPU     []int          `json:"fpu"`
 	XMM     map[string]int `json:"xmm,omitempty"`
 	MM      map[string]int `json:"mm,omitempty"`
@@ -35,12 +37,13 @@ type LiftedBlock struct {
 
 // LiftedFlags are the operands of the last flag setting instruction, an index of -1 standing for none.
 type LiftedFlags struct {
-	A    int `json:"a"`
-	B    int `json:"b"`
-	R    int `json:"r"`
-	CF   int `json:"cf"`
-	FswA int `json:"fsw_a"`
-	FswB int `json:"fsw_b"`
+	Kind string `json:"kind,omitempty"`
+	A    int    `json:"a"`
+	B    int    `json:"b"`
+	R    int    `json:"r"`
+	CF   int    `json:"cf"`
+	FswA int    `json:"fsw_a"`
+	FswB int    `json:"fsw_b"`
 }
 
 // LiftedFCmp is the pending float comparison the status word reports.
@@ -50,7 +53,8 @@ type LiftedFCmp struct {
 	AxFSW bool `json:"ax_fsw"`
 }
 
-// LiftedTerm is how a block ends: a jump, a branch, a switch or the routine's return.
+// LiftedTerm is how a block ends: a jump, a branch, a switch or the routine's return, and in a machine lift a jump
+// through a computed address, a halt, a software interrupt or an interrupt return.
 type LiftedTerm struct {
 	Kind    string   `json:"kind"`
 	Target  string   `json:"target,omitempty"`
@@ -60,14 +64,18 @@ type LiftedTerm struct {
 	Index   int      `json:"index,omitempty"`
 	Targets []string `json:"targets,omitempty"`
 	Value   int      `json:"value,omitempty"`
+	Vector  int      `json:"vector,omitempty"`
 }
 
 // liftedBlock is a block before its expressions are pooled.
 type liftedBlock struct {
 	va      uint32
+	insns   int
 	effects []Effect
 	regs    [8]Expr
+	segs    map[string]Expr
 	sp      int32
+	spExpr  Expr // the stack pointer where the block moved it out of the frame
 	fpu     []Expr
 	xmm     map[string]Expr
 	mm      map[string]Expr
@@ -89,6 +97,8 @@ type blockTerm struct {
 	index   Expr
 	targets []uint32
 	value   Expr
+	vector  int
+	ret     uint32 // the return address a call pushed before the jump, for walking a routine past its calls
 }
 
 // blockRun is the block the executor is lifting, with the leaders that end it and the instructions it owns.
@@ -115,6 +125,7 @@ const liftedEntrySP = 0x10000
 // blockEntry is what the executor knows of the machine where a block starts.
 type blockEntry struct {
 	esp      int32
+	espMoved bool // the stack pointer left the frame, so the block starts with it as a value
 	ebp      int32
 	ebpKnown bool
 	rest     int32   // where the stack settles between calls, the argument words of a call in progress below it
@@ -322,7 +333,7 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 			return lf, fmt.Errorf("lift %08X block %s: %w", entry, key, err)
 		}
 		lf.blocks[key] = b
-		exit := blockEntry{esp: b.sp, rest: b.rest}
+		exit := blockEntry{esp: b.sp, rest: b.rest, espMoved: b.spExpr != nil}
 		if p, ok := b.regs[5].(Ptr); ok && p.Base == "stack" {
 			exit.ebp, exit.ebpKnown = p.Off, true
 		} else if in.ebpKnown && b.regs[5] == nil {
@@ -352,8 +363,12 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 			}
 			prev, seen := entries[succ]
 			// A block entered with the stack at another depth is lifted again for that way in
-			if seen && (prev.esp != next.esp || prev.ebpKnown != next.ebpKnown || prev.ebp != next.ebp) {
-				succ = fmt.Sprintf("%s~%X_%X", succ, uint32(next.esp), uint32(next.ebp))
+			if seen && (prev.esp != next.esp || prev.espMoved != next.espMoved || prev.ebpKnown != next.ebpKnown || prev.ebp != next.ebp) {
+				depth := fmt.Sprintf("%X", uint32(next.esp))
+				if next.espMoved {
+					depth = "moved"
+				}
+				succ = fmt.Sprintf("%s~%s_%X", succ, depth, uint32(next.ebp))
 				prev, seen = entries[succ]
 			}
 			if !seen {
@@ -372,7 +387,7 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 		}
 		t := b.term
 		switch t.kind {
-		case "trap", "halt":
+		case "trap", "halt", "noreturn":
 		case "jump":
 			b.succs = []string{link(t.target)}
 		case "branch":
@@ -409,6 +424,9 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 	s := &execState{mem: map[memKey]memVal{}, va: va, root: fn.EntryVA}
 	s.regs = in.regs
 	s.regs[4] = Ptr{"stack", in.esp}
+	if in.espMoved {
+		s.regs[4] = Sym{"reg.ESP"}
+	}
 	s.regs[5] = nil
 	if in.ebpKnown {
 		s.regs[5] = Ptr{"stack", in.ebp}
@@ -419,7 +437,7 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 	if in.pred != nil {
 		s.fl, s.fcmp, s.axFSW = entryFlags(in.pred)
 	}
-	s.rest = in.rest
+	s.rest, s.restBase = in.rest, "stack"
 	s.entry = [][8]Expr{s.regs}
 	ex.block = &blockRun{start: va, leaders: leaders, inside: inside}
 	ex.paths = nil
@@ -435,12 +453,17 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 	if run.term == nil {
 		return nil, fmt.Errorf("block %08X ends without a jump, branch or return", va)
 	}
-	b := &liftedBlock{va: va, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, rest: s.rest, xmm: map[string]Expr{}, mm: map[string]Expr{}}
-	sp, ok := s.regs[4].(Ptr)
-	if !ok || sp.Base != "stack" {
-		return nil, fmt.Errorf("block %08X leaves the stack pointer at %s", va, ExprString(s.regs[4]))
+	b := &liftedBlock{va: va, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, rest: s.rest, xmm: map[string]Expr{}, mm: map[string]Expr{}, segs: map[string]Expr{}}
+	for i, v := range s.segs {
+		if v != nil {
+			b.segs[segNames[i]] = v
+		}
 	}
-	b.sp = sp.Off
+	if sp, ok := s.regs[4].(Ptr); ok && sp.Base == "stack" {
+		b.sp = sp.Off
+	} else {
+		b.spExpr = s.regs[4]
+	}
 	for i, v := range s.regs {
 		if i == 4 || v == nil {
 			continue
@@ -507,85 +530,95 @@ func (lf *LiftedFunction) serialize(pool *ExprPool) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	in := pool.interner()
 	for _, key := range keys {
-		b := lf.blocks[key]
-		lb := &LiftedBlock{VA: b.va, Effects: effectsJSON(pool, b.effects), Regs: map[string]int{}, SP: b.sp, FPU: []int{}}
-		for i, v := range b.regs {
-			if v != nil {
-				lb.Regs[registerNames[i]] = pool.Add(v)
-			}
-		}
-		for _, v := range b.fpu {
-			lb.FPU = append(lb.FPU, pool.Add(v))
-		}
-		if len(b.xmm) > 0 {
-			lb.XMM = map[string]int{}
-			for name, v := range b.xmm {
-				lb.XMM[name] = pool.Add(v)
-			}
-		}
-		if len(b.mm) > 0 {
-			lb.MM = map[string]int{}
-			for name, v := range b.mm {
-				lb.MM[name] = pool.Add(v)
-			}
-		}
-		if b.fl.kind != "" {
-			lb.Flags = &LiftedFlags{A: optional(pool, b.fl.a), B: optional(pool, b.fl.b), R: optional(pool, b.fl.r), CF: optional(pool, b.fl.cf), FswA: -1, FswB: -1}
-			if b.fl.fsw != nil {
-				lb.Flags.FswA, lb.Flags.FswB = pool.Add(b.fl.fsw.a), pool.Add(b.fl.fsw.b)
-			}
-		}
-		if b.fcmp != nil {
-			lb.FCmp = &LiftedFCmp{A: pool.Add(b.fcmp.a), B: pool.Add(b.fcmp.b), AxFSW: b.axFSW}
-		}
-		t := b.term
-		lb.Term = LiftedTerm{Kind: t.kind}
-		switch t.kind {
-		case "jump":
-			lb.Term.Target = b.succs[0]
-		case "branch":
-			lb.Term.Cond, lb.Term.Taken, lb.Term.Fall = pool.Add(t.cond), b.succs[0], b.succs[1]
-		case "switch":
-			lb.Term.Index, lb.Term.Targets = pool.Add(t.index), b.succs
-		case "return":
-			lb.Term.Value = pool.Add(t.value)
-		}
-		lf.Blocks[key] = lb
+		lf.Blocks[key] = serializeBlock(in, lf.blocks[key])
 	}
+}
+
+// Serializes one block with its expressions pooled through the interner given
+func serializeBlock(in *interner, b *liftedBlock) *LiftedBlock {
+	lb := &LiftedBlock{VA: b.va, Insns: b.insns, Effects: effectsJSON(in, b.effects), Regs: map[string]int{}, SP: b.sp, FPU: []int{}}
+	if b.spExpr != nil {
+		lb.ESP = in.add(b.spExpr)
+	}
+	for i, v := range b.regs {
+		if v != nil {
+			lb.Regs[registerNames[i]] = in.add(v)
+		}
+	}
+	for name, v := range b.segs {
+		lb.Regs[name] = in.add(v)
+	}
+	for _, v := range b.fpu {
+		lb.FPU = append(lb.FPU, in.add(v))
+	}
+	if len(b.xmm) > 0 {
+		lb.XMM = map[string]int{}
+		for name, v := range b.xmm {
+			lb.XMM[name] = in.add(v)
+		}
+	}
+	if len(b.mm) > 0 {
+		lb.MM = map[string]int{}
+		for name, v := range b.mm {
+			lb.MM[name] = in.add(v)
+		}
+	}
+	lb.Flags = b.flagsJSON(in)
+	if b.fcmp != nil {
+		lb.FCmp = &LiftedFCmp{A: in.add(b.fcmp.a), B: in.add(b.fcmp.b), AxFSW: b.axFSW}
+	}
+	t := b.term
+	lb.Term = LiftedTerm{Kind: t.kind}
+	switch t.kind {
+	case "jump", "hlt":
+		lb.Term.Target = b.succs[0]
+	case "int":
+		lb.Term.Target, lb.Term.Vector = b.succs[0], t.vector
+	case "branch":
+		lb.Term.Cond, lb.Term.Taken, lb.Term.Fall = in.add(t.cond), b.succs[0], b.succs[1]
+	case "switch":
+		lb.Term.Index, lb.Term.Targets = in.add(t.index), b.succs
+	case "return":
+		lb.Term.Value = in.add(t.value)
+	case "jumpind":
+		lb.Term.Index = in.add(t.index)
+	}
+	return lb
 }
 
 // Pools an expression that may be absent, which is written as -1
-func optional(pool *ExprPool, e Expr) int {
+func optional(in *interner, e Expr) int {
 	if e == nil {
 		return -1
 	}
-	return pool.Add(e)
+	return in.add(e)
 }
 
 // Serializes effects with their expressions as pool indices
-func effectsJSON(pool *ExprPool, effects []Effect) []EffectJSON {
+func effectsJSON(in *interner, effects []Effect) []EffectJSON {
 	out := []EffectJSON{}
 	for _, e := range effects {
 		ej := EffectJSON{Kind: e.Kind, VA: e.VA, Base: e.Base, Off: e.Off, Size: e.Size, Fn: e.Fn, Seq: e.Seq, Target: e.Target}
 		if e.Value != nil {
-			ej.Value = pool.Add(e.Value)
+			ej.Value = in.add(e.Value)
 		}
 		if e.Addr != nil {
-			ej.Addr = pool.Add(e.Addr)
+			ej.Addr = in.add(e.Addr)
 			ej.HasAddr = true
 		}
 		for _, a := range e.Args {
-			ej.Args = append(ej.Args, pool.Add(a))
+			ej.Args = append(ej.Args, in.add(a))
 		}
 		if e.This != nil {
-			ej.This = pool.Add(e.This)
+			ej.This = in.add(e.This)
 			ej.HasThis = true
 		}
 		for _, b := range e.Buffers {
 			bj := BufferJSON{Index: b.Index, Elems: []int{}, Sizes: append([]int{}, b.Sizes...)}
 			for _, el := range b.Elems {
-				bj.Elems = append(bj.Elems, pool.Add(el))
+				bj.Elems = append(bj.Elems, in.add(el))
 			}
 			ej.Buffers = append(ej.Buffers, bj)
 		}
@@ -594,55 +627,133 @@ func effectsJSON(pool *ExprPool, effects []Effect) []EffectJSON {
 	return out
 }
 
-// Describes a lifted routine for the dump output
+// Describes a lifted routine for the dump output, each node a block shares defined once as tN
 func (lf *LiftedFunction) String() string {
 	var sb strings.Builder
 	for _, key := range slices.Sorted(maps.Keys(lf.blocks)) {
 		b := lf.blocks[key]
-		fmt.Fprintf(&sb, "block %s sp=%X\n", key, b.sp)
+		p := &graphPrinter{sb: &sb, refs: map[exprKey]int{}, names: map[exprKey]string{}}
+		for _, e := range b.shown() {
+			p.count(e)
+		}
+		if b.spExpr != nil {
+			fmt.Fprintf(&sb, "block %s\n", key)
+			p.line("ESP = %s", p.render(b.spExpr))
+		} else {
+			fmt.Fprintf(&sb, "block %s sp=%X\n", key, b.sp)
+		}
 		for _, e := range b.effects {
-			fmt.Fprintf(&sb, "  %s\n", effectString(e))
+			p.line("%s", effectString(e, p.render))
 		}
 		for i, v := range b.regs {
 			if v != nil {
-				fmt.Fprintf(&sb, "  %s = %s\n", registerNames[i], ExprString(v))
+				p.line("%s = %s", registerNames[i], p.render(v))
+			}
+		}
+		for _, name := range segNames {
+			if v, ok := b.segs[name]; ok {
+				p.line("%s = %s", name, p.render(v))
 			}
 		}
 		t := b.term
 		switch t.kind {
 		case "jump":
-			fmt.Fprintf(&sb, "  jump %s\n", b.succs[0])
+			p.line("jump %s", b.succs[0])
 		case "branch":
-			fmt.Fprintf(&sb, "  branch %s ? %s : %s\n", ExprString(t.cond), b.succs[0], b.succs[1])
+			p.line("branch %s ? %s : %s", p.render(t.cond), b.succs[0], b.succs[1])
 		case "switch":
-			fmt.Fprintf(&sb, "  switch %s %v\n", ExprString(t.index), b.succs)
+			p.line("switch %s %v", p.render(t.index), b.succs)
 		case "return":
-			fmt.Fprintf(&sb, "  return %s\n", ExprString(t.value))
+			p.line("return %s", p.render(t.value))
 		case "trap":
-			fmt.Fprintf(&sb, "  trap\n")
+			p.line("trap")
 		case "halt":
-			fmt.Fprintf(&sb, "  halt\n")
+			p.line("halt")
+		case "noreturn":
+			p.line("noreturn")
+		case "jumpind":
+			p.line("jump to %s", p.render(t.index))
+		case "hlt":
+			p.line("hlt then %s", b.succs[0])
+		case "int":
+			p.line("int %d then %s", t.vector, b.succs[0])
+		case "iret":
+			p.line("iret")
 		}
 	}
 	return sb.String()
 }
 
-// Renders one effect in the dump notation
-func effectString(e Effect) string {
+// The expressions the dump prints for a block
+func (b *liftedBlock) shown() []Expr {
+	out := []Expr{b.spExpr}
+	for _, e := range b.effects {
+		out = append(out, e.Value, e.Addr)
+		out = append(out, e.Args...)
+	}
+	out = append(out, b.regs[:]...)
+	for _, name := range segNames {
+		out = append(out, b.segs[name])
+	}
+	return append(out, b.term.cond, b.term.index, b.term.value)
+}
+
+// graphPrinter renders a block's expressions with every compound node the block shares named once
+type graphPrinter struct {
+	sb    *strings.Builder
+	refs  map[exprKey]int
+	names map[exprKey]string
+}
+
+// Counts the references each node receives, descending into a node on its first reference
+func (p *graphPrinter) count(e Expr) {
+	if e == nil {
+		return
+	}
+	k := keyOf(e)
+	p.refs[k]++
+	if p.refs[k] == 1 {
+		eachChild(e, p.count)
+	}
+}
+
+// Renders an expression, a compound node referenced more than once defined on its first use and named after
+func (p *graphPrinter) render(e Expr) string {
+	if e == nil || !hasChildren(e) || p.refs[keyOf(e)] < 2 {
+		return formatExpr(e, p.render)
+	}
+	k := keyOf(e)
+	if name, ok := p.names[k]; ok {
+		return name
+	}
+	body := formatExpr(e, p.render)
+	name := fmt.Sprintf("t%d", len(p.names))
+	p.names[k] = name
+	p.line("%s = %s", name, body)
+	return name
+}
+
+// Writes one indented line of the dump
+func (p *graphPrinter) line(format string, args ...any) {
+	fmt.Fprintf(p.sb, "  "+format+"\n", args...)
+}
+
+// Renders one effect in the dump notation with the expression renderer given
+func effectString(e Effect, str func(Expr) string) string {
 	switch e.Kind {
 	case "store":
 		if e.Addr != nil {
-			return fmt.Sprintf("mem%d[%s] = %s", e.Size, ExprString(e.Addr), ExprString(e.Value))
+			return fmt.Sprintf("mem%d[%s] = %s", e.Size, str(e.Addr), str(e.Value))
 		}
-		return fmt.Sprintf("%s.%d@0x%X = %s", e.Base, e.Size, e.Off, ExprString(e.Value))
+		return fmt.Sprintf("%s.%d@0x%X = %s", e.Base, e.Size, e.Off, str(e.Value))
 	case "copy":
-		return fmt.Sprintf("copy %s x%d from %s to %s", ExprString(e.Value), e.Size, ExprString(e.Args[0]), ExprString(e.Addr))
+		return fmt.Sprintf("copy %s x%d from %s to %s", str(e.Value), e.Size, str(e.Args[0]), str(e.Addr))
 	case "fill":
-		return fmt.Sprintf("fill %s x%d with %s at %s", ExprString(e.Args[0]), e.Size, ExprString(e.Value), ExprString(e.Addr))
+		return fmt.Sprintf("fill %s x%d with %s at %s", str(e.Args[0]), e.Size, str(e.Value), str(e.Addr))
 	}
 	args := make([]string, len(e.Args))
 	for i, a := range e.Args {
-		args[i] = ExprString(a)
+		args[i] = str(a)
 	}
 	return fmt.Sprintf("%s#%d(%s)", e.Fn, e.Seq, strings.Join(args, ", "))
 }

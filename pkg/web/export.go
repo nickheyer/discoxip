@@ -20,11 +20,11 @@ import (
 	"github.com/nickheyer/discoxip/pkg/xbe"
 )
 
-//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js static/system.js static/console.js static/gpu.js
+//go:embed static/*
 var staticFiles embed.FS
 
 // Export generates a self-contained web application from extracted XIP data and the disassembled dashboard executable.
-func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
+func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *xbe.KernelInput) error {
 	for _, dir := range []string{
 		outputDir,
 		filepath.Join(outputDir, "data", "scenes"),
@@ -46,7 +46,7 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
 	fmt.Fprintf(os.Stderr, "Found %d XAP scene(s)\n", len(xapFiles))
 
 	fmt.Fprintf(os.Stderr, "Deriving render model from the executable\n")
-	layouts, model, err := scene.LoadLayouts(d)
+	layouts, model, err := scene.LoadLayouts(d, kernel)
 	if err != nil {
 		return fmt.Errorf("web: %w", err)
 	}
@@ -138,12 +138,16 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
 		return err
 	}
 
-	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js", "static/system.js", "static/console.js", "static/gpu.js"} {
-		data, err := staticFiles.ReadFile(name)
+	entries, err := fs.ReadDir(staticFiles, "static")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		data, err := staticFiles.ReadFile("static/" + entry.Name())
 		if err != nil {
-			return fmt.Errorf("web: reading embedded %s: %w", name, err)
+			return fmt.Errorf("web: reading embedded %s: %w", entry.Name(), err)
 		}
-		if err := os.WriteFile(filepath.Join(outputDir, filepath.Base(name)), data, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(outputDir, entry.Name()), data, 0o644); err != nil {
 			return err
 		}
 	}

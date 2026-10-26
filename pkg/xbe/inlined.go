@@ -17,48 +17,81 @@ func createsVertexShader(name string) bool {
 	return name == "D3DDevice_CreateVertexShader" || name == declarationParser
 }
 
-// Rebuilds an expression top down, each node the function maps replacing its whole subtree
+// Rebuilds an expression top down, a mapped node replacing its subtree and a shared node rebuilt once
 func mapExpr(e Expr, f func(Expr) (Expr, bool)) Expr {
+	return mapExprWithin(e, f, map[exprKey]Expr{})
+}
+
+func mapExprWithin(e Expr, f func(Expr) (Expr, bool), done map[exprKey]Expr) Expr {
 	if e == nil {
 		return nil
 	}
-	if r, ok := f(e); ok {
+	k := keyOf(e)
+	if r, ok := done[k]; ok {
 		return r
 	}
-	switch v := e.(type) {
-	case Load:
-		if v.Addr != nil {
-			v.Addr = mapExpr(v.Addr, f)
+	r := e
+	if m, ok := f(e); ok {
+		r = m
+	} else {
+		sub := func(x Expr) Expr { return mapExprWithin(x, f, done) }
+		switch v := e.(type) {
+		case Load:
+			if a := sub(v.Addr); keyOf(a) != keyOf(v.Addr) {
+				v.Addr = a
+				r = v
+			}
+		case Bin:
+			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+				r = Bin{v.Op, a, b}
+			}
+		case Un:
+			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+				r = Un{v.Op, a}
+			}
+		case Cond:
+			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+				r = Cond{v.Op, a, b}
+			}
+		case FCmpSet:
+			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+				r = FCmpSet{a, b, v.Set}
+			}
+		case Not:
+			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+				r = Not{a}
+			}
+		case Elem:
+			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+				r = Elem{a, v.Index}
+			}
+		case Sel:
+			if c, a, b := sub(v.C), sub(v.A), sub(v.B); keyOf(c) != keyOf(v.C) || keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+				r = Sel{c, a, b}
+			}
+		case Block:
+			elems, changed := make([]Expr, len(v.Elems)), false
+			for i, x := range v.Elems {
+				elems[i] = sub(x)
+				changed = changed || keyOf(elems[i]) != keyOf(x)
+			}
+			if changed {
+				r = Block{elems}
+			}
+		case CallResult:
+			args, this := make([]Expr, len(v.Args)), sub(v.This)
+			changed := keyOf(this) != keyOf(v.This)
+			for i, a := range v.Args {
+				args[i] = sub(a)
+				changed = changed || keyOf(args[i]) != keyOf(a)
+			}
+			if changed {
+				r = CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: this, Target: v.Target}
+			}
 		}
-		return v
-	case Bin:
-		return Bin{v.Op, mapExpr(v.A, f), mapExpr(v.B, f)}
-	case Un:
-		return Un{v.Op, mapExpr(v.A, f)}
-	case Cond:
-		return Cond{v.Op, mapExpr(v.A, f), mapExpr(v.B, f)}
-	case FCmpSet:
-		return FCmpSet{mapExpr(v.A, f), mapExpr(v.B, f), v.Set}
-	case Not:
-		return Not{mapExpr(v.A, f)}
-	case Elem:
-		return Elem{mapExpr(v.A, f), v.Index}
-	case Sel:
-		return Sel{mapExpr(v.C, f), mapExpr(v.A, f), mapExpr(v.B, f)}
-	case Block:
-		elems := make([]Expr, len(v.Elems))
-		for i, x := range v.Elems {
-			elems[i] = mapExpr(x, f)
-		}
-		return Block{elems}
-	case CallResult:
-		args := make([]Expr, len(v.Args))
-		for i, a := range v.Args {
-			args[i] = mapExpr(a, f)
-		}
-		return CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: mapExpr(v.This, f), Target: v.Target}
 	}
-	return e
+	done[k] = r
+	return r
 }
 
 // Reads the call sequence of an allocation result, as the result itself or a pointer to its start

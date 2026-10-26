@@ -54,15 +54,6 @@ export class VirtualConsole {
     return this.config.avPack;
   }
 
-  // Kernel variables the executable reads through its import table
-  kernelVariable(name, off, size) {
-    if (name === 'HalBootSMCVideoMode' && off === 0) return this.config.avPack;
-    if (name === 'XboxHardwareInfo' && off === 0) return this.config.hardwareFlags;
-    if (name === 'KeTickCount' && off === 0) return Math.floor(performance.now() - this.started) >>> 0;
-    // The console was started from its own dashboard, so no launch data page exists
-    if (name === 'LaunchDataPage' && off === 0) return 0;
-    throw new Error(`kernel variable ${name}+${off} (${size} bytes) is not one the console serves`);
-  }
 
 
   realNow() {

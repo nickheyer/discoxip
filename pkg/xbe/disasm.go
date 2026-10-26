@@ -23,9 +23,10 @@ type Function struct {
 	Name         string // resolved name (kernel import, symbol, or auto-generated)
 	Symbol       *Symbol
 	Instructions []Instruction
-	CallTargets  []uint32 // VAs of functions this function calls
-	CalledBy     []uint32 // VAs of functions that call this one
-	Size         int      // total bytes
+	CallTargets  []uint32            // VAs of functions this function calls
+	CalledBy     []uint32            // VAs of functions that call this one
+	Size         int                 // total bytes
+	Tables       map[uint32][]uint32 // case targets of each indirect jump, by the jump's address
 }
 
 // Disassembly is the complete disassembled image.
@@ -53,6 +54,10 @@ type Disassembly struct {
 	layoutBusy      bool
 	biases          map[uint32]int32
 	stackIns        map[uint32]int
+	boundaries      map[uint32]bool         // routines the image names from outside its code, which no routine runs into
+	noReturn        map[uint32]bool         // routines known never to return to their caller
+	kernel          bool                    // the image is the kernel, whose named routines lie among its own rather than in libraries
+	endsAt          map[uint32]*Instruction // the instruction ending at each address, for the machine lift's entry check
 }
 
 // Disassemble performs full recursive disassembly of the XBE image.
@@ -149,16 +154,19 @@ func (d *Disassembly) linearSweep(text *Section) {
 	}
 }
 
-// Decodes again from every call target the sweep passed over misaligned, data in a code section having desynchronized it
+// Decodes again from every call target the sweep passed over misaligned, data in a code section having
+// desynchronized it, each target tried once since one that decodes to nothing stays missing
 func (d *Disassembly) resynchronize() {
+	tried := map[uint32]bool{}
 	for {
 		var missing []uint32
 		for _, insn := range d.InsnByVA {
 			if insn.Inst.Op != x86asm.CALL {
 				continue
 			}
-			if t := resolveTarget(insn); t != 0 && d.InsnByVA[t] == nil && d.sectionOf(t) != nil {
+			if t := resolveTarget(insn); t != 0 && !tried[t] && d.InsnByVA[t] == nil && d.sectionOf(t) != nil {
 				missing = append(missing, t)
+				tried[t] = true
 			}
 		}
 		if len(missing) == 0 {
@@ -346,11 +354,13 @@ func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool,
 	seen := make(map[uint32]bool)
 	work := []uint32{entry}
 	var callTargets []uint32
+	tables := map[uint32][]uint32{}
 	for len(work) > 0 {
 		va := work[len(work)-1]
 		work = work[:len(work)-1]
 		for {
-			if seen[va] || va < sec.VirtualAddr || va >= sec.VirtualAddr+sec.VirtualSize || (owned != nil && owned[va] && va != entry) {
+			// Running into a routine the image names ends the code a routine owns, as after a call that never returns
+			if seen[va] || va < sec.VirtualAddr || va >= sec.VirtualAddr+sec.VirtualSize || (owned != nil && owned[va] && va != entry) || (va != entry && d.boundaries[va]) {
 				break
 			}
 			insn, ok := d.InsnByVA[va]
@@ -376,8 +386,9 @@ func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool,
 					continue
 				}
 				if t == 0 {
-					for _, jt := range d.jumpTableTargets(insn, sec) {
-						work = append(work, jt)
+					if jts := d.jumpTableTargets(insn, sec); len(jts) > 0 {
+						tables[va] = jts
+						work = append(work, jts...)
 					}
 				} else if t != entry && !(entries[t] && op == x86asm.JMP) {
 					work = append(work, t)
@@ -395,7 +406,7 @@ func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool,
 	if len(seen) == 0 {
 		return nil
 	}
-	fn := &Function{EntryVA: entry, CallTargets: callTargets}
+	fn := &Function{EntryVA: entry, CallTargets: callTargets, Tables: tables}
 	vas := make([]uint32, 0, len(seen))
 	for va := range seen {
 		vas = append(vas, va)
@@ -931,6 +942,9 @@ func (d *Disassembly) libraries() map[*Section]bool {
 
 // Reports whether an address lies in a section holding signature identified library functions other than the entry section
 func (d *Disassembly) inLibrary(va uint32) bool {
+	if d.kernel {
+		return false
+	}
 	sec := d.sectionOf(va)
 	if sec == nil || sec == d.sectionOf(d.Image.EntryPoint) {
 		return false

@@ -19,6 +19,11 @@ func (fn *Function) successors(i int, index map[uint32]int) []int {
 				out = append(out, j)
 			}
 		}
+		for _, t := range fn.Tables[in.VA] {
+			if j, ok := index[t]; ok {
+				out = append(out, j)
+			}
+		}
 		if isUnconditionalJump(op) {
 			return out
 		}
@@ -157,6 +162,9 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 	}
 	saves := map[uint32]bool{}
 	d.savePushes[fn.EntryVA] = saves
+	// Registers already saved on every path reaching each instruction, whose next push passes an argument
+	saved := make([]map[x86asm.Reg]bool, len(fn.Instructions))
+	saved[entry] = map[x86asm.Reg]bool{}
 	work := []int{entry}
 	for len(work) > 0 {
 		i := work[len(work)-1]
@@ -164,9 +172,13 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 		in := &fn.Instructions[i]
 		// Pushing a still untouched register the function pops again later saves it rather than reading an argument.
 		save := prologue[i]
+		pushed := x86asm.Reg(0)
 		if in.Inst.Op == x86asm.PUSH {
-			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && popped[wideRegister(r)] && !written[i][wideRegister(r)] {
-				save = true
+			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok {
+				pushed = wideRegister(r)
+				if popped[pushed] && !written[i][pushed] && !saved[i][pushed] {
+					save = true
+				}
 			}
 		}
 		if save && in.Inst.Op == x86asm.PUSH {
@@ -184,9 +196,17 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 		for _, r := range d.writtenBy(in) {
 			after[r] = true
 		}
+		savedAfter := map[x86asm.Reg]bool{}
+		for r := range saved[i] {
+			savedAfter[r] = true
+		}
+		if save && pushed != 0 {
+			savedAfter[pushed] = true
+		}
 		for _, j := range fn.successors(i, index) {
 			if written[j] == nil {
 				written[j] = after
+				saved[j] = savedAfter
 				work = append(work, j)
 				continue
 			}
@@ -194,6 +214,12 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 			for r := range written[j] {
 				if !after[r] {
 					delete(written[j], r)
+					changed = true
+				}
+			}
+			for r := range saved[j] {
+				if !savedAfter[r] {
+					delete(saved[j], r)
 					changed = true
 				}
 			}

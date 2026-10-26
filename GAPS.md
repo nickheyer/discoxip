@@ -4,6 +4,15 @@ Goal. Go derives everything from the executable, the XIP data and a Go model of 
 
 Measured on sample/5659 with the staged tree (build/dev of Oct 24). Lifted 1291 routines. Lifted 583 named library routines with no named failure. 35 address keyed routines still fail. 168 lifted library routines are shadowed by JavaScript cases that run before the image.
 
+## 0. Lift the kernel and BIOS
+
+The kernel runs from its own image the way the dashboard does. Nothing below this section is finished until the loader runs the kernel's code for every kernel export, and the stand-ins of sections 2 and 3 are replaced by hardware models under the lifted kernel.
+
+- [ ] Boot. Go performs what the MCPX and the 2BL do, the x-code init of the chipset as the register writes they make, the decrypt, the decompress, the copy, and starts the loader at the kernel entry with the three keys the 2BL passes.
+- [ ] Hardware under the kernel, each a loader device whose registers and semantics come from Go tables. PCI configuration space, the PIC and PIT, the SMBus with the SMC and EEPROM, the IDE controller with a disk image built from sample/ as FATX partitions, the DVD drive, the USB host controllers, the NIC, the APU, the NV2A, the flash itself.
+- [ ] Threads. The kernel's scheduler runs several threads. The loader runs the kernel's own context switch on lifted code, with the thread stacks as memory.
+- [ ] Launch. The kernel's XBE loader reads xboxdash.xbe from the disk image through the IDE model and starts it, which replaces the loader's own image mapping, startup sequence and the hand sequenced initializers, disk and init calls.
+
 ## 1. Call order in the loader
 
 - [ ] performCall in derived.js runs its own switch, then ConsoleApi.call, then imageRoutine. Run the image body first for every name the library map carries.

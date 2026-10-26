@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -81,6 +82,25 @@ type flagState struct {
 }
 
 // The carry the last flag setting operation left
+// Reports whether the high word of a 64 bit dividend adds nothing, zero for an unsigned divide and the sign of the
+// low word for a signed one
+func narrowDividend(op x86asm.Op, hi, lo Expr) bool {
+	if op == x86asm.DIV {
+		c, ok := isConst(hi)
+		return ok && c == 0
+	}
+	if c, ok := isConst(hi); ok {
+		l, ok := isConst(lo)
+		return ok && c == uint32(int32(l)>>31)
+	}
+	b, ok := hi.(Bin)
+	if !ok || b.Op != "sar" {
+		return false
+	}
+	c, ok := isConst(b.B)
+	return ok && c == 31 && equalExprs(b.A, lo)
+}
+
 func carryOf(fl flagState) (Expr, bool) {
 	if fl.cf != nil {
 		return fl.cf, true
@@ -92,6 +112,13 @@ func carryOf(fl flagState) (Expr, bool) {
 		return mkCond("ult", fl.r, fl.a), true
 	case "and", "or", "xor", "test":
 		return IConst{0}, true
+	case "eflags":
+		return mkBin("and", fl.a, IConst{1}), true
+	case "fsw":
+		// After the status word is stored to the flags, the carry is the compare's less or unordered code
+		if fl.fsw != nil {
+			return mkFCmp(fl.fsw.a, fl.fsw.b, 1|8), true
+		}
 	}
 	return nil, false
 }
@@ -149,6 +176,9 @@ const (
 
 type execState struct {
 	regs       [8]Expr
+	segs       [6]Expr // segment selectors, read as the runtime's processor holds them where no block set them
+	df         bool    // the direction flag, string instructions moving backwards while it is set
+	machineDF  bool    // a machine block reads the direction flag live, nothing in the block having set it
 	xmm        [8][4]Expr
 	mm         [8][2]Expr
 	mem        map[memKey]memVal
@@ -168,12 +198,13 @@ type execState struct {
 	entry      [][8]Expr // register values at entry of the outer function and each inlined frame
 	pushes     int       // argument pushes since the last call boundary
 	rest       int32     // stack offset above the outstanding argument words, where the stack settles between calls
+	restBase   string    // the memory the rest level lies in, the frame or wherever the stack pointer moved
 	lastSave   bool      // the instruction just run pushed a register to save it
 	pending    *pendingCall
-	bound      map[string]Expr // atomic symbolic values fixed by earlier guards
-	boundLoads map[string]Load // memory reads behind those values, freed when the memory changes
-	loops      map[uint32]int  // backward symbolic branches taken per jump on this path
-	nulled     bool            // a pointer a guard fixed to zero was dereferenced, which the hardware cannot do
+	bound      map[string]binding // atomic symbolic values fixed by earlier guards, keyed by atom
+	boundLoads map[string]Load    // memory reads behind those values, freed when the memory changes
+	loops      map[uint32]int     // backward symbolic branches taken per jump on this path
+	nulled     bool               // a pointer a guard fixed to zero was dereferenced, which the hardware cannot do
 }
 
 // pendingCall remembers the arguments popped for a call of unknown arity so a later
@@ -219,6 +250,8 @@ type Executor struct {
 	pointer        Expr                  // the function pointer the call being recorded goes through
 	tail           bool                  // the call being recorded is a jump leaving the return address under the arguments
 	tailClean      uint32                // stack bytes the callee of a tail jump removes, which its return then applies
+	machine        bool                  // blocks are lifted as the processor runs them, the stack in memory and calls as jumps
+	template       *CodeTemplate         // code lifted as a template whose patched words the copy supplies
 }
 
 // NewExecutor prepares an executor with symbol and vtable knowledge.
@@ -457,8 +490,12 @@ func leavesStackPointer(in *Instruction) bool {
 // where the stack stands, and it never stays below the stack pointer
 func (ex *Executor) settleRest(s *execState, in *Instruction) {
 	p, ok := s.regs[4].(Ptr)
-	if !ok || p.Base != "stack" {
+	if !ok {
 		return
+	}
+	// A stack moved to other memory settles afresh where it now stands
+	if p.Base != s.restBase {
+		s.rest, s.restBase = p.Off, p.Base
 	}
 	switch {
 	case in.Inst.Op == x86asm.PUSH && s.lastSave:
@@ -476,7 +513,7 @@ func (ex *Executor) settleRest(s *execState, in *Instruction) {
 // Bytes of argument words standing between the stack pointer and the rest level
 func (s *execState) outstanding() uint32 {
 	p, ok := s.regs[4].(Ptr)
-	if !ok || p.Base != "stack" || s.rest <= p.Off {
+	if !ok || p.Base != s.restBase || s.rest <= p.Off {
 		return 0
 	}
 	return uint32(s.rest - p.Off)
@@ -903,7 +940,7 @@ func (s *execState) clone() *execState {
 		pc := *s.pending
 		n.pending = &pc
 	}
-	n.bound = make(map[string]Expr, len(s.bound))
+	n.bound = make(map[string]binding, len(s.bound))
 	for k, v := range s.bound {
 		n.bound[k] = v
 	}
@@ -931,6 +968,13 @@ func (s *execState) clone() *execState {
 }
 
 func (s *execState) getReg(r x86asm.Reg) Expr {
+	if i, isSeg := segIndex[r]; isSeg {
+		v := s.segs[i]
+		if v == nil {
+			v = Sym{"reg." + segNames[i]}
+		}
+		return mkUn("zx16", v)
+	}
 	idx, ok := regIndex[r]
 	if !ok {
 		panic(fmt.Sprintf("unsupported register %v", r))
@@ -953,6 +997,10 @@ func (s *execState) getReg(r x86asm.Reg) Expr {
 }
 
 func (s *execState) setReg(r x86asm.Reg, v Expr) {
+	if i, isSeg := segIndex[r]; isSeg {
+		s.segs[i] = mkUn("zx16", v)
+		return
+	}
 	idx := regIndex[r]
 	size, high := regSize(r)
 	old := s.regs[idx]
@@ -976,6 +1024,17 @@ func (s *execState) setReg(r x86asm.Reg, v Expr) {
 
 // Computes the address expression of a memory operand
 func (ex *Executor) addr(s *execState, m x86asm.Mem) Expr {
+	// A machine block reaches segment relative memory through the base the processor holds for the segment
+	if ex.machine && (m.Segment == x86asm.FS || m.Segment == x86asm.GS) {
+		var e Expr = IConst{uint32(m.Disp)}
+		if m.Base != 0 {
+			e = mkBin("add", s.getReg(m.Base), e)
+		}
+		if m.Index != 0 {
+			e = mkBin("add", e, mkBin("mul", s.getReg(m.Index), IConst{uint32(m.Scale)}))
+		}
+		return mkBin("add", Sym{"segbase." + m.Segment.String()}, e)
+	}
 	// Thread local memory, which the compiler links its exception records into, is its own region
 	if m.Segment != 0 && m.Base == 0 && m.Index == 0 {
 		return Ptr{strings.ToLower(m.Segment.String()), int32(m.Disp)}
@@ -1009,6 +1068,13 @@ func indexesTable(v Expr) bool {
 
 // The address a memory access reads, a call result added to an image address being a table it indexes
 func (ex *Executor) asAddress(a Expr) Expr {
+	// A machine block addresses memory by value alone, a fixed address being the only pointer form
+	if ex.machine {
+		if c, ok := isConst(a); ok {
+			return Ptr{"", int32(c)}
+		}
+		return a
+	}
 	p := asPtr(a)
 	q, ok := p.(Ptr)
 	if ok && strings.HasPrefix(q.Base, "res") && ex.d.sectionOf(uint32(q.Off)) != nil {
@@ -1043,10 +1109,13 @@ func asPtr(a Expr) Expr {
 func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 	a = ex.asAddress(a)
 	p, ok := a.(Ptr)
-	if ok && p.Base == "" && uint32(p.Off) < ex.d.Image.BaseAddr {
+	if ok && p.Base == "" && uint32(p.Off) < ex.d.Image.BaseAddr && !ex.machine {
 		s.nulled = true
 	}
 	if !ok {
+		if ex.machine {
+			ex.forgetAliased(s, a, size)
+		}
 		s.effects = append(s.effects, Effect{Kind: "store", VA: va, Base: "?", Addr: a, Size: size, Value: v})
 		return
 	}
@@ -1082,7 +1151,7 @@ func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 		}
 	}
 	s.mem[memKey{p.Base, p.Off}] = memVal{size: size, v: v, va: va}
-	if p.Base == "" && !ex.d.layoutBusy && ex.stateStore(s, uint32(p.Off), size, v, va) {
+	if p.Base == "" && !ex.d.layoutBusy && !ex.machine && ex.stateStore(s, uint32(p.Off), size, v, va) {
 		return
 	}
 	// A path folds its own stack away, a lifted block leaves its frame for the blocks after it to read
@@ -1143,10 +1212,19 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 	a = ex.asAddress(a)
 	p, ok := a.(Ptr)
 	if !ok {
+		if ex.machine {
+			if v, stored := s.machineStoredThrough(a, size); stored {
+				return v
+			}
+			return Load{Addr: a, Size: size, Epoch: len(s.effects)}
+		}
 		if v, stored := s.storedThrough(a, size); stored {
 			return v
 		}
 		return Load{Addr: a, Size: size, Epoch: len(s.effects)}
+	}
+	if ex.machine && p.Base == "" && !memoryAddress(IConst{uint32(p.Off)}) {
+		return ex.loadBacking(s, p, size)
 	}
 	if mv, ok := s.mem[memKey{p.Base, p.Off}]; ok && mv.size == size {
 		if f, isF := mv.v.(FConst); isF {
@@ -1199,6 +1277,24 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 
 // Reads memory never written on this path from the image or as a symbolic input a guard may have fixed
 func (ex *Executor) loadBacking(s *execState, p Ptr, size int) Expr {
+	if p.Base == "" && ex.machine {
+		// A machine block folds only what the image holds in memory the processor never writes
+		va := uint32(p.Off)
+		if sec := ex.d.sectionOf(va); sec != nil && sec.Flags&0x1 == 0 && ex.d.sectionOf(va+uint32(size)-1) == sec {
+			switch size {
+			case 1:
+				v, _ := ex.d.Image.ReadU8(va)
+				return IConst{uint32(v)}
+			case 2:
+				v, _ := ex.d.Image.ReadU16(va)
+				return IConst{uint32(v)}
+			case 4:
+				v, _ := ex.d.Image.ReadU32(va)
+				return IConst{v}
+			}
+		}
+		return Load{Base: p.Base, Off: p.Off, Size: size, Epoch: len(s.effects)}
+	}
 	if p.Base == "" {
 		va := uint32(p.Off)
 		if va < ex.d.Image.BaseAddr {
@@ -1350,6 +1446,10 @@ func (ex *Executor) rawOperand(s *execState, in *Instruction, a x86asm.Arg, size
 	case x86asm.Reg:
 		return s.getReg(v)
 	case x86asm.Imm:
+		// An immediate the copy of a template patches is read from the copy
+		if off, patched := ex.template.patchedWord(in); patched && size == 4 {
+			return ex.template.slotLoad(off)
+		}
 		switch size {
 		case 1:
 			return IConst{uint32(uint8(v))}
@@ -1407,7 +1507,7 @@ func (ex *Executor) Run(entry uint32, init func(s *execState)) ([]Path, error) {
 	s.regs[5] = Sym{"reg.EBP"}
 	init(s)
 	s.push(RetAddr{VA: 0, Clean: 0})
-	s.rest = stackOff(s)
+	s.rest, s.restBase = stackOff(s), "stack"
 	s.entry = [][8]Expr{s.regs}
 	ex.paths, ex.dropped = nil, 0
 	if err := ex.run(s); err != nil {
@@ -1482,28 +1582,24 @@ func (ex *Executor) seedArgs(s *execState, va uint32, prefix string, stackArgs i
 	s.pushArgs(args...)
 }
 
-// Reports whether a push saves a callee saved register still at its entry value rather than passing an input,
-// a lifted block reading that off the routine's own flow since every register looks untouched where it starts
-func (ex *Executor) savesRegister(s *execState, in *Instruction, a x86asm.Arg, v Expr) bool {
+// Reports whether a push saves a callee owned register rather than passing an argument, by the pushing function's flow
+func (ex *Executor) savesRegister(s *execState, in *Instruction, a x86asm.Arg) bool {
 	r, ok := a.(x86asm.Reg)
-	if !ok || (r != x86asm.EBP && r != x86asm.EBX && r != x86asm.ESI && r != x86asm.EDI) || len(s.entry) == 0 {
+	if !ok || (r != x86asm.EBP && r != x86asm.EBX && r != x86asm.ESI && r != x86asm.EDI) {
 		return false
 	}
 	current := s.root
 	if len(s.frames) > 0 {
 		current = s.frames[len(s.frames)-1]
 	}
-	if ex.block != nil && len(s.frames) == 0 {
-		return ex.d.savingPush(ex.d.Functions[current], in.VA)
-	}
-	if slices.Contains(ex.d.registerInputs(current), r) {
+	fn := ex.d.Functions[current]
+	if fn == nil {
 		return false
 	}
-	at := s.entry[len(s.entry)-1][regIndex[r]]
-	if at == nil {
-		at = Sym{"reg." + r.String()}
+	if (ex.block == nil || len(s.frames) > 0) && slices.Contains(ex.d.registerInputs(current), r) {
+		return false
 	}
-	return ExprString(at) == ExprString(v)
+	return ex.d.savingPush(fn, in.VA)
 }
 
 // Pushes stack arguments in order after init so arg0 is nearest the return slot
@@ -1538,6 +1634,10 @@ func (ex *Executor) run(s *execState) error {
 			return nil
 		}
 		in, ok := ex.d.InsnByVA[s.va]
+		if !ok && ex.machine {
+			in = ex.d.insnAt(s.va)
+			ok = in != nil
+		}
 		if !ok {
 			return &ExecError{VA: s.va, Frames: s.frames, Err: fmt.Errorf("no instruction"), Effects: s.effects}
 		}
@@ -1560,11 +1660,11 @@ func (ex *Executor) run(s *execState) error {
 		if debugTrace && (s.steps%5000 == 0 || s.steps < 400) {
 			fmt.Printf("  trace: %08X %-28s esp=%s pushes=%d pending=%v\n", in.VA, in.Inst.String(), ExprString(s.regs[4]), s.pushes, s.pending != nil)
 		}
-		if a, ok := ex.arrayIdx[s.va]; ok {
+		if a, ok := ex.arrayIdx[s.va]; ok && !ex.machine {
 			ex.arrayElement(s, in, a)
 			continue
 		}
-		if r, ok := ex.d.resourceRef[s.va]; ok {
+		if r, ok := ex.d.resourceRef[s.va]; ok && !ex.machine {
 			if err := ex.resourceCount(s, in, r); err != nil {
 				return &ExecError{VA: in.VA, Insn: in.Inst.String(), Frames: s.frames, Err: err, Effects: s.effects}
 			}
@@ -1580,11 +1680,11 @@ func (ex *Executor) run(s *execState) error {
 			return &ExecError{VA: in.VA, Insn: in.Inst.String(), Frames: s.frames, Err: err, Effects: s.effects}
 		}
 		// A routine realigning or sizing its stack by a value leaves no frame offset for the next push to land at
-		if _, framed := s.regs[4].(Ptr); !framed {
+		if _, framed := s.regs[4].(Ptr); !framed && ex.block == nil {
 			return &ExecError{VA: in.VA, Insn: in.Inst.String(), Frames: s.frames, Err: fmt.Errorf("the stack pointer becomes %s", ExprString(s.regs[4])), Effects: s.effects}
 		}
 		ex.settleRest(s, in)
-		if ex.block != nil && ex.block.term != nil && (ex.block.term.kind == "trap" || ex.block.term.kind == "halt") {
+		if ex.block != nil && ex.block.term != nil && (ex.block.term.kind == "trap" || ex.block.term.kind == "halt" || ex.block.term.kind == "noreturn") {
 			return nil
 		}
 		// The dashboard never runs a path that reaches through a null pointer, so it is left unsummarized
@@ -1759,10 +1859,10 @@ func (s *execState) bindFrom(cond Expr) {
 		return
 	}
 	if s.bound == nil {
-		s.bound = map[string]Expr{}
+		s.bound = map[string]binding{}
 	}
-	key := ExprString(atom)
-	s.bound[key] = value
+	key := atomKey(atom, digestMemo{})
+	s.bound[key] = binding{atom, value}
 	if l, ok := atom.(Load); ok && l.Addr == nil {
 		if s.boundLoads == nil {
 			s.boundLoads = map[string]Load{}
@@ -1789,26 +1889,65 @@ func isAtomic(e Expr) bool {
 	return false
 }
 
-// Replaces bound atomic values inside an expression
+// An atomic value a guard fixed, with the constant it holds
+type binding struct {
+	atom  Expr
+	value Expr
+}
+
+// The key an atomic value is bound under, a load through an address keyed by the digest of the address
+func atomKey(e Expr, digests digestMemo) string {
+	switch v := e.(type) {
+	case Sym:
+		return "sym:" + v.Name
+	case CallResult:
+		return "call:" + v.Fn + "#" + strconv.Itoa(v.Seq)
+	case Load:
+		if v.Addr == nil {
+			return "load:" + v.Base + ":" + strconv.FormatInt(int64(v.Off), 10) + ":" + strconv.Itoa(v.Size)
+		}
+		return "mem:" + strconv.Itoa(v.Size) + ":" + strconv.FormatUint(exprDigest(v.Addr, digests), 16)
+	}
+	panic(fmt.Sprintf("atomKey: %T", e))
+}
+
+// Replaces bound atomic values inside an expression, each shared node rewritten once
 func (s *execState) substitute(e Expr) Expr {
 	if len(s.bound) == 0 || e == nil {
 		return e
 	}
+	return s.substituteWithin(e, map[exprKey]Expr{}, digestMemo{})
+}
+
+func (s *execState) substituteWithin(e Expr, done map[exprKey]Expr, digests digestMemo) Expr {
+	k := keyOf(e)
+	if r, ok := done[k]; ok {
+		return r
+	}
+	r := e
 	if isAtomic(e) {
-		if v, ok := s.bound[ExprString(e)]; ok {
-			return v
+		if b, ok := s.bound[atomKey(e, digests)]; ok && equalExprs(b.atom, e) {
+			r = b.value
+		}
+	} else {
+		switch v := e.(type) {
+		case Bin:
+			a, b := s.substituteWithin(v.A, done, digests), s.substituteWithin(v.B, done, digests)
+			if keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+				if strings.HasPrefix(v.Op, "f") {
+					r = mkFBin(v.Op, a, b)
+				} else {
+					r = mkBin(v.Op, a, b)
+				}
+			}
+		case Un:
+			if a := s.substituteWithin(v.A, done, digests); keyOf(a) != keyOf(v.A) {
+				r = mkUn(v.Op, a)
+			}
 		}
 	}
-	switch v := e.(type) {
-	case Bin:
-		if strings.HasPrefix(v.Op, "f") {
-			return mkFBin(v.Op, s.substitute(v.A), s.substitute(v.B))
-		}
-		return mkBin(v.Op, s.substitute(v.A), s.substitute(v.B))
-	case Un:
-		return mkUn(v.Op, s.substitute(v.A))
-	}
-	return e
+	done[k] = r
+	return r
 }
 
 // Counts the populated operands of an instruction
@@ -1829,11 +1968,17 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	s.va = next
 	switch op {
 	case x86asm.NOP, x86asm.FWAIT, x86asm.FLDCW, x86asm.FNSTCW, x86asm.FNCLEX, x86asm.FNINIT:
+		if ex.machine && op != x86asm.NOP && op != x86asm.FWAIT {
+			return ex.machineControlWord(s, in)
+		}
 		return false, nil
-	case x86asm.WBINVD:
+	case x86asm.WBINVD, x86asm.INVD:
 		// Writing the caches back leaves memory holding what the stores already put there
 		return false, nil
 	case x86asm.INT, x86asm.HLT, x86asm.UD2:
+		if ex.machine {
+			return ex.machineTrap(s, in, next)
+		}
 		// A path that traps, such as a failed stack cookie check, never completes and is abandoned.
 		if ex.block != nil && len(s.frames) == 0 {
 			ex.block.term = &blockTerm{kind: "trap"}
@@ -1841,6 +1986,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		}
 		return true, nil
 	case x86asm.MOV, x86asm.MOVZX, x86asm.MOVSX:
+		if done, handled, err := ex.systemStep(s, in, next); handled {
+			return done, err
+		}
 		size := opSize(in, args[1])
 		v := ex.operand(s, in, args[1], size)
 		if op == x86asm.MOVSX {
@@ -1865,17 +2013,16 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		ex.setOperand(s, in, args[0], 4, ex.addr(s, args[1].(x86asm.Mem)))
 	case x86asm.PUSH:
 		v := ex.operand(s, in, args[0], 4)
-		s.push(v)
-		// A lifted block leaves what it pushes in the frame for the blocks after it
-		if ex.block != nil {
-			s.effects = append(s.effects, Effect{Kind: "store", VA: in.VA, Base: "stack", Off: stackOff(s), Size: 4, Value: v})
+		ex.pushWord(s, in, v)
+		if ex.machine {
+			break
 		}
-		if !ex.savePush[in.VA] && !ex.savesRegister(s, in, args[0], v) {
+		if !ex.savePush[in.VA] && !ex.savesRegister(s, in, args[0]) {
 			s.pushes++
 		} else {
 			s.lastSave = true
 			// A saved register bounds the locals below it, the push of ecx being a local itself
-			if r, isReg := args[0].(x86asm.Reg); isReg && r != x86asm.ECX {
+			if r, isReg := args[0].(x86asm.Reg); isReg && r != x86asm.ECX && onFrame(s) {
 				key := memKey{stackBase(s), stackOff(s)}
 				mv := s.mem[key]
 				mv.frame = true
@@ -1886,7 +2033,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		v := ex.pop(s)
 		ex.setOperand(s, in, args[0], 4, v)
 	case x86asm.LEAVE:
-		s.regs[4] = s.regs[5]
+		s.regs[4] = s.getReg(x86asm.EBP)
 		s.regs[5] = ex.pop(s)
 	case x86asm.ADD, x86asm.SUB, x86asm.AND, x86asm.OR, x86asm.XOR, x86asm.ADC, x86asm.SBB:
 		size := opSize(in, args[0])
@@ -1897,10 +2044,10 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			if !ok {
 				return false, fmt.Errorf("carry arithmetic after %s flags", s.fl.kind)
 			}
-			// sbb r, r materializes the borrow alone, as all ones or zero
+			// sbb r, r materializes the borrow alone, as all ones or zero, and borrows again exactly when it was set
 			if op == x86asm.SBB && sameArg(args[0], args[1]) {
 				r := maskSize(mkUn("neg", cf), size)
-				s.fl = narrowFlags(flagState{kind: "alu", a: r, b: IConst{0}, r: r}, size)
+				s.fl = narrowFlags(flagState{kind: "alu", a: r, b: IConst{0}, r: r, cf: cf}, size)
 				ex.setOperand(s, in, args[0], size, r)
 				return false, nil
 			}
@@ -1909,7 +2056,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 				name = "sub"
 			}
 			r := maskSize(mkBin(name, mkBin(name, a, b), cf), size)
-			s.fl = narrowFlags(flagState{kind: "alu", a: a, b: b, r: r}, size)
+			// The carry out of a sum with carry is a wrap past the first operand, or an equal result with the carry in
+			var out Expr
+			if op == x86asm.ADC {
+				out = mkBin("or", mkCond("ult", r, maskSize(a, size)), mkBin("and", cf, mkCond("eq", r, maskSize(a, size))))
+			} else {
+				out = mkBin("or", mkCond("ult", maskSize(a, size), maskSize(b, size)), mkBin("and", cf, mkCond("eq", maskSize(a, size), maskSize(b, size))))
+			}
+			s.fl = narrowFlags(flagState{kind: "alu", a: a, b: b, r: r, cf: out}, size)
 			ex.setOperand(s, in, args[0], size, r)
 			return false, nil
 		}
@@ -1970,9 +2124,11 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		size := opSize(in, args[0])
 		switch nargs {
 		case 1:
-			// The widening product lands in edx:eax.
+			// The widening product lands in edx:eax, dx:ax or ax, the carry and overflow set when the high half holds
+			// more than the low half's sign
 			if size != 4 {
-				return false, fmt.Errorf("narrow widening multiply unsupported")
+				ex.narrowMultiply(s, in, op, size)
+				break
 			}
 			a := s.getReg(x86asm.EAX)
 			b := ex.operand(s, in, args[0], 4)
@@ -1980,8 +2136,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			if op == x86asm.MUL {
 				hi = "mulhi"
 			}
-			s.setReg(x86asm.EDX, mkBin(hi, a, b))
-			s.setReg(x86asm.EAX, mkBin("mul", a, b))
+			lo, high := mkBin("mul", a, b), mkBin(hi, a, b)
+			s.setReg(x86asm.EDX, high)
+			s.setReg(x86asm.EAX, lo)
+			var cf Expr = mkCond("ne", high, IConst{0})
+			if op == x86asm.IMUL {
+				cf = mkCond("ne", high, mkBin("sar", lo, IConst{31}))
+			}
+			s.fl = flagState{kind: "alu", a: lo, b: IConst{0}, r: lo, cf: cf}
 		case 2:
 			a := ex.operand(s, in, args[0], size)
 			b := ex.operand(s, in, args[1], size)
@@ -1991,7 +2153,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			b := ex.operand(s, in, args[2], size)
 			ex.setOperand(s, in, args[0], size, mkBin("mul", a, b))
 		}
-	case x86asm.CMOVA, x86asm.CMOVAE, x86asm.CMOVB, x86asm.CMOVBE, x86asm.CMOVE, x86asm.CMOVG, x86asm.CMOVGE, x86asm.CMOVL, x86asm.CMOVLE, x86asm.CMOVNE, x86asm.CMOVNS, x86asm.CMOVS, x86asm.CMOVP, x86asm.CMOVNP:
+	case x86asm.CMOVA, x86asm.CMOVAE, x86asm.CMOVB, x86asm.CMOVBE, x86asm.CMOVE, x86asm.CMOVG, x86asm.CMOVGE, x86asm.CMOVL, x86asm.CMOVLE, x86asm.CMOVNE, x86asm.CMOVNS, x86asm.CMOVS, x86asm.CMOVP, x86asm.CMOVNP, x86asm.CMOVO, x86asm.CMOVNO:
 		size := opSize(in, args[0])
 		kept := ex.operand(s, in, args[0], size)
 		moved := ex.operand(s, in, args[1], size)
@@ -2115,7 +2277,8 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	case x86asm.IDIV, x86asm.DIV:
 		size := opSize(in, args[0])
 		if size != 4 {
-			return false, fmt.Errorf("narrow division unsupported")
+			ex.narrowDivide(s, in, op, size)
+			return false, nil
 		}
 		divisor := ex.operand(s, in, args[0], 4)
 		lo := s.getReg(x86asm.EAX)
@@ -2138,8 +2301,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			if op == x86asm.IDIV {
 				name = "idiv"
 			}
-			s.setReg(x86asm.EAX, Bin{name, lo, divisor})
-			s.setReg(x86asm.EDX, Bin{name + "_rem", lo, divisor})
+			if narrowDividend(op, hi, lo) {
+				s.setReg(x86asm.EAX, Bin{name, lo, divisor})
+				s.setReg(x86asm.EDX, Bin{name + "_rem", lo, divisor})
+			} else {
+				dividend := Bin{"hilo", hi, lo}
+				s.setReg(x86asm.EAX, Bin{name + "64", dividend, divisor})
+				s.setReg(x86asm.EDX, Bin{name + "64_rem", dividend, divisor})
+			}
 		}
 	case x86asm.CDQ:
 		s.setReg(x86asm.EDX, mkBin("sar", s.getReg(x86asm.EAX), IConst{31}))
@@ -2171,10 +2340,13 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		} else {
 			s.setReg(x86asm.EAX, mkBin("or", mkBin("and", s.getReg(x86asm.EAX), IConst{^uint32(0) << (8 * uint32(size))}), mkSel(same, acc, dst)))
 		}
-	case x86asm.SETE, x86asm.SETNE, x86asm.SETL, x86asm.SETGE, x86asm.SETLE, x86asm.SETG, x86asm.SETB, x86asm.SETAE, x86asm.SETBE, x86asm.SETA, x86asm.SETS, x86asm.SETNS, x86asm.SETP, x86asm.SETNP:
+	case x86asm.SETE, x86asm.SETNE, x86asm.SETL, x86asm.SETGE, x86asm.SETLE, x86asm.SETG, x86asm.SETB, x86asm.SETAE, x86asm.SETBE, x86asm.SETA, x86asm.SETS, x86asm.SETNS, x86asm.SETP, x86asm.SETNP, x86asm.SETO, x86asm.SETNO:
 		c := ex.condition(s, op)
 		ex.setOperand(s, in, args[0], 1, c)
 	case x86asm.JMP:
+		if ex.machine {
+			return ex.machineJump(s, in)
+		}
 		if rel, ok := args[0].(x86asm.Rel); ok {
 			target := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
 			if !ex.Opaque[target] && !(ex.block != nil && len(s.frames) == 0 && !ex.block.inside[target]) {
@@ -2192,7 +2364,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			}
 		}
 		return ex.tailCall(s, in)
-	case x86asm.JE, x86asm.JNE, x86asm.JL, x86asm.JGE, x86asm.JLE, x86asm.JG, x86asm.JB, x86asm.JAE, x86asm.JBE, x86asm.JA, x86asm.JS, x86asm.JNS, x86asm.JP, x86asm.JNP:
+	case x86asm.JE, x86asm.JNE, x86asm.JL, x86asm.JGE, x86asm.JLE, x86asm.JG, x86asm.JB, x86asm.JAE, x86asm.JBE, x86asm.JA, x86asm.JS, x86asm.JNS, x86asm.JP, x86asm.JNP, x86asm.JO, x86asm.JNO:
 		rel := args[0].(x86asm.Rel)
 		taken := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
 		return ex.branch(s, ex.condition(s, op), taken, next)
@@ -2201,13 +2373,28 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		taken := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
 		return ex.branch(s, mkCond("eq", s.getReg(x86asm.ECX), IConst{0}), taken, next)
 	case x86asm.CALL:
+		if ex.machine {
+			return ex.machineCall(s, in, next)
+		}
 		return false, ex.call(s, in, next)
 	case x86asm.RET:
 		clean := int32(0)
 		if nargs > 0 {
 			clean = int32(args[0].(x86asm.Imm))
 		}
+		if ex.machine {
+			return ex.machineReturn(s, clean, false)
+		}
 		return ex.doReturn(s, clean)
+	case x86asm.LRET:
+		clean := int32(0)
+		if nargs > 0 {
+			clean = int32(args[0].(x86asm.Imm))
+		}
+		if !ex.machine {
+			return false, fmt.Errorf("far return")
+		}
+		return ex.machineReturn(s, clean, true)
 	case x86asm.STOSD, x86asm.STOSB, x86asm.STOSW:
 		size := map[x86asm.Op]int{x86asm.STOSD: 4, x86asm.STOSB: 1, x86asm.STOSW: 2}[op]
 		src := map[x86asm.Op]x86asm.Reg{x86asm.STOSD: x86asm.EAX, x86asm.STOSB: x86asm.AL, x86asm.STOSW: x86asm.AX}[op]
@@ -2218,8 +2405,8 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 				// A fill of unknown or long length is kept as an effect the runtime performs, the pointer moving past it.
 				dst := s.getReg(x86asm.EDI)
 				n := s.getReg(x86asm.ECX)
-				s.effects = append(s.effects, Effect{Kind: "fill", VA: in.VA, Addr: dst, Size: size, Value: s.getReg(src), Args: []Expr{n}})
-				s.setReg(x86asm.EDI, mkBin("add", dst, mkBin("mul", n, IConst{uint32(size)})))
+				s.effects = append(s.effects, Effect{Kind: "fill", VA: in.VA, Addr: dst, Size: size, Value: s.getReg(src), Args: []Expr{n, s.stringStep(size)}})
+				s.setReg(x86asm.EDI, mkBin("add", dst, mkBin("mul", n, s.stringStep(size))))
 				s.setReg(x86asm.ECX, IConst{0})
 				break
 			}
@@ -2229,7 +2416,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		for i := uint32(0); i < count; i++ {
 			dst := s.getReg(x86asm.EDI)
 			ex.store(s, dst, size, v, in.VA)
-			s.setReg(x86asm.EDI, mkBin("add", dst, IConst{uint32(size)}))
+			s.setReg(x86asm.EDI, mkBin("add", dst, s.stringStep(size)))
 		}
 		if hasRep(in) {
 			s.setReg(x86asm.ECX, IConst{0})
@@ -2239,13 +2426,30 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		bytes := size
 		if hasRep(in) {
 			c, ok := isConst(s.getReg(x86asm.ECX))
-			if !ok {
-				return false, fmt.Errorf("rep cmps with symbolic count")
+			if !ok || ex.machine {
+				// A repeated compare of unknown length is left to the runtime, which reports the elements it passed,
+				// as is every one in a machine block, where the registers it leaves must be exact
+				esi, edi, count := s.getReg(x86asm.ESI), s.getReg(x86asm.EDI), s.getReg(x86asm.ECX)
+				repne := IConst{0}
+				if repnePrefix(in) {
+					repne = IConst{1}
+				}
+				n := ex.cpuResult(s, in, cpuCMPS, esi, edi, count, IConst{uint32(size)}, s.stringStep(size), repne)
+				s.setReg(x86asm.ECX, mkBin("sub", count, n))
+				s.advance(x86asm.ESI, n, size)
+				s.advance(x86asm.EDI, n, size)
+				a := ex.load(s, mkBin("sub", s.getReg(x86asm.ESI), s.stringStep(size)), size)
+				b := ex.load(s, mkBin("sub", s.getReg(x86asm.EDI), s.stringStep(size)), size)
+				s.fl = narrowFlags(flagState{kind: "cmp", a: a, b: b, r: mkBin("sub", a, b)}, size)
+				break
 			}
 			if c > maxRepCompare {
 				return false, fmt.Errorf("rep cmps count %d exceeds the unroll limit", c)
 			}
 			bytes = int(c) * size
+		}
+		if s.df {
+			return false, fmt.Errorf("backward cmps of a fixed count")
 		}
 		a := ex.loadBlock(s, s.getReg(x86asm.ESI), bytes)
 		b := ex.loadBlock(s, s.getReg(x86asm.EDI), bytes)
@@ -2275,8 +2479,8 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 				if p, isPtr := asPtr(dst).(Ptr); isPtr {
 					base, off = p.Base, p.Off
 				}
-				s.effects = append(s.effects, Effect{Kind: "copy", VA: in.VA, Base: base, Off: off, Addr: dst, Size: size, Value: count, Args: []Expr{src}})
-				advance := mkBin("mul", count, IConst{uint32(size)})
+				s.effects = append(s.effects, Effect{Kind: "copy", VA: in.VA, Base: base, Off: off, Addr: dst, Size: size, Value: count, Args: []Expr{src, s.stringStep(size)}})
+				advance := mkBin("mul", count, s.stringStep(size))
 				s.setReg(x86asm.EDI, mkBin("add", dst, advance))
 				s.setReg(x86asm.ESI, mkBin("add", src, advance))
 				s.setReg(x86asm.ECX, IConst{0})
@@ -2310,6 +2514,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: portIn, Args: args, Seq: ex.seq})
 		ex.setOperand(s, in, data, size, CallResult{Fn: portIn, Args: args, Seq: ex.seq})
 	default:
+		if done, handled, err := ex.systemStep(s, in, next); handled {
+			return done, err
+		}
 		if isFPU(op) {
 			return false, ex.fpuStep(s, in)
 		}
@@ -2385,8 +2592,16 @@ func (ex *Executor) movs(s *execState, in *Instruction, size int) {
 	dst := s.getReg(x86asm.EDI)
 	v := ex.load(s, src, size)
 	ex.store(s, dst, size, v, in.VA)
-	s.setReg(x86asm.ESI, mkBin("add", src, IConst{uint32(size)}))
-	s.setReg(x86asm.EDI, mkBin("add", dst, IConst{uint32(size)}))
+	s.setReg(x86asm.ESI, mkBin("add", src, s.stringStep(size)))
+	s.setReg(x86asm.EDI, mkBin("add", dst, s.stringStep(size)))
+}
+
+// The x87 status word a compare leaves, its condition codes set for less, unordered and equal
+func statusWord(a, b Expr) Expr {
+	less := mkBin("mul", mkFCmp(a, b, 1), IConst{0x100})
+	unordered := mkBin("mul", mkFCmp(a, b, 8), IConst{0x400})
+	equal := mkBin("mul", mkFCmp(a, b, 2), IConst{0x4000})
+	return mkBin("or", less, mkBin("or", unordered, equal))
 }
 
 // Builds the predicate a conditional jump tests from the last flag producer
@@ -2397,6 +2612,14 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 	}
 	if f.kind == "comiss" {
 		return ex.comissCondition(s, op)
+	}
+	// A machine block entered from anywhere decides on the flag record the processor holds, and one after a popped
+	// flags word decides on that word's bits
+	if f.kind == "machine" {
+		return Sym{"cond." + jumpName(op)}
+	}
+	if f.kind == "eflags" {
+		return eflagsCondition(f.a, op)
 	}
 	zero := func() Expr { return mkCond("eq", f.r, IConst{0}) }
 	sign := func() Expr { return mkCond("lt", f.r, IConst{0}) }
@@ -2466,8 +2689,59 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 		return sign()
 	case x86asm.JNS, x86asm.SETNS:
 		return mkNot(sign())
+	case x86asm.JO, x86asm.SETO:
+		of, err := ex.overflow(s)
+		if err != nil {
+			panic(err)
+		}
+		return mkCond("ne", of, IConst{0})
+	case x86asm.JNO, x86asm.SETNO:
+		of, err := ex.overflow(s)
+		if err != nil {
+			panic(err)
+		}
+		return mkCond("eq", of, IConst{0})
 	}
 	panic(fmt.Sprintf("condition %v", op))
+}
+
+// The jump deciding the same condition as a set or a conditional move, which the machine names conditions by
+func jumpName(op x86asm.Op) string {
+	switch op {
+	case x86asm.SETE:
+		return "JE"
+	case x86asm.SETNE:
+		return "JNE"
+	case x86asm.SETL:
+		return "JL"
+	case x86asm.SETGE:
+		return "JGE"
+	case x86asm.SETLE:
+		return "JLE"
+	case x86asm.SETG:
+		return "JG"
+	case x86asm.SETB:
+		return "JB"
+	case x86asm.SETAE:
+		return "JAE"
+	case x86asm.SETBE:
+		return "JBE"
+	case x86asm.SETA:
+		return "JA"
+	case x86asm.SETS:
+		return "JS"
+	case x86asm.SETNS:
+		return "JNS"
+	case x86asm.SETP:
+		return "JP"
+	case x86asm.SETNP:
+		return "JNP"
+	case x86asm.SETO:
+		return "JO"
+	case x86asm.SETNO:
+		return "JNO"
+	}
+	return op.String()
 }
 
 // Resolves a jump after fnstsw/test ah by enumerating float compare outcomes
@@ -2566,6 +2840,9 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 			} else if a.Base != 0 {
 				obj = s.getReg(a.Base)
 				slot = int32(a.Disp)
+			} else {
+				// A jump or call through a pointer a global holds goes where the pointer points when it runs
+				return ex.pointerCall(s, in, next, v)
 			}
 		} else if p, ok := addrE.(Ptr); ok && p.Base == "stack" {
 			// A call through a function pointer kept in a local goes where the pointer points
@@ -2728,6 +3005,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 				return err
 			} else if done {
 				ex.keepUnwritten(s, target, eax, ecx, edx)
+				ex.endAfterNoReturn(s, fn)
 				return nil
 			}
 		}
@@ -2744,6 +3022,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		} else if ex.allocHook != nil && ex.Allocators[target] {
 			s.setReg(x86asm.EAX, ex.allocHook())
 		}
+		ex.endAfterNoReturn(s, fn)
 		return nil
 	}
 	if sym := fn.Symbol; sym != nil {
@@ -3074,6 +3353,53 @@ func (d *Disassembly) demandAfter(fn *Function, callVA uint32) int {
 	return demand
 }
 
+// Ends a lifted block after a call to a routine that never returns, the code after the call being unreachable
+func (ex *Executor) endAfterNoReturn(s *execState, fn *Function) {
+	if ex.block == nil || len(s.frames) > 0 || !ex.d.neverReturns(fn) {
+		return
+	}
+	ex.block.term = &blockTerm{kind: "noreturn"}
+	s.va = 0
+}
+
+// Reports whether a routine never returns, having no return and leaving only into routines that never return
+func (d *Disassembly) neverReturns(fn *Function) bool {
+	if d.noReturn == nil {
+		d.noReturn = map[uint32]bool{}
+	}
+	if v, ok := d.noReturn[fn.EntryVA]; ok {
+		return v
+	}
+	// Routines handing off to each other in a cycle never return either
+	d.noReturn[fn.EntryVA] = true
+	index := fn.instructionIndex()
+	result := true
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		switch in.Inst.Op {
+		case x86asm.RET, x86asm.IRETD, x86asm.LRET:
+			result = false
+		case x86asm.JMP:
+			if _, isRel := in.Inst.Args[0].(x86asm.Rel); !isRel {
+				result = false
+				break
+			}
+			t := resolveTarget(in)
+			if _, inside := index[t]; !inside {
+				callee := d.Functions[t]
+				if callee == nil || !d.neverReturns(callee) {
+					result = false
+				}
+			}
+		}
+		if !result {
+			break
+		}
+	}
+	d.noReturn[fn.EntryVA] = result
+	return result
+}
+
 // Reports whether a function traps as soon as it is entered, following only the jumps it takes unconditionally
 func (d *Disassembly) trapsOnEntry(fn *Function) bool {
 	va := fn.EntryVA
@@ -3316,7 +3642,11 @@ func d3dxBufferSize(name string) int {
 
 // Reads a whole buffer as one value, falling back to a symbolic block load
 func (ex *Executor) loadBlock(s *execState, a Expr, size int) Expr {
-	a = asPtr(a)
+	if ex.machine {
+		a = ex.asAddress(a)
+	} else {
+		a = asPtr(a)
+	}
 	p, ok := a.(Ptr)
 	if !ok {
 		if v, stored := s.storedThrough(a, size); stored {
@@ -3943,6 +4273,10 @@ func (ex *Executor) fpuStep(s *execState, in *Instruction) error {
 	case x86asm.FNSTSW:
 		s.axFSW = s.fcmp != nil
 		s.regs[0] = Sym{"fsw"}
+		// A machine block holds the status word's condition codes as the compare in it decides them
+		if ex.machine && s.fcmp != nil {
+			s.regs[0] = statusWord(s.fcmp.a, s.fcmp.b)
+		}
 	case x86asm.FTST:
 		s.fcmp = &fcmpRec{a: s.st(0), b: FConst{0}}
 	case x86asm.FPATAN:
@@ -4000,7 +4334,7 @@ var cmovJump = map[x86asm.Op]x86asm.Op{
 	x86asm.CMOVA: x86asm.JA, x86asm.CMOVAE: x86asm.JAE, x86asm.CMOVB: x86asm.JB, x86asm.CMOVBE: x86asm.JBE,
 	x86asm.CMOVE: x86asm.JE, x86asm.CMOVNE: x86asm.JNE, x86asm.CMOVG: x86asm.JG, x86asm.CMOVGE: x86asm.JGE,
 	x86asm.CMOVL: x86asm.JL, x86asm.CMOVLE: x86asm.JLE, x86asm.CMOVS: x86asm.JS, x86asm.CMOVNS: x86asm.JNS,
-	x86asm.CMOVP: x86asm.JP, x86asm.CMOVNP: x86asm.JNP,
+	x86asm.CMOVP: x86asm.JP, x86asm.CMOVNP: x86asm.JNP, x86asm.CMOVO: x86asm.JO, x86asm.CMOVNO: x86asm.JNO,
 }
 
 // Collects every symbolic input referenced by a set of paths

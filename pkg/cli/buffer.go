@@ -39,6 +39,7 @@ func init() {
 	dumpCmd.Flags().IntVar(&bufferDumpLimit, "limit", 0, "max vertices to print (0 = all)")
 	dumpCmd.Flags().StringVar(&bufferXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
 	dumpCmd.MarkFlagRequired("xbe")
+	addKernelFlags(dumpCmd)
 
 	exportCmd := &cobra.Command{
 		Use:   "export <file.vb> <file.ib>",
@@ -49,6 +50,7 @@ func init() {
 	exportCmd.Flags().StringVarP(&bufferExportOutput, "output", "o", "", "output file (default: stdout)")
 	exportCmd.Flags().StringVar(&bufferXBE, "xbe", "", "dashboard executable declaring the vertex layouts (required)")
 	exportCmd.MarkFlagRequired("xbe")
+	addKernelFlags(exportCmd)
 
 	bufferCmd.AddCommand(infoCmd, dumpCmd, exportCmd)
 	rootCmd.AddCommand(bufferCmd)

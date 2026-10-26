@@ -58,6 +58,7 @@ func init() {
 		RunE:  runXBERender,
 	}
 	renderCmd.Flags().StringVarP(&xbeRenderOutput, "output", "o", "", "output file (default: stdout)")
+	addKernelFlags(renderCmd)
 
 	liftCmd := &cobra.Command{
 		Use:   "lift <file.xbe> <va>...",
@@ -231,7 +232,11 @@ func runXBERender(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	rm, err := xbe.DeriveRender(d)
+	kernel, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	rm, err := xbe.DeriveRender(d, kernel)
 	if err != nil {
 		return err
 	}

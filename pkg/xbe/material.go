@@ -58,10 +58,11 @@ type BufferJSON struct {
 
 func pathsJSON(pool *ExprPool, paths []Path) []PathJSON {
 	out := []PathJSON{}
+	in := pool.interner()
 	for _, p := range paths {
-		pj := PathJSON{Return: pool.Add(p.Return), Guards: []int{}, GuardPos: []int{}, Effects: effectsJSON(pool, p.Effects)}
+		pj := PathJSON{Return: in.add(p.Return), Guards: []int{}, GuardPos: []int{}, Effects: effectsJSON(in, p.Effects)}
 		for i, g := range p.Guards {
-			pj.Guards = append(pj.Guards, pool.Add(g))
+			pj.Guards = append(pj.Guards, in.add(g))
 			pos := len(p.Effects)
 			if i < len(p.GuardPos) {
 				pos = p.GuardPos[i]

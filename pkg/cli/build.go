@@ -37,6 +37,7 @@ Example:
 		RunE: runBuild,
 	}
 	buildCmd.Flags().StringVarP(&buildOutputDir, "output", "o", "", "output directory (default: <source>/out)")
+	addKernelFlags(buildCmd)
 	rootCmd.AddCommand(buildCmd)
 }
 
@@ -147,7 +148,11 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "\nStep 4: Building web application...\n")
-	if err := web.Export(extractDir, srcDir, webDir, d); err != nil {
+	kernel, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	if err := web.Export(extractDir, srcDir, webDir, d, kernel); err != nil {
 		return fmt.Errorf("web export: %w", err)
 	}
 

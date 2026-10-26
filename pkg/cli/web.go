@@ -25,6 +25,7 @@ func init() {
 		RunE:  runWebExport,
 	}
 	exportCmd.Flags().StringVarP(&webOutputDir, "output", "o", "", "output directory")
+	addKernelFlags(exportCmd)
 
 	webCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(webCmd)
@@ -47,7 +48,11 @@ func runWebExport(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return web.Export(inputDir, inputDir, outputDir, d)
+	kernel, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	return web.Export(inputDir, inputDir, outputDir, d, kernel)
 }
 
 // Opens and disassembles an executable
@@ -59,11 +64,15 @@ func disassemble(path string) (*xbe.Disassembly, error) {
 	return xbe.Disassemble(img)
 }
 
-// Derives the render model and vertex layouts of an executable at a path
+// Derives the render model and vertex layouts of an executable at a path with the kernel the flags name
 func loadLayouts(path string) (map[uint32]scene.Layout, *xbe.RenderModel, error) {
 	d, err := disassemble(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	return scene.LoadLayouts(d)
+	kernel, err := loadKernel()
+	if err != nil {
+		return nil, nil, err
+	}
+	return scene.LoadLayouts(d, kernel)
 }
