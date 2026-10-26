@@ -97,12 +97,13 @@ type LibVersion struct {
 
 // Image is a parsed XBE image with sections mapped by virtual address.
 type Image struct {
-	BaseAddr   uint32
-	EntryPoint uint32 // unscrambled
-	KernThunk  uint32 // unscrambled
-	Sections   []Section
-	Libs       []LibVersion
-	raw        []byte // entire file contents for random access
+	BaseAddr    uint32
+	EntryPoint  uint32 // unscrambled
+	KernThunk   uint32 // unscrambled
+	HeadersSize uint32
+	Sections    []Section
+	Libs        []LibVersion
+	raw         []byte // entire file contents for random access
 }
 
 // Returns the XDK build number of the named library or 0 when absent
@@ -146,8 +147,9 @@ func Parse(data []byte) (*Image, error) {
 	}
 
 	img := &Image{
-		BaseAddr: h.BaseAddr,
-		raw:      data,
+		BaseAddr:    h.BaseAddr,
+		HeadersSize: h.HeadersSize,
+		raw:         data,
 	}
 
 	// Unscramble entry point and kernel thunk address.
@@ -325,7 +327,7 @@ type ImageMemory struct {
 }
 
 // Lays every loaded section out in address order as the memory the console starts the executable with
-func (img *Image) Memory() (ImageMemory, []byte) {
+func (img *Image) Memory() (ImageMemory, []byte, error) {
 	order := make([]*Section, 0, len(img.Sections))
 	for i := range img.Sections {
 		order = append(order, &img.Sections[i])
@@ -333,11 +335,20 @@ func (img *Image) Memory() (ImageMemory, []byte) {
 	sort.Slice(order, func(i, j int) bool { return order[i].VirtualAddr < order[j].VirtualAddr })
 	mem := ImageMemory{File: MemoryFile, Base: img.BaseAddr}
 	var bytes []byte
+	// The loader maps the header at the base address, the certificate the executable reads its title from inside it
+	if int(img.HeadersSize) > len(img.raw) {
+		return mem, nil, fmt.Errorf("xbe: the header claims %d bytes of a %d byte file", img.HeadersSize, len(img.raw))
+	}
+	if len(order) > 0 && img.BaseAddr+img.HeadersSize > order[0].VirtualAddr {
+		return mem, nil, fmt.Errorf("xbe: the header ends at %08X inside section %s at %08X", img.BaseAddr+img.HeadersSize, order[0].Name, order[0].VirtualAddr)
+	}
+	mem.Sections = append(mem.Sections, ImageSection{Name: "header", VA: img.BaseAddr, Size: img.HeadersSize, Off: 0, Writable: false})
+	bytes = append(bytes, img.raw[:img.HeadersSize]...)
 	for _, s := range order {
 		mem.Sections = append(mem.Sections, ImageSection{Name: s.Name, VA: s.VirtualAddr, Size: s.VirtualSize, Off: uint32(len(bytes)), Writable: s.Flags&0x1 != 0})
 		bytes = append(bytes, s.Data...)
 	}
-	return mem, bytes
+	return mem, bytes, nil
 }
 
 // FindSection returns the section with the given name, or nil.

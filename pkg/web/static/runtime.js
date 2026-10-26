@@ -1,7 +1,7 @@
 import * as THREE from 'three';
-import { DerivedModel, cloneState, makeBuffer, matMul, SceneObject, VertexBuffer, MatrixStack, bitsFromFloat, TS_WORLD, ARCHIVE_TYPE, HEAP_TYPE, ARRAY_ELEMENT } from './derived.js';
-import { DevicePipeline, describeGeometry, describeFVF, primitiveIndices } from './pipeline.js';
-import { VirtualConsole, nativeClasses, dateMembers, NATIVE_DRAW_CLASSES } from './system.js';
+import { DerivedModel, cloneState, makeBuffer, SceneObject, VertexBuffer, IndexBuffer, MatrixStack, bitsFromFloat, ARCHIVE_TYPE, HEAP_TYPE, SCRIPT_VALUE_TYPE, ARRAY_ELEMENT } from './derived.js';
+import { DevicePipeline, describeGeometry, describeFVF, primitiveTriangles, decodeTexels, paletteBytes } from './pipeline.js';
+import { VirtualConsole, nativeClasses, dateMembers } from './system.js';
 
 // ============================================================================
 // XAP Runtime — the dashboard executable's frame loop run over its scene files
@@ -34,9 +34,8 @@ const CLEAR_TARGET = 0xF0;
 
 // The script scope object a loaded scene's post load step creates and fires initialize on
 const SCOPE_TYPE = '$scope';
-// Classes whose fields drive subsystems the runtime provides itself: audio voices, controller input, glyph layout
-// and the console hardware the natives in system.js stand in for
-const RUNTIME_FIELD_CLASSES = new Set(['AudioClip', 'Joystick', 'Text', 'Keyboard', 'DVDPlayer', 'DynamicTexture']);
+// Classes whose fields drive subsystems the runtime provides itself: audio voices, controller input and the idle timer
+const RUNTIME_FIELD_CLASSES = new Set(['AudioClip', 'PeriodicAudioGroup', 'Joystick', 'ScreenSaver']);
 
 // ============================================================================
 // Main entry point
@@ -73,7 +72,10 @@ class XAPRuntime {
     this.nodes = {};           // global DEF name → XAPNode
     this.root = null;          // the scene object the frame draws
     this.frameDraws = [];      // meshes drawn this frame in order
-    this.quadMeshes = new Map(); // vertex buffer → mesh drawn from it
+    this.streamMeshes = new Map(); // vertex buffer → mesh drawn from it
+    this.deviceTextures = new Map(); // the description and Three texture of each texture header the executable created
+    this.unswizzleTables = new Map(); // the swizzled texel each texel reads, by level size
+    this.rangeMeshes = new Map();  // loaded buffer → mesh drawn from a run of its indices
     this.presentParams = 0;    // address of the present parameters the device was created with
     this.tickBase = 0;
     this.archives = new Map(); // archive path → loaded archive object
@@ -89,15 +91,11 @@ class XAPRuntime {
     this.boundJoysticks = [];  // joysticks bound by scripts, the last bound receiving input
     this.running = true;
 
-    // Fonts
-    this.fonts = {}; // fontName → parsed font JSON
-
     // Audio
     this.audioCtx = null;
     this.audioBuffers = {};
     this.playingClips = new Set();
     this.screenSaver = null;
-    this.textRenderers = [];
     this.meshLoads = [];
 
     // Input
@@ -137,16 +135,20 @@ class XAPRuntime {
       const memoryResp = await fetch(`${DATA_BASE}/${renderModel.memory.file}`);
       const startupMemory = new Uint8Array(await memoryResp.arrayBuffer());
       this.console = new VirtualConsole(renderModel.system);
-      // The partition the dashboard runs from is the one the build was given, files and font version included
-      this.console.files = this.config.files || [];
-      this.console.fontVersion = this.config.font_version | 0;
       installDate(this.console);
       this.derived = new DerivedModel(renderModel, this.deviceHost(), startupMemory);
-      this.pipeline = new DevicePipeline(THREE, renderModel, { resolve: (h) => this.resolveTextureHandle(h) });
+      // Routines and library calls named in the page's trace parameter log every call they get
+      for (const name of (new URLSearchParams(window.location.search).get('trace') || '').split(',').filter(Boolean)) {
+        this.derived.traced.add(/^[0-9A-Fa-f]+$/.test(name) ? parseInt(name, 16) : name);
+      }
+      // The page's verify parameter checks every compiled expression against its interpretation
+      this.derived.verify = new URLSearchParams(window.location.search).has('verify');
+      // The page's interp parameter evaluates expressions by interpretation instead of their compiled forms
+      this.derived.interpret = new URLSearchParams(window.location.search).has('interp');
+      this.pipeline = new DevicePipeline(THREE, renderModel, { resolve: (h, palette) => this.resolveTextureHandle(h, palette) });
       this.device = cloneState(this.derived.defaults);
       this.derived.onDraw = (state, env, quad) => this.onDerivedDraw(state, env, quad);
-      this.natives = { ...nativeClasses(this, this.console), ...this.runtimeNativeClasses() };
-      for (const cls of Object.keys(nativeClasses(this, this.console))) RUNTIME_FIELD_CLASSES.add(cls);
+      this.natives = { ...nativeClasses(this), ...this.runtimeNativeClasses() };
       this.installHooks();
       this.checkNatives(renderModel.system.methods);
       for (const t of renderModel.textures) {
@@ -158,17 +160,23 @@ class XAPRuntime {
       _log(`[XBE] ${(startupMemory.length / 1024) | 0} KB of startup memory in ${renderModel.memory.sections.length} sections`);
       _log(`[XBE] ${renderModel.materials.length} materials, ${Object.keys(renderModel.programs).length} vertex programs, ${renderModel.textures.length} procedural textures, ${Object.keys(renderModel.draw.functions).length} routines`);
 
-      await this.loadFonts();
+      await this.loadConsoleFiles();
 
       const loadPromises = this.config.scenes.map(name => this.loadSceneData(name));
       await Promise.allSettled(loadPromises);
       _log(`[XAP] ${Object.keys(this.sceneData).length} scenes loaded`);
 
-      // The device init runs on the executable's renderer object before any scene is built, then the startup
-      // creates the matrix stack the node draws compose their world matrices on.
+      // The static initializers run first, the way the CRT init runs them before main, then the device init runs
+      // on the executable's renderer object before any scene is built, and the startup creates the matrix stack the
+      // node draws compose their world matrices on.
+      for (const va of this.derived.scene.initializers) this.runStartup(va);
+      // The startup links the drive letters and makes the data directories before the renderer is initialized
+      this.runStartup(this.derived.scene.disk);
       this.runRenderer(this.derived.scene.init);
-      // The main load fills the caller's path buffer with the scene file it opens.
-      this.runRenderer(this.derived.scene.main_load, [{ obj: new SceneObject(HEAP_TYPE, null), off: 0 }]);
+      // The main load fills the caller's path buffer with the scene file it opens, taking the renderer again where
+      // its startup passes that too
+      const sc = this.derived.scene;
+      this.runRenderer(sc.main_load, sc.main_load_args.map((role) => (role === 'renderer' ? sc.renderer : { obj: new SceneObject(HEAP_TYPE, null), off: 0 })));
       this.derived.memory.store(this.derived.scene.matrix_stack, 4, { matrixStack: new MatrixStack() });
       this.rootGlobal = this.findRootGlobal();
 
@@ -219,6 +227,13 @@ class XAPRuntime {
     return this.presentParams;
   }
 
+  // Runs a startup routine that takes no object, as the CRT init calls the static initializers
+  runStartup(va) {
+    const parent = this.derived.newEnv(null);
+    parent.state = this.device;
+    return this.derived.run(va, null, [], this.device, parent);
+  }
+
   // Runs a renderer routine on the executable's static renderer object
   runRenderer(va, args = []) {
     const sc = this.derived.scene;
@@ -246,8 +261,6 @@ class XAPRuntime {
   // Runtime implementations of the routines the model keeps as calls
   installHooks() {
     const d = this.derived, sc = d.scene;
-    d.hook(d.drawSlotFunction('Text'), (thisVal, args, state) => { this.onDerivedTextDraw(this.objectOf(thisVal), state); return 0; });
-    d.hook(d.typeSlot('DynamicTexture', d.draw.texture_slot), (thisVal) => this.dynamicTextureHandle(this.objectOf(thisVal)));
     d.hook(sc.group.draw, (thisVal, args, state, env) => { this.drawChildren(this.objectOf(thisVal), state, env); return 0; });
     d.hook(sc.group.tick, (thisVal, args, state, env) => { this.tickChildren(this.objectOf(thisVal), args[0], state, env); return 0; });
     const element = (thisVal, args) => this.arrayElement(thisVal, d.int(args[0]));
@@ -274,35 +287,26 @@ class XAPRuntime {
     d.hook(sc.scene_load.populate, (thisVal, args) => { this.populateInline(this.receiverOf(thisVal, args).node); return 1; });
     d.hook(sc.scene_load.new_scope, (thisVal, args) => ({ obj: new SceneObject(SCOPE_TYPE, this.receiverOf(thisVal, args).node), off: 0 }));
     d.hook(sc.scene_load.attach, () => 0);
-    // The runtime loads geometry itself, so a node's load hands back the buffer it holds and nothing else
+    // The runtime loads geometry and image files itself, so a node's load hands back the buffer it holds and nothing
+    // else, except in a class that creates a device texture its own routines fill, whose load runs from the image
     for (const nt of Object.values(d.types)) {
       const slots = nt.slots || [];
       const va = slots[d.draw.load_slot / 4];
-      if (va) d.hook(va, (thisVal) => this.objectOf(thisVal).slots.get(d.accessor.offset) || 0);
+      if (va && !nt.own_texture) d.hook(va, (thisVal) => d.readField(this.objectOf(thisVal), d.accessor.offset, 4) || 0);
     }
     // Allocators hand back fresh zeroed memory the paths then fill by field offset.
     for (const va of d.model.allocators) d.hook(va, () => ({ obj: new SceneObject(HEAP_TYPE, null), off: 0 }));
-    // The device creation keeps the present parameters the init filled in.
+    // The device creation runs from the image, the runtime keeping the present parameters the init filled in
     d.hook = d.hook.bind(d);
     const perform = d.performCall.bind(d);
-    d.performCall = (fn, argIdx, thisIdx, env, seq) => {
+    d.performCall = (fn, argIdx, thisIdx, env, seq, target) => {
       if (fn === 'Direct3D_CreateDevice') {
         const params = d.eval(argIdx[4], env);
         if (typeof params !== 'number') throw new Error(`device created with present parameters at ${JSON.stringify(params)}`);
         this.presentParams = params;
-        this.createDevice();
-        return 0;
       }
-      return perform(fn, argIdx, thisIdx, env, seq);
+      return perform(fn, argIdx, thisIdx, env, seq, target);
     };
-  }
-
-  // The creation fills the static device's surfaces, a build using the XDK getters instead keeping no device layout
-  createDevice() {
-    const d = this.derived, layout = d.model.device;
-    if (!layout.global) return;
-    d.memory.store(layout.global, 4, layout.object);
-    for (const field of layout.surfaces) d.memory.store(layout.object + field, 4, { device: 'surface', field });
   }
 
   objectOf(v) {
@@ -314,7 +318,10 @@ class XAPRuntime {
   // Joins the path a helper was handed onto its base and writes the result where its output points
   joinPath(thisVal, args, env) {
     const d = this.derived, j = d.scene.scene_load.join;
-    const input = (i) => (i === 0 ? thisVal : args[i - 1]);
+    const input = (i) => {
+      const v = i === 0 ? thisVal : args[i - 1];
+      return v instanceof SceneObject ? { obj: v, off: 0 } : v;
+    };
     const base = input(j.base);
     const joined = joinPaths(d.string(input(j.src)), typeof base === 'number' && base === 0 ? null : d.string(base));
     d.storeString(input(j.out), joined, env);
@@ -433,7 +440,7 @@ class XAPRuntime {
     const d = this.derived;
     const loader = d.functions.get(d.scene.inline_load);
     if (!loader) throw new Error('the inline load routine is not summarized');
-    for (const [off, value] of this.loadedArchiveFields()) archive.slots.set(off, value);
+    for (const [off, value] of this.loadedArchiveFields()) archive.mem.store(off, 4, value);
     this.archives.set(key, archive);
     return { obj: archive };
   }
@@ -453,7 +460,7 @@ class XAPRuntime {
           if (b && b.k === 'i' && this.loadsInlineArchive(a.a)) reads.set(b.v, n.size);
         }
       }
-      for (const key of ['a', 'b', 'addr', 'this']) if (n[key] !== undefined) walk(n[key]);
+      for (const key of ['a', 'b', 'c', 'addr', 'this']) if (n[key] !== undefined) walk(n[key]);
       for (const key of ['args', 'elems']) if (n[key]) for (const x of n[key]) walk(x);
     };
     for (const va of [inline.slots[d.draw.slot / 4], inline.slots[sc.tick_slot / 4]]) {
@@ -515,18 +522,19 @@ class XAPRuntime {
     }
   }
 
-  async loadFonts() {
-    const fontFiles = [
-      { file: 'Xbox', role: 'heading' },
-      { file: 'XBox_Book', role: 'body' },
-    ];
-    for (const { file, role } of fontFiles) {
-      const resp = await fetch(`${DATA_BASE}/fonts/${file}.json`);
-      if (!resp.ok) throw new Error(`font ${file} is not exported`);
-      const fontData = await resp.json();
-      this.fonts[role] = fontData;
-      _log(`[XTF] Loaded font "${fontData.name}" as ${role}`);
+  // Fetches the font files the dashboard opens through the console's file routines, which the build copied, and
+  // lays the partition the dashboard runs from out of them and the other files the build listed
+  async loadConsoleFiles() {
+    const files = this.config.files || [];
+    const data = new Map();
+    for (const name of files) {
+      if (!name.toLowerCase().endsWith('.xtf')) continue;
+      const resp = await fetch(`${DATA_BASE}/files/${name.replace(/\\/g, '/')}`);
+      if (!resp.ok) throw new Error(`console file ${name} was not copied by the build`);
+      data.set(name.toLowerCase(), new Uint8Array(await resp.arrayBuffer()));
+      _log(`[XTF] Loaded ${name} for the dashboard's own font loader`);
     }
+    this.derived.consoleApi.attachFiles(files, data);
   }
 
   async loadSceneData(name) {
@@ -588,12 +596,6 @@ class XAPRuntime {
     const appData = extractNode(f.appearance);
     if (geomData) {
       this.buildGeometry(node, geomData, appData, archiveName);
-    }
-
-    if (f.font !== undefined && !geomData) {
-      const tr = new TextRenderer(this, node, String(f.font), this.fonts, this.pipeline.createMaterial(), String(f.justify || 'left'));
-      node._textRenderer = tr;
-      this.textRenderers.push(tr);
     }
 
     if (f.url !== undefined && typeof f.url === 'string' && f.url.match(/\.wav$/i)) {
@@ -707,12 +709,7 @@ class XAPRuntime {
     }
 
     if (geomFields.font !== undefined) {
-      const fontName = geomFields.font || 'Body';
-      const justify = geomFields.justify || 'left';
-      const tr = new TextRenderer(this, geomNode, String(fontName), this.fonts, material, String(justify));
-      node._textRenderer = tr;
-      geomNode._textRenderer = tr;
-      this.textRenderers.push(tr);
+      // A text geometry draws itself through its own class draw, which the shape draw dispatches to
       return;
     }
 
@@ -728,12 +725,15 @@ class XAPRuntime {
     throw new Error(`geometry node ${geomData.type} has neither a mesh url, text nor a radius`);
   }
 
-  // Gives a geometry node the loaded buffer object its draw path dereferences
+  // Gives a geometry node the loaded buffer object its draw path dereferences, its indices as the bytes the executable addresses
   attachBuffer(geomNode, geometry, mesh, desc) {
+    const index = mesh.geometry.index.array;
+    const indices = index instanceof Uint16Array ? index : Uint16Array.from(index);
+    geometry.indexBuffer = new IndexBuffer(0, 2, new Uint8Array(indices.buffer, indices.byteOffset, indices.byteLength));
     const buffer = makeBuffer(this.derived.model, geometry);
     buffer.mesh = mesh;
     buffer.desc = desc;
-    geomNode.derivedObject().slots.set(this.derived.accessor.offset, { obj: buffer });
+    geomNode.derivedObject().mem.store(this.derived.accessor.offset, 4, { obj: buffer });
   }
 
   // Builds a sphere in the layout the executable stores: position, packed normal and a zero diffuse
@@ -774,7 +774,7 @@ class XAPRuntime {
       const url = getField(texData, 'url');
       if (url) {
         const tex = this.loadTexture(url);
-        texNode.derivedObject().slots.set(this.derived.draw.texture_field, { xapTexture: tex });
+        texNode.derivedObject().mem.store(this.derived.draw.texture_field, 4, { xapTexture: tex });
       }
     }
     return appNode;
@@ -794,82 +794,185 @@ class XAPRuntime {
     return node;
   }
 
-  // Resolves a texture handle the derived paths bound at a stage
-  resolveTextureHandle(handle) {
+  // Resolves a texture handle the derived paths bound at a stage, a texture the executable created through the
+  // palette bound beside it
+  resolveTextureHandle(handle, palette) {
     if (handle && handle.texture !== undefined) {
       const tex = this.proceduralTextures[handle.texture];
       if (!tex) throw new Error(`procedural ${handle.texture} was not exported`);
       return tex;
     }
     if (handle && handle.xapTexture !== undefined) return handle.xapTexture;
+    if (handle && handle.obj !== undefined) return this.deviceTexture(handle, palette);
     throw new Error(`texture handle ${JSON.stringify(handle)} has no runtime texture`);
   }
 
-  // Applies the device state at a draw call to the mesh being drawn and queues it for the frame
-  onDerivedDraw(state, env, quad) {
-    if (quad) {
-      this.drawQuad(state, quad);
-      return;
+  // The texture Three samples for one the executable created and filled, decoded again whenever physical memory changed
+  deviceTexture(header, palette) {
+    const phys = this.derived.memory.physical;
+    let tex = this.deviceTextures.get(header.obj);
+    if (!tex) {
+      tex = this.describeDeviceTexture(header);
+      this.deviceTextures.set(header.obj, tex);
     }
-    const buffer = env.this && env.this.obj !== undefined ? env.this.obj : env.this;
-    if (!buffer || !buffer.mesh) throw new Error(`indexed draw from ${buffer ? buffer.type : 'nothing'} which holds no mesh`);
-    this.pipeline.update(buffer.mesh.material, state, buffer.desc);
-    this.frameDraws.push(buffer.mesh);
+    if (tex.stamp === phys.store.writes) return tex.three;
+    const texels = phys.store.bytes(phys.physical(tex.data), tex.width * tex.height * tex.bpp);
+    const entries = palette === undefined ? null : this.paletteEntries(palette, tex.format);
+    decodeTexels(tex.format, tex.bpp, texels, tex.unswizzled, entries, tex.three.image.data);
+    tex.stamp = phys.store.writes;
+    tex.three.needsUpdate = true;
+    return tex.three;
   }
 
-  // Draws a range of the vertex buffer the executable filled through a lock
-  drawQuad(state, quad) {
+  // Describes the top level of a texture the executable created through the image's own routines: its description,
+  // the bytes a texel of its format takes, whether that format is swizzled and the texel each swizzled one lands on
+  describeDeviceTexture(header) {
+    const d = this.derived, layout = d.model.surface_desc, resource = d.model.resource;
+    if (!resource) throw new Error('the image carries no resource routine naming where a texture keeps its data');
+    const desc = { obj: new SceneObject(HEAP_TYPE, null), off: 0 };
+    if (d.imageRoutine('D3DTexture_GetLevelDesc') !== undefined) d.callImage('D3DTexture_GetLevelDesc', [header, 0, desc], this.device);
+    else {
+      // A build without the level description describes the level's surface, which it hands out and takes back
+      const slot = { obj: new SceneObject(HEAP_TYPE, null), off: 0 };
+      d.callImage('D3DTexture_GetSurfaceLevel', [header, 0, slot], this.device);
+      const surface = d.readField(slot.obj, 0, 4);
+      d.callImage('D3DSurface_GetDesc', [surface, desc], this.device);
+      d.callImage('D3DResource_Release', [surface], this.device);
+    }
+    const format = d.int(d.readField(desc.obj, layout.format, 4));
+    const width = d.int(d.readField(desc.obj, layout.width, 4)), height = d.int(d.readField(desc.obj, layout.height, 4));
+    const bpp = d.int(d.callImage('XGBytesPerPixelFromFormat', [format], this.device));
+    if (d.int(d.callImage('XGIsSwizzledFormat', [format], this.device)) === 0) throw new Error(`texture format 0x${format.toString(16)} is linear, and the GPU model reads swizzled textures by the image's unswizzle`);
+    const three = new THREE.DataTexture(new Uint8Array(width * height * 4), width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+    three.flipY = false;
+    three.colorSpace = THREE.NoColorSpace;
+    three.generateMipmaps = false;
+    three.minFilter = THREE.LinearFilter;
+    three.magFilter = THREE.LinearFilter;
+    const data = (d.int(d.readField(header.obj, resource.data, 4)) | resource.alias) >>> 0;
+    return { format, width, height, bpp, data, unswizzled: this.unswizzling(width, height, bpp), three, stamp: -1 };
+  }
+
+  // The swizzled texel each texel of a level reads, found by having the image's own XGUnswizzleRect move texels whose
+  // bytes carry their own swizzled index, one byte of that index per run
+  unswizzling(width, height, bpp) {
+    const key = `${width}x${height}x${bpp}`;
+    const known = this.unswizzleTables.get(key);
+    if (known) return known;
+    const d = this.derived, phys = d.memory.physical, count = width * height, bytes = count * bpp;
+    const table = new Uint32Array(count);
+    const src = phys.allocate(bytes, 0, 0xFFFFFFFF, 0), dst = phys.allocate(bytes, 0, 0xFFFFFFFF, 0);
+    if (src === 0 || dst === 0) throw new Error(`no physical memory holds the ${bytes} bytes the unswizzle of a ${key} texture moves`);
+    try {
+      const from = new Uint8Array(bytes);
+      for (let shift = 0; shift === 0 || (count - 1) >>> shift > 0; shift += 8) {
+        for (let t = 0; t < count; t++) from.fill((t >>> shift) & 255, t * bpp, t * bpp + bpp);
+        phys.store.setBytes(phys.physical(src), from);
+        d.callImage('XGUnswizzleRect', [src, width, height, 0, dst, width * bpp, 0, bpp], this.device);
+        const to = phys.store.bytes(phys.physical(dst), bytes);
+        for (let p = 0; p < count; p++) table[p] += to[p * bpp] * 2 ** shift;
+      }
+    } finally {
+      phys.free(src);
+      phys.free(dst);
+    }
+    this.unswizzleTables.set(key, table);
+    return table;
+  }
+
+  // The palette entries a texture of a format can index, read where the image's own resource routines reach a
+  // resource's data
+  paletteEntries(palette, format) {
+    const d = this.derived, resource = d.model.resource, phys = d.memory.physical;
+    if (!palette || palette.obj === undefined) throw new Error(`palette ${JSON.stringify(palette)} is no resource the executable created`);
+    const at = (d.int(d.readField(palette.obj, resource.data, 4)) | resource.alias) >>> 0;
+    return phys.store.bytes(phys.physical(at), paletteBytes(format));
+  }
+
+  // Applies the device state at a draw call to the geometry it draws and queues that for the frame
+  onDerivedDraw(state, env, draw) {
+    const base = state.baseVertex || 0;
+    const buffer = env.this && env.this.obj !== undefined ? env.this.obj : env.this;
+    if (buffer instanceof SceneObject && buffer.mesh) { this.drawLoaded(buffer, state, draw, env, base); return; }
+    const run = draw.indices === undefined ? Array.from({ length: draw.count }, (_, i) => draw.start + i) : this.readIndices(draw.indices, draw.count, env).map((i) => i + base);
+    this.drawStream(state, primitiveTriangles(draw.primitive, run));
+  }
+
+  // The indices an indexed draw reads from the pointer it was handed
+  readIndices(p, count, env) {
+    const out = new Array(count);
+    const bytes = p && p.raw !== undefined && p.raw.indexBytes ? p.raw.indexBytes : 2;
+    if (p && p.raw !== undefined) {
+      const view = p.raw.view, off = p.off || 0;
+      if (off + count * bytes > p.raw.bytes.length) throw new Error(`index run of ${count} at +0x${off.toString(16)} outside the ${p.raw.bytes.length} bytes of its buffer`);
+      for (let i = 0; i < count; i++) out[i] = bytes === 4 ? view.getUint32(off + 4 * i, true) : view.getUint16(off + 2 * i, true);
+      return out;
+    }
+    for (let i = 0; i < count; i++) out[i] = this.derived.int(this.derived.loadLive(env, this.derived.offsetPointer(p, 2 * i), 2));
+    return out;
+  }
+
+  // Draws a loaded mesh, the whole of it through its own geometry and a run of its indices through a copy
+  drawLoaded(buffer, state, draw, env, base) {
+    const whole = buffer.mesh.geometry.index.count;
+    const own = draw.indices !== undefined && draw.indices.raw === buffer.geometry.indexBuffer;
+    const off = draw.indices === undefined ? 0 : (draw.indices.off || 0);
+    if (own && off === 0 && draw.count === whole && !base) {
+      this.pipeline.update(buffer.mesh.material, state, buffer.desc);
+      this.frameDraws.push(buffer.mesh);
+      return;
+    }
+    // A run of the mesh's own indices is named by where it lies, indices from elsewhere by what they hold
+    let entry = this.rangeMeshes.get(buffer);
+    const key = own ? `${draw.primitive}:${off}:${draw.count}:${base}` : null;
+    if (entry && key !== null && entry.key === key) {
+      this.pipeline.update(entry.mesh.material, state, buffer.desc);
+      this.frameDraws.push(entry.mesh);
+      return;
+    }
+    const run = draw.indices === undefined ? Array.from({ length: draw.count }, (_, i) => draw.start + i) : this.readIndices(draw.indices, draw.count, env).map((i) => i + base);
+    const triangles = primitiveTriangles(draw.primitive, run);
+    const fullKey = key !== null ? key : triangles.join(',');
+    if (!entry || entry.key !== fullKey) {
+      const geometry = buffer.mesh.geometry.clone();
+      geometry.setIndex(triangles);
+      const mesh = new THREE.Mesh(geometry, entry ? entry.mesh.material : this.pipeline.createMaterial());
+      detachFromThree(mesh);
+      if (entry) entry.mesh.geometry.dispose();
+      entry = { mesh, key: fullKey };
+      this.rangeMeshes.set(buffer, entry);
+    }
+    this.pipeline.update(entry.mesh.material, state, buffer.desc);
+    this.frameDraws.push(entry.mesh);
+  }
+
+  // Draws triangles over the vertex buffer the executable filled through a lock, its geometry refreshed in place
+  drawStream(state, triangles) {
     const stream = state.stream;
     if (!stream || !stream.vb) throw new Error(`vertex draw from ${JSON.stringify(stream)} which is no vertex buffer`);
     const vb = stream.vb;
     const fvf = typeof state.program === 'number' ? state.program : vb.fvf;
     const desc = describeFVF(fvf);
     if (desc.stride !== state.streamStride) throw new Error(`vertex format 0x${fvf.toString(16)} is ${desc.stride} bytes but the stream stride is ${state.streamStride}`);
-    const key = vb;
-    let entry = this.quadMeshes.get(key);
-    const indices = primitiveIndices(quad.primitive, quad.start, quad.count);
-    if (!entry || entry.version !== vb.version || entry.fvf !== fvf || entry.indices !== indices.join(',')) {
+    let entry = this.streamMeshes.get(vb);
+    if (!entry || entry.fvf !== fvf) {
       const count = vb.bytes.length / desc.stride;
       const geometry = new THREE.BufferGeometry();
-      const view = vb.view;
-      for (const a of desc.attributes) {
-        const data = new Float32Array(count * a.comps);
-        for (let v = 0; v < count; v++) {
-          const base = v * desc.stride + a.offset;
-          if (a.source === 'color') {
-            const c = view.getUint32(base, true);
-            data[v * 4] = ((c >>> 16) & 255) / 255; data[v * 4 + 1] = ((c >>> 8) & 255) / 255; data[v * 4 + 2] = (c & 255) / 255; data[v * 4 + 3] = (c >>> 24) / 255;
-          } else {
-            for (let k = 0; k < a.comps; k++) data[v * a.comps + k] = view.getFloat32(base + 4 * k, true);
-          }
-        }
-        geometry.setAttribute('a_' + a.offset, new THREE.BufferAttribute(data, a.comps));
-      }
-      geometry.setIndex(indices);
+      for (const a of desc.attributes) geometry.setAttribute('a_' + a.offset, new THREE.BufferAttribute(new Float32Array(count * a.comps), a.comps));
       const mesh = new THREE.Mesh(geometry, entry ? entry.mesh.material : this.pipeline.createMaterial());
       detachFromThree(mesh);
       if (entry) entry.mesh.geometry.dispose();
-      entry = { mesh, version: vb.version, fvf, indices: indices.join(',') };
-      this.quadMeshes.set(key, entry);
+      entry = { mesh, version: -1, fvf, wide: count > 0x10000 };
+      this.streamMeshes.set(vb, entry);
     }
+    if (vb.dirtyHi > vb.dirtyLo) {
+      fillStreamAttributes(entry.mesh.geometry, vb, desc);
+      vb.dirtyLo = vb.bytes.length;
+      vb.dirtyHi = 0;
+    }
+    setStreamIndex(entry.mesh.geometry, triangles, entry.wide);
     this.pipeline.update(entry.mesh.material, state, desc);
     this.frameDraws.push(entry.mesh);
-  }
-
-  // The glyph draw happens between the render states the executable's text draw routine sets
-  onDerivedTextDraw(obj, state) {
-    const tr = obj.node._textRenderer;
-    if (!tr) throw new Error(`text draw on ${obj.node.data.def || obj.node.data.type} which renders no text`);
-    const td = this.derived.draw.text_draw;
-    for (const [index, value] of td.before) this.derived.setRenderState(state, index, value);
-    tr.update();
-    if (tr.layoutMesh) {
-      const snapshot = cloneState(state);
-      snapshot.transforms[TS_WORLD] = matMul(Float32Array.from(tr.layoutMesh.matrix.elements), state.transforms[TS_WORLD]);
-      this.pipeline.update(tr.material, snapshot, TEXT_GEOMETRY, true);
-      this.frameDraws.push(tr.layoutMesh);
-    }
-    for (const [index, value] of td.after) this.derived.setRenderState(state, index, value);
   }
 
   // Shows the frame the executable just drew, fitted to the display shape the console would show it in
@@ -881,7 +984,7 @@ class XAPRuntime {
     const canvas = this.renderer.domElement;
     const width = this.derived.memory.load(this.presentParamsAddress() + PRESENT_WIDTH, 4);
     const height = this.derived.memory.load(this.presentParamsAddress() + PRESENT_HEIGHT, 4);
-    const aspect = (this.console.videoFlags() & VIDEO_FLAG_WIDESCREEN) ? DISPLAY_ASPECT_WIDE : DISPLAY_ASPECT_NORMAL;
+    const aspect = (this.derived.consoleApi.videoFlags() & VIDEO_FLAG_WIDESCREEN) ? DISPLAY_ASPECT_WIDE : DISPLAY_ASPECT_NORMAL;
     const cw = canvas.clientWidth, ch = canvas.clientHeight;
     let vw = cw, vh = cw / aspect;
     if (vh > ch) { vh = ch; vw = ch * aspect; }
@@ -1087,8 +1190,6 @@ class XAPRuntime {
 
   // Natives the runtime implements through its audio machinery and the executable's own native routines
   runtimeNativeClasses() {
-    const unimplemented = (cls, names) => Object.fromEntries(names.map((n) => [n, () => { throw new Error(`${cls}.${n} is registered by the executable but the runtime does not implement it`); }]));
-    const derivedNative = (va) => (node, ...args) => this.runNative(va, node, args);
     const classes = {
       AudioClip: {
         Play: (node) => node._play(),
@@ -1098,23 +1199,54 @@ class XAPRuntime {
         getMinutes: (node) => Math.floor(node._playbackSeconds() / 60),
         getSeconds: (node) => Math.floor(node._playbackSeconds()) % 60,
       },
-      Keyboard: unimplemented('Keyboard', this.derived.model.system.methods.Keyboard),
-      DVDPlayer: unimplemented('DVDPlayer', this.derived.model.system.methods.DVDPlayer),
     };
-    for (const [cls, fns] of Object.entries(this.derived.scene.natives)) {
-      classes[cls] = classes[cls] || {};
-      for (const [name, va] of Object.entries(fns)) classes[cls][name] = derivedNative(va);
+    for (const [cls, names] of Object.entries(this.derived.model.system.methods)) {
+      if (RUNTIME_FIELD_CLASSES.has(cls) || SCRIPT_OBJECT_PROTOTYPES[cls]) continue;
+      classes[cls] = {};
+      for (const name of names) classes[cls][name] = (node, ...args) => this.callNative(cls, name, node, args);
     }
     return classes;
   }
 
-  // Runs one of the executable's script natives on a node with float arguments
-  runNative(va, node, args) {
-    const d = this.derived;
-    const parent = d.newEnv(null);
+  // An environment for routines the runtime enters on the executable's behalf
+  hostEnv() {
+    const parent = this.derived.newEnv(null);
     parent.state = this.device;
-    const bits = args.map((a) => bitsFromFloat(Number(a)));
-    return d.run(va, node.derivedObject(), bits, this.device, parent);
+    return parent;
+  }
+
+  // Calls a script native through the executable's own dispatcher, which converts the boxed arguments for it
+  callNative(cls, name, node, args) {
+    const d = this.derived, s = d.scene.script;
+    const index = d.model.system.methods[cls].indexOf(name);
+    if (index < 0) throw new Error(`${cls} registers no native ${name}`);
+    const argv = d.heapObject(4 * Math.max(args.length, 1)).obj;
+    args.forEach((a, i) => d.writeField(argv, 4 * i, this.scriptValue(a), 4));
+    return this.scriptResult(d.run(s.call, node.derivedObject(), [index, { obj: argv, off: 0 }, args.length], this.device, this.hostEnv()));
+  }
+
+  // A script argument as the dispatcher receives it: a node as its object, anything else as the engine's value
+  scriptValue(a) {
+    if (a === undefined || a === null) return 0;
+    if (typeof a === 'object' && a.__xapNode) return { obj: a.__xapNode.derivedObject(), off: 0 };
+    const obj = new SceneObject(SCRIPT_VALUE_TYPE, null);
+    obj.scriptValue = a;
+    return { obj, off: 0 };
+  }
+
+  // Reads the value object a native handed back as the script value it boxes
+  scriptResult(v) {
+    const d = this.derived, s = d.scene.script;
+    if (v === 0 || v === undefined || v === null) return undefined;
+    if (!v || v.obj === undefined) throw new Error(`a native returned ${JSON.stringify(v)} which is no value object`);
+    const vt = d.int(d.readField(v.obj, 0, 4));
+    if (vt === s.number_vtable) return floatFromBits(d.int(d.readField(v.obj, s.number_field, 4)));
+    if (vt === s.string_vtable) {
+      // A value whose characters were never set holds the empty string
+      const chars = d.readField(v.obj, s.string_field, 4);
+      return d.int(chars) === 0 ? '' : d.string(chars);
+    }
+    throw new Error(`a native returned a value with vtable ${vt.toString(16)}, neither a number nor a string`);
   }
 
   // Every method a class registers must be implemented, the script object classes being the engine's own
@@ -1149,11 +1281,6 @@ class XAPRuntime {
       const entry = geometry.userData.entry;
       this.attachBuffer(node, { format: entry.format, stride: entry.stride, primitiveCount: entry.indexCount / 3 }, shape._mesh, geometry.userData.desc);
     });
-  }
-
-  // The texture handle a dynamic texture node hands the appearance draw
-  dynamicTextureHandle(obj) {
-    throw new Error(`dynamic texture ${obj.node.data.def || 'DynamicTexture'} is not rendered by the runtime`);
   }
 
   // ========================================================================
@@ -1274,9 +1401,9 @@ class XAPRuntime {
     this.pollGamepad();
     this.updateAudio();
     if (this.screenSaver) this.screenSaver.tick(dt);
-    for (const tr of this.textRenderers) tr.tick(dt);
     try {
       this.frameDraws = [];
+      this.derived.work = 0;
       this.runRenderer(this.derived.scene.tick);
       this.runRenderer(this.derived.scene.frame);
     } catch (err) {
@@ -1298,6 +1425,7 @@ class XAPRuntime {
         const progress = Math.min(seconds / duration, 1);
         if (progress !== node._fields.progress) {
           node._fields.progress = progress;
+          node._fieldsVersion++;
           this.fireEvent(node, 'OnProgressChanged');
         }
       }
@@ -1319,7 +1447,6 @@ class XAPNode {
     this.runtime = runtime;
     this.archiveName = archiveName;
     this._mesh = null;
-    this._textRenderer = null;
     this._isBound = false;
     this._eventHandlers = null;
     this._audioUrl = '';
@@ -1329,6 +1456,7 @@ class XAPNode {
     this._archive = '';
     this._sceneName = '';
     this._fields = {};
+    this._fieldsVersion = 0;
     this._xapChildren = []; // ordered list of XAPNodes from children[] and buildScene
     this._fieldNodes = {}; // node valued fields such as a level's control, path and shell
     this._fieldLists = {}; // multi node fields such as a switch's choices
@@ -1358,7 +1486,6 @@ class XAPNode {
         if (s === '__xapNode') return target;
         if (s === 'children') return target._getChildProxies();
         if (s === 'transportMode') return target._transportMode;
-        if (s === 'text') return target._textRenderer ? target._textRenderer.text : (target._fields.text || '');
         if (s === 'string') return target._fields.string || '';
         if (s === 'isBound' && target.data.type === 'Joystick') return target._isBound;
         if (s === 'volume') return target._audioVolume;
@@ -1379,8 +1506,8 @@ class XAPNode {
         if (s === 'texture') return target._getTextureProxy();
         if (s === 'geometry') return target._getGeometryProxy();
 
-        if (target._fields[s] !== undefined) return target._fields[s];
         const field = RUNTIME_FIELD_CLASSES.has(target.data.type) ? null : target.runtime.derived.fieldByName(target.data.type, s);
+        if (target._fields[s] !== undefined) return target.sceneFieldValue(s, field);
         if (field) return target.readDerivedField(field);
 
         const child = target._findChildByDef(s);
@@ -1407,15 +1534,12 @@ class XAPNode {
         if (s === 'url' && target.data.type === 'AudioClip') {
           target._audioUrl = String(value);
           target._fields.url = value;
-          return true;
-        }
-        if (s === 'text') {
-          target._fields.text = value;
-          if (target._textRenderer) target._textRenderer.setText(String(value));
+          target._fieldsVersion++;
           return true;
         }
         if (s === 'string') {
           target._fields.string = value;
+          target._fieldsVersion++;
           return true;
         }
         if (s === 'isBound' && target.data.type === 'Joystick') {
@@ -1448,6 +1572,16 @@ class XAPNode {
 
   _getChildProxies() {
     return this._xapChildren.map(n => n.proxy);
+  }
+
+  // A scene file field as a script reads it, a node valued one being the node the object points at
+  sceneFieldValue(name, field) {
+    if (field && field.type === FIELD_NODE) return this.readDerivedField(field);
+    const raw = this._fields[name];
+    const data = extractNode(raw);
+    if (data) return this.runtime.nodeFor(data, this.archiveName).proxy;
+    if (Array.isArray(raw) && raw.some((v) => extractNode(v))) return this.fieldNodeList(name).map((n) => n.proxy);
+    return raw;
   }
 
   // The nodes a multi node field holds
@@ -1544,23 +1678,24 @@ class XAPNode {
       if (store) this.storeField(field, value);
     }
     this._fields[name] = value;
+    this._fieldsVersion++;
     if (this.data.type === 'ImageTexture' && name === 'url') {
-      this.derivedObject().slots.set(d.draw.texture_field, { xapTexture: this.runtime.loadTexture(String(value)) });
+      this.derivedObject().mem.store(d.draw.texture_field, 4, { xapTexture: this.runtime.loadTexture(String(value)) });
     }
   }
 
   // The generic field store the executable performs after the hook allows it
   storeField(field, value) {
-    const obj = this.derivedObject();
+    const mem = this.derivedObject().mem;
     switch (field.type) {
-      case FIELD_BOOL: obj.slots.set(field.off, value ? 1 : 0); break;
-      case FIELD_INT: obj.slots.set(field.off, Number(value) >>> 0); break;
-      case FIELD_NUMBER: obj.slots.set(field.off, bitsFromFloat(Number(value))); break;
-      case FIELD_STRING: obj.slots.set(field.off, { str: String(value) }); break;
-      case FIELD_NODE: obj.slots.set(field.off, this.fieldNodeValue(value)); break;
-      case FIELD_VEC3: case FIELD_COLOR: obj.slots.set(field.off, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2])])); break;
-      case FIELD_ROTATION: obj.slots.set(field.off, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2]), Number(value[3])])); break;
-      default: obj.slots.delete(field.off);
+      case FIELD_BOOL: mem.store(field.off, 1, value ? 1 : 0); break;
+      case FIELD_INT: mem.store(field.off, 4, Number(value) >>> 0); break;
+      case FIELD_NUMBER: mem.store(field.off, 4, bitsFromFloat(Number(value))); break;
+      case FIELD_STRING: mem.store(field.off, 4, { str: String(value) }); break;
+      case FIELD_NODE: mem.store(field.off, 4, this.fieldNodeValue(value)); break;
+      case FIELD_VEC3: case FIELD_COLOR: mem.store(field.off, 12, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2])])); break;
+      case FIELD_ROTATION: mem.store(field.off, 16, Float32Array.from([Number(value[0]), Number(value[1]), Number(value[2]), Number(value[3])])); break;
+      default: throw new Error(`field ${field.name} of ${this.data.type} has scene type ${field.type} which the runtime does not store`);
     }
   }
 
@@ -1592,9 +1727,13 @@ class XAPNode {
     return Math.max(0, at - this._startedAt);
   }
 
+  // Keeps the mode in the executable's clip object as well, where its visualizer reads it
   _setTransportMode(mode) {
     if (this._transportMode === mode) return;
     this._transportMode = mode;
+    const d = this.runtime.derived, field = d.fieldByName(this.data.type, 'transportMode');
+    if (!field) throw new Error(`${this.data.type} declares no transportMode field`);
+    this.derivedObject().mem.store(field.off, 4, mode >>> 0);
     this.runtime.fireEvent(this, 'OnTransportModeChanged');
   }
 
@@ -1849,261 +1988,8 @@ class ScreenSaverTimer {
 }
 
 // ============================================================================
-// Text Renderer — glyph layout following the executable's text draw routine
-// ============================================================================
-
-const TEXT_LINE_ADVANCE = 1.0, TEXT_SOFT_LINE_ADVANCE = 1.5, TEXT_SCROLL_GAP = 1.5, TEXT_COLUMN_FADE = 2.0, TEXT_OVERFLOW_FADE = 1.0, TEXT_BOX_MARGIN = 2.0;
-const TEXT_SMALL_GLYPH_INDEX = 190, TEXT_SMALL_GLYPH_SCALE = 0.9, TEXT_HIGHLIGHT_ALPHA = 0.5;
-const CLOCK_TOKEN = '<clock>';
-const TAB = String.fromCharCode(9), CR = String.fromCharCode(13), LF = String.fromCharCode(10);
-
-class TextRenderer {
-  constructor(runtime, node, fontName, fontCache, material, justify) {
-    this.runtime = runtime;
-    this.node = node;
-    this.fontName = fontName;
-    this.fontCache = fontCache;
-    this.material = material;
-    this.justify = justify;
-    this.text = '';
-    this.builtKey = null;
-    this.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
-    this.scrollStart = 0;
-    this.layoutMesh = null;
-    this.basePositions = null;
-    this.alphas = null;
-    this.setText(String(node._fields.text ?? ''));
-  }
-
-  setText(text) {
-    this.text = text;
-    this.node._fields.scroll = 0;
-    this.scrollStart = 0;
-  }
-
-  // Scene values win, constructor defaults stand in for omitted fields
-  field(name) {
-    const v = this.node._fields[name];
-    return v === undefined ? this.runtime.derived.defaultField('Text', name) : v;
-  }
-
-  // The string the glyphs spell: the clock token becomes the time, translated text comes from the tables
-  displayString() {
-    if (this.text.startsWith(CLOCK_TOKEN)) return this.runtime.console.formatClock();
-    return this.field('translate') ? this.runtime.console.translate(this.runtime.console.language, this.text) : this.text;
-  }
-
-  // Lays the text out again when its string, language, width or font changed
-  update() {
-    const str = this.displayString();
-    const width = asNumber(this.field('width'));
-    const key = `${str} ${width} ${this.fontName}`;
-    if (key !== this.builtKey) {
-      this.builtKey = key;
-      this.rebuild(str, width);
-    }
-    this.animate();
-  }
-
-  rebuild(str, width) {
-    if (this.layoutMesh) this.layoutMesh.geometry.dispose();
-    this.layoutMesh = null;
-    const role = this.fontName.toLowerCase() === 'heading' ? 'heading' : 'body';
-    const fontData = this.fontCache[role];
-    if (!fontData) throw new Error(`font ${this.fontName} is not loaded`);
-    const laid = layoutText(str, fontData, width);
-    this.bbox = laid.bbox;
-    if (laid.positions.length === 0) return;
-    this.basePositions = Float32Array.from(laid.positions);
-    this.alphas = Float32Array.from(laid.alphas);
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('a_0', new THREE.BufferAttribute(Float32Array.from(laid.positions), 3));
-    geometry.setAttribute('a_12', new THREE.BufferAttribute(new Float32Array(laid.alphas.length * 4), 4));
-    geometry.setIndex(laid.indices);
-    this.layoutMesh = new THREE.Mesh(geometry, this.material);
-    detachFromThree(this.layoutMesh);
-    this.applyAlpha(this.alphas, 0, 0);
-  }
-
-  // Writes the glyph alpha and offsets the glyphs for justification and scroll
-  applyAlpha(alphas, x, y) {
-    const diffuse = this.layoutMesh.geometry.attributes.a_12;
-    for (let i = 0; i < alphas.length; i++) diffuse.setXYZW(i, 1, 1, 1, alphas[i]);
-    diffuse.needsUpdate = true;
-    this.layoutMesh.matrix.makeTranslation(x, y, 0);
-  }
-
-  // Positions the text the way the draw routine does: justified and scrolled, fading at the box edges
-  animate() {
-    if (!this.layoutMesh) return;
-    const width = asNumber(this.field('width'));
-    let extent = this.bbox.maxX - this.bbox.minX;
-    if (width !== 0 && Math.abs(width) < extent) extent = Math.abs(width);
-    let x = 0;
-    const justify = String(this.justify).toLowerCase();
-    if (justify === 'middle') x = -0.5 * extent;
-    else if (justify === 'end') x = -extent;
-    const height = asNumber(this.field('height'));
-    const textHeight = this.bbox.maxY - this.bbox.minY;
-    const scroll = asNumber(this.node._fields.scroll ?? 0);
-    if (height === 0 || textHeight <= height) {
-      this.applyAlpha(this.alphas, x, scroll);
-      return;
-    }
-    const top = TEXT_LINE_ADVANCE - scroll + (scroll === 0 ? TEXT_LINE_ADVANCE : 0);
-    const bottom = TEXT_LINE_ADVANCE - scroll - height - TEXT_BOX_MARGIN;
-    const faded = new Float32Array(this.alphas.length);
-    for (let i = 0; i < faded.length; i++) faded[i] = this.alphas[i] * scrollFade(this.basePositions[3 * i + 1], top, bottom);
-    this.applyAlpha(faded, x, scroll);
-  }
-
-  // Scrolls text taller than its box after the delay, wrapping past the end with a gap
-  tick(dt) {
-    const rate = asNumber(this.field('scrollRate'));
-    if (rate === 0 || !this.layoutMesh) return;
-    const now = this.runtime.clock.elapsedTime;
-    if (this.scrollStart === 0) this.scrollStart = now + asNumber(this.field('scrollDelay'));
-    if (now < this.scrollStart) return;
-    const height = asNumber(this.field('height'));
-    const textHeight = this.bbox.maxY - this.bbox.minY;
-    if (textHeight <= height) return;
-    let scroll = asNumber(this.node._fields.scroll ?? 0) + dt * height * rate;
-    if (scroll > textHeight + TEXT_SCROLL_GAP) scroll -= textHeight + TEXT_SCROLL_GAP;
-    this.node._fields.scroll = scroll;
-  }
-}
-
-// Alpha of a glyph vertex at a height inside a scrolled box, fading over one line at both edges
-function scrollFade(y, top, bottom) {
-  if (y > top || y < bottom) return 0;
-  return Math.min(1, top - y, y - bottom);
-}
-
-// Places glyph outlines like the executable: lines wrap at a positive width, overflow fades out at the edge,
-// a tab starts a right aligned column and highlight markers halve the alpha of the text between them
-function layoutText(str, fontData, width) {
-  const glyphs = fontData.glyphs;
-  const wrap = width > 0 ? width : 0;
-  const limit = Math.abs(width);
-  const positions = [], alphas = [], indices = [];
-  const chars = [...str];
-  const measure = measureColumns(chars, glyphs, limit);
-  let x = 0, y = 0, vertexCount = 0;
-  let lineStartVertex = 0, column = 1, lastSpace = -1, lastSpaceVertex = 0;
-  let overflow = width < 0, highlight = false, hadTab = false;
-  let minX = 0, maxX = 0, minY = 0, maxY = 0;
-  const finishLine = (hardBreak) => {
-    if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_OVERFLOW_FADE, measure.lineWidth);
-    x = 0;
-    y -= hardBreak || hadTab || highlight ? TEXT_LINE_ADVANCE : TEXT_SOFT_LINE_ADVANCE;
-    lineStartVertex = vertexCount;
-    lastSpace = -1;
-    column = 1;
-    overflow = width < 0;
-  };
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i];
-    if (ch === '*' && markerAt(chars, i)) {
-      highlight = !highlight;
-      continue;
-    }
-    if (ch === CR || ch === LF) {
-      if (ch === CR && chars[i + 1] === LF) i++;
-      finishLine(ch === CR);
-      continue;
-    }
-    if (ch === TAB && width >= 0) {
-      if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_COLUMN_FADE, measure.lineWidth);
-      column = 2;
-      hadTab = true;
-      x = measure.lineWidth - measure.column2;
-      continue;
-    }
-    const glyph = glyphs[ch];
-    if (!glyph) continue;
-    const scale = glyph.i > TEXT_SMALL_GLYPH_INDEX ? TEXT_SMALL_GLYPH_SCALE : 1;
-    const advance = glyph.adv * scale;
-    if (wrap > 0 && ch !== ' ' && column === 1 && x + advance > wrap) {
-      if (lastSpace >= 0) {
-        positions.length = lastSpaceVertex * 3;
-        alphas.length = lastSpaceVertex;
-        indices.length = indexCountFor(indices, lastSpaceVertex);
-        vertexCount = lastSpaceVertex;
-        i = lastSpace;
-        x = 0;
-        y -= TEXT_LINE_ADVANCE;
-        lineStartVertex = vertexCount;
-        lastSpace = -1;
-        continue;
-      }
-      overflow = true;
-    }
-    if (glyph.verts && glyph.idx && glyph.idx.length > 0) {
-      for (let k = 0; k < glyph.verts.length; k += 2) {
-        const px = glyph.verts[k] * scale + x, py = glyph.verts[k + 1] * scale + y;
-        positions.push(px, py, 0);
-        alphas.push(highlight ? TEXT_HIGHLIGHT_ALPHA : 1);
-        minX = Math.min(minX, px); maxX = Math.max(maxX, px); minY = Math.min(minY, py); maxY = Math.max(maxY, py);
-      }
-      for (let k = 0; k < glyph.idx.length; k++) indices.push(glyph.idx[k] + vertexCount);
-      vertexCount += glyph.verts.length / 2;
-    }
-    x += advance;
-    if (ch === ' ') { lastSpace = i; lastSpaceVertex = vertexCount; }
-  }
-  if (overflow && column === 1) fadeRange(positions, alphas, lineStartVertex, vertexCount, measure.lineWidth - TEXT_OVERFLOW_FADE, measure.lineWidth);
-  return { positions, alphas, indices, bbox: { minX, maxX, minY, maxY } };
-}
-
-// A highlight marker is an asterisk whose run ends with another asterisk before a tab, newline or the end
-function markerAt(chars, i) {
-  for (let k = i + 1; k < chars.length; k++) {
-    const c = chars[k];
-    if (c === LF || c === CR || c === TAB) return k - 1 > i && chars[k - 1] === '*';
-  }
-  return chars.length - 1 > i && chars[chars.length - 1] === '*';
-}
-
-// Measures the widest first and second column so overflow and tab stops know the line width
-function measureColumns(chars, glyphs, limit) {
-  let col1 = 0, col2 = 0, x1 = 0, x2 = 0, column = 1, sawTab = false;
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i];
-    if (ch === CR || ch === LF) { col1 = Math.max(col1, x1); col2 = Math.max(col2, x2); x1 = 0; x2 = 0; column = 1; continue; }
-    if (ch === TAB) { column = 2; sawTab = true; continue; }
-    if (ch === '*' && markerAt(chars, i)) continue;
-    const glyph = glyphs[ch];
-    if (!glyph) continue;
-    const advance = glyph.adv * (glyph.i > TEXT_SMALL_GLYPH_INDEX ? TEXT_SMALL_GLYPH_SCALE : 1);
-    if (column === 1) x1 += advance; else x2 += advance;
-  }
-  col1 = Math.max(col1, x1); col2 = Math.max(col2, x2);
-  let lineWidth = col1;
-  if (limit !== 0) lineWidth = sawTab ? (col1 + col2 > limit ? limit - col2 : lineWidth) : limit;
-  return { lineWidth, column2: col2 };
-}
-
-// Fades vertices out between two x positions, the way the draw dims text past its width
-function fadeRange(positions, alphas, from, to, start, end) {
-  const span = end - start;
-  for (let i = from; i < to; i++) {
-    const t = span > 0 ? Math.min(1, Math.max(0, (positions[3 * i] - start) / span)) : (positions[3 * i] > start ? 1 : 0);
-    alphas[i] *= 1 - t;
-  }
-}
-
-function indexCountFor(indices, vertexCount) {
-  let n = indices.length;
-  while (n > 0 && indices[n - 1] >= vertexCount) n--;
-  return n;
-}
-
-// ============================================================================
 // Helper functions
 // ============================================================================
-
-// Text glyph geometry carries positions only, drawn through the fixed function path
-const TEXT_GEOMETRY = describeGeometry({ format: 0, stride: 28, attributes: [{ register: 0, semantic: 'position', type: 'FLOAT3', offset: 0, comps: 3 }, { register: 3, semantic: 'diffuse', type: 'FLOAT4', offset: 12, comps: 4 }] });
 
 // Joins a path onto a base the way the executable's helper does, parent steps cutting the base at its separators
 function joinPaths(src, base) {
@@ -2130,6 +2016,44 @@ function detachFromThree(mesh) {
   mesh.frustumCulled = false;
   mesh.matrixAutoUpdate = false;
   mesh.matrixWorldAutoUpdate = false;
+}
+
+// Converts the vertices written since the last conversion into the geometry's attribute arrays and marks that
+// range for upload
+function fillStreamAttributes(geometry, vb, desc) {
+  const view = vb.view;
+  const first = Math.floor(vb.dirtyLo / desc.stride), last = Math.min(Math.ceil(vb.dirtyHi / desc.stride), vb.bytes.length / desc.stride);
+  for (const a of desc.attributes) {
+    const attribute = geometry.getAttribute('a_' + a.offset), data = attribute.array;
+    for (let v = first; v < last; v++) {
+      const base = v * desc.stride + a.offset;
+      if (a.source === 'color') {
+        const c = view.getUint32(base, true);
+        data[v * 4] = ((c >>> 16) & 255) / 255; data[v * 4 + 1] = ((c >>> 8) & 255) / 255; data[v * 4 + 2] = (c & 255) / 255; data[v * 4 + 3] = (c >>> 24) / 255;
+      } else {
+        for (let k = 0; k < a.comps; k++) data[v * a.comps + k] = view.getFloat32(base + 4 * k, true);
+      }
+    }
+    attribute.clearUpdateRanges();
+    attribute.addUpdateRange(first * a.comps, (last - first) * a.comps);
+    attribute.needsUpdate = true;
+  }
+}
+
+// Writes a triangle list into the geometry's index, growing the index when the list outgrows it
+function setStreamIndex(geometry, triangles, wide) {
+  const index = geometry.index;
+  if (index && index.array.length >= triangles.length) {
+    let same = geometry.drawRange.count === triangles.length;
+    for (let i = 0; same && i < triangles.length; i++) same = index.array[i] === triangles[i];
+    if (same) return;
+    index.array.set(triangles);
+    index.needsUpdate = true;
+  } else {
+    geometry.dispose();
+    geometry.setIndex(new THREE.BufferAttribute((wide ? Uint32Array : Uint16Array).from(triangles), 1));
+  }
+  geometry.setDrawRange(0, triangles.length);
 }
 
 const floatBuf = new DataView(new ArrayBuffer(4));

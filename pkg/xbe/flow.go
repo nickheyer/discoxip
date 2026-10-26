@@ -124,14 +124,19 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 	}
 	written[entry] = map[x86asm.Reg]bool{}
 	prologue := map[int]bool{}
+	framed := false
 	for i := entry; i < len(fn.Instructions); i++ {
 		in := &fn.Instructions[i]
 		if in.Inst.Op == x86asm.PUSH {
-			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI) {
+			// A push of ecx under a fresh frame pointer reserves a local, the compiler's short form of the allocation
+			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && framed)) {
 				prologue[i] = true
 				continue
 			}
 			break
+		}
+		if dst, src, ok := registerMove(in); ok && dst == x86asm.EBP && src == x86asm.ESP {
+			framed = true
 		}
 		switch in.Inst.Op {
 		case x86asm.MOV, x86asm.LEA, x86asm.SUB, x86asm.AND, x86asm.XOR:
@@ -147,6 +152,11 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 			}
 		}
 	}
+	if d.savePushes == nil {
+		d.savePushes = map[uint32]map[uint32]bool{}
+	}
+	saves := map[uint32]bool{}
+	d.savePushes[fn.EntryVA] = saves
 	work := []int{entry}
 	for len(work) > 0 {
 		i := work[len(work)-1]
@@ -158,6 +168,9 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && popped[wideRegister(r)] && !written[i][wideRegister(r)] {
 				save = true
 			}
+		}
+		if save && in.Inst.Op == x86asm.PUSH {
+			saves[in.VA] = true
 		}
 		for _, r := range registersRead(in, save) {
 			if !written[i][r] {
@@ -196,7 +209,29 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 		}
 	}
 	d.liveIns[fn.EntryVA] = out
+	if d.liveFloatIns == nil {
+		d.liveFloatIns = map[uint32][]x86asm.Reg{}
+	}
+	var floats []x86asm.Reg
+	for _, r := range floatArgumentRegisters {
+		if live[r] {
+			floats = append(floats, r)
+		}
+	}
+	d.liveFloatIns[fn.EntryVA] = floats
 	return out
+}
+
+// Lists the vector registers some path of a function reads a float from before any instruction on it writes them
+func (d *Disassembly) liveInFloatRegisters(fn *Function) []x86asm.Reg {
+	d.liveInRegisters(fn)
+	return d.liveFloatIns[fn.EntryVA]
+}
+
+// Reports whether a push saves a callee owned register rather than passing an argument, by the function's own flow
+func (d *Disassembly) savingPush(fn *Function, va uint32) bool {
+	d.liveInRegisters(fn)
+	return d.savePushes[fn.EntryVA][va]
 }
 
 // Computes the global each register was loaded from before each instruction, agreeing across every path reaching it

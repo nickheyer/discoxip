@@ -19,6 +19,7 @@ func DeriveTextures(d *Disassembly, producers []uint32, allocators []uint32) ([]
 	out := []*ProducedTexture{}
 	for _, va := range producers {
 		ex := NewExecutor(d)
+		ex.ImageCreations = true
 		for _, a := range allocators {
 			ex.Allocators[a] = true
 			ex.Opaque[a] = true
@@ -89,6 +90,38 @@ func textureFromPath(p Path) (*ProducedTexture, error) {
 				buffers[e.Base] = map[int32]uint32{}
 			}
 			buffers[e.Base][e.Off] = v
+		case e.Kind == "fill" && e.Size == 4:
+			// A long fill stands for the pixel stores it makes, each the same constant
+			dst, isDst := asPtr(e.Addr).(Ptr)
+			v, okV := isConst(e.Value)
+			n, okN := isConst(e.Args[0])
+			if !isDst || !okV || !okN {
+				return nil, fmt.Errorf("fill of %s with %s at %s is symbolic", ExprString(e.Args[0]), ExprString(e.Value), ExprString(e.Addr))
+			}
+			if buffers[dst.Base] == nil {
+				buffers[dst.Base] = map[int32]uint32{}
+			}
+			for i := int32(0); i < int32(n); i++ {
+				buffers[dst.Base][dst.Off+4*i] = v
+			}
+		case e.Kind == "copy" && e.Size == 4:
+			// A long copy stands for the pixel stores it makes from another buffer
+			dst, isDst := asPtr(e.Addr).(Ptr)
+			src, isSrc := asPtr(e.Args[0]).(Ptr)
+			n, okN := isConst(e.Value)
+			if !isDst || !isSrc || !okN {
+				return nil, fmt.Errorf("copy of %s from %s to %s is symbolic", ExprString(e.Value), ExprString(e.Args[0]), ExprString(e.Addr))
+			}
+			if buffers[dst.Base] == nil {
+				buffers[dst.Base] = map[int32]uint32{}
+			}
+			for i := int32(0); i < int32(n); i++ {
+				v, ok := buffers[src.Base][src.Off+4*i]
+				if !ok {
+					return nil, fmt.Errorf("copy reads %s+%X which no store filled", src.Base, src.Off+4*i)
+				}
+				buffers[dst.Base][dst.Off+4*i] = v
+			}
 		}
 	}
 	if tex == nil {

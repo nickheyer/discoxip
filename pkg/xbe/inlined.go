@@ -43,6 +43,8 @@ func mapExpr(e Expr, f func(Expr) (Expr, bool)) Expr {
 		return Not{mapExpr(v.A, f)}
 	case Elem:
 		return Elem{mapExpr(v.A, f), v.Index}
+	case Sel:
+		return Sel{mapExpr(v.C, f), mapExpr(v.A, f), mapExpr(v.B, f)}
 	case Block:
 		elems := make([]Expr, len(v.Elems))
 		for i, x := range v.Elems {
@@ -54,7 +56,7 @@ func mapExpr(e Expr, f func(Expr) (Expr, bool)) Expr {
 		for i, a := range v.Args {
 			args[i] = mapExpr(a, f)
 		}
-		return CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: mapExpr(v.This, f)}
+		return CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: mapExpr(v.This, f), Target: v.Target}
 	}
 	return e
 }
@@ -244,7 +246,7 @@ func (ex *Executor) foldCreations(p Path) (Path, bool, error) {
 			for j, x := range b.Elems {
 				elems[j] = mapExpr(x, subst)
 			}
-			buffers[k] = ArgBuffer{Index: b.Index, Elems: elems}
+			buffers[k] = ArgBuffer{Index: b.Index, Elems: elems, Sizes: b.Sizes}
 		}
 		e.Buffers = buffers
 		out.Effects = append(out.Effects, e)

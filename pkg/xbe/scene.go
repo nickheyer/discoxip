@@ -14,33 +14,51 @@ import (
 
 // SceneModel is the frame loop, camera, node traversal and script natives the executable runs around the draws.
 type SceneModel struct {
-	Renderer    uint32                       `json:"renderer"`
-	Camera      uint32                       `json:"camera"`
-	MatrixStack uint32                       `json:"matrix_stack"`
-	Frame       uint32                       `json:"frame"`
-	Tick        uint32                       `json:"tick"`
-	Init        uint32                       `json:"init"`
-	MainLoad    uint32                       `json:"main_load"`
-	CameraTick  uint32                       `json:"camera_tick"`
-	TickSlot    int32                        `json:"tick_slot"`
-	Group       GroupTraversal               `json:"group"`
-	Natives     map[string]map[string]uint32 `json:"natives"`
-	FireEvent   uint32                       `json:"fire_event"`
-	ArrayElem   uint32                       `json:"array_element"`
-	Present     uint32                       `json:"present"`
-	Loader      uint32                       `json:"loader"`
-	ImageLoad   []uint32                     `json:"image_load"`
-	Unloader    uint32                       `json:"unloader"`
-	InlineLoad  uint32                       `json:"inline_load"`
-	PostLoad    uint32                       `json:"post_load"`
-	SceneLoad   SceneLoadHelpers             `json:"scene_load"`
-	ScriptTick  uint32                       `json:"script_tick"`
-	TickHooks   []uint32                     `json:"tick_hooks"`
-	Input       []uint32                     `json:"input"`
-	Timers      TimerList                    `json:"timers"`
-	Control     uint32                       `json:"control_global"`
-	Slots       map[string]SceneSlots        `json:"slots"`
-	Errors      map[string]string            `json:"errors"`
+	Renderer     uint32                       `json:"renderer"`
+	Camera       uint32                       `json:"camera"`
+	MatrixStack  uint32                       `json:"matrix_stack"`
+	Frame        uint32                       `json:"frame"`
+	Tick         uint32                       `json:"tick"`
+	Init         uint32                       `json:"init"`
+	Disk         uint32                       `json:"disk"`
+	Initializers []uint32                     `json:"initializers"`
+	MainLoad     uint32                       `json:"main_load"`
+	MainLoadArgs []string                     `json:"main_load_args"`
+	CameraTick   uint32                       `json:"camera_tick"`
+	TickSlot     int32                        `json:"tick_slot"`
+	Group        GroupTraversal               `json:"group"`
+	Natives      map[string]map[string]uint32 `json:"natives"`
+	FireEvent    uint32                       `json:"fire_event"`
+	ArrayElem    uint32                       `json:"array_element"`
+	Present      uint32                       `json:"present"`
+	Loader       uint32                       `json:"loader"`
+	ImageLoad    []uint32                     `json:"image_load"`
+	Unloader     uint32                       `json:"unloader"`
+	InlineLoad   uint32                       `json:"inline_load"`
+	PostLoad     uint32                       `json:"post_load"`
+	SceneLoad    SceneLoadHelpers             `json:"scene_load"`
+	ScriptTick   uint32                       `json:"script_tick"`
+	TickHooks    []uint32                     `json:"tick_hooks"`
+	Input        []uint32                     `json:"input"`
+	Timers       TimerList                    `json:"timers"`
+	Control      uint32                       `json:"control_global"`
+	Script       ScriptCalls                  `json:"script"`
+	Slots        map[string]SceneSlots        `json:"slots"`
+	Errors       map[string]string            `json:"errors"`
+}
+
+// ScriptCalls is the engine's native dispatcher, the conversions it asks of argument values and the value objects
+// it takes back from natives.
+type ScriptCalls struct {
+	Call         uint32 `json:"call"`
+	Resolve      int32  `json:"resolve"`
+	ToNumber     int32  `json:"to_number"`
+	ToString     int32  `json:"to_string"`
+	Release      int32  `json:"release"`
+	NumberField  int32  `json:"number_field"`
+	StringField  int32  `json:"string_field"`
+	NumberVtable uint32 `json:"number_vtable"`
+	StringVtable uint32 `json:"string_vtable"`
 }
 
 // SceneSlots are the per class methods the runtime runs, zero where the class inherits none.
@@ -91,6 +109,51 @@ var sceneTrace = os.Getenv("DISCOXIP_SCENE_TRACE") != ""
 
 // Callee levels below a scene root that are summarized along with it
 const sceneCalleeDepth = 2
+
+// Effects the paths of one routine may carry before it runs block by block instead
+const maxPathEffects = 262144
+
+// Reports whether a routine's own instructions name a kernel export through its thunk
+func (d *Disassembly) usesImport(va uint32, name string) bool {
+	fn := d.Functions[va]
+	if fn == nil {
+		return false
+	}
+	for i := range fn.Instructions {
+		for _, a := range fn.Instructions[i].Inst.Args {
+			if m, ok := a.(x86asm.Mem); ok && m.Base == 0 && m.Index == 0 && d.Imports[uint32(m.Disp)] == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Reports whether a routine calls one callee before it first calls another
+func callsBefore(fn *Function, first, second uint32) bool {
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op != x86asm.CALL {
+			continue
+		}
+		switch resolveTarget(in) {
+		case first:
+			return true
+		case second:
+			return false
+		}
+	}
+	return false
+}
+
+// Effects every path of a routine carries, added up
+func pathEffects(paths []Path) int {
+	n := 0
+	for _, p := range paths {
+		n += len(p.Effects)
+	}
+	return n
+}
 
 // The XDK routines through which the dashboard reaches the controllers, which the runtime drives itself
 var inputRoutines = map[string]bool{"XGetDevices": true, "XGetDeviceChanges": true, "XInputOpen": true, "XInputClose": true, "XInputGetState": true, "XInputPoll": true, "XInputGetCapabilities": true}
@@ -143,10 +206,10 @@ type sceneWork struct {
 }
 
 // DeriveScene summarizes the frame loop, the camera, the node class draw and tick methods and the natives that move the scene.
-func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map[string]*NodeType, sm *SystemModel) error {
+func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map[string]*NodeType, sm *SystemModel, registrar uint32) error {
 	ex := NewExecutor(d)
 	callers := ex.staticThisCallers()
-	sc := &SceneModel{Natives: map[string]map[string]uint32{}, Slots: map[string]SceneSlots{}, Errors: map[string]string{}}
+	sc := &SceneModel{Natives: map[string]map[string]uint32{}, Slots: map[string]SceneSlots{}, Errors: map[string]string{}, Initializers: []uint32{}}
 	sc.Renderer = callers[rm.Clock.Via]
 	if sc.Renderer == 0 {
 		return fmt.Errorf("xbe: clock writer %08X is not called on a static object", rm.Clock.Via)
@@ -209,16 +272,35 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if sc.Frame == 0 || sc.Init == 0 {
 		return fmt.Errorf("xbe: renderer %08X has no frame (%08X) or init (%08X) routine", sc.Renderer, sc.Frame, sc.Init)
 	}
-	// The startup names the main scene file to the renderer method that loads it.
+	// The startup names the main scene file to the renderer method that loads it, handing it the renderer again
+	// or only the buffer for the file's path, as its call site shows
 	for _, startup := range d.Functions[sc.Init].CalledBy {
 		for _, c := range d.plainCallees(startup) {
 			if fn := d.Functions[c]; fn != nil && pushesWideStringSuffix(d, fn, ".xap") {
 				sc.MainLoad = c
+				seed := map[x86asm.Reg]uint32{}
+				if addr := callers[startup]; addr != 0 && ex.thisLoc[startup].Reg != 0 {
+					seed[ex.thisLoc[startup].Reg] = addr
+				}
+				sc.MainLoadArgs = mainLoadArgs(d, d.Functions[startup], c, sc.Renderer, seed)
+			}
+			// The startup links the drive letters its paths name before the init runs, through a routine of its own
+			if d.usesImport(c, "IoCreateSymbolicLink") {
+				if sc.Disk != 0 && sc.Disk != c {
+					return fmt.Errorf("xbe: startup routines link the drives in two routines (%08X, %08X)", sc.Disk, c)
+				}
+				if !callsBefore(d.Functions[startup], c, sc.Init) {
+					return fmt.Errorf("xbe: startup %08X links the drives in %08X only after the init %08X", startup, c, sc.Init)
+				}
+				sc.Disk = c
 			}
 		}
 	}
 	if sc.MainLoad == 0 {
 		return fmt.Errorf("xbe: no startup routine around init %08X names the main scene file", sc.Init)
+	}
+	if sc.Disk == 0 {
+		return fmt.Errorf("xbe: no startup routine around init %08X links the drive letters", sc.Init)
 	}
 	// Where the optimizer merged the frame loop into the tick, the tick is the loop body and the draw ends it
 	if slices.Contains(d.Functions[sc.Tick].CallTargets, sc.Frame) {
@@ -257,12 +339,13 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if err := sc.deriveGroup(d, group.Slots[rm.Draw.Slot/4], group.Slots[sc.TickSlot/4], rm.Draw.Slot, sc.TickSlot); err != nil {
 		return err
 	}
-	// The scene graph classes run their natives out of the executable, the host services being the runtime's own
-	for _, class := range []string{"Level", "Transform", "Background"} {
-		if fns := sm.methodFunctions[class]; len(fns) > 0 {
+	// Every class runs its natives out of the executable, the scene graph classes being required to summarize
+	for class, fns := range sm.methodFunctions {
+		if len(fns) > 0 {
 			sc.Natives[class] = fns
 		}
 	}
+	requiredNatives := map[string]bool{"Level": true, "Transform": true, "Background": true}
 	if len(sc.Natives["Level"]) == 0 || len(sc.Natives["Transform"]) == 0 {
 		return fmt.Errorf("xbe: the Level and Transform classes register no script natives")
 	}
@@ -325,6 +408,18 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		if va == 0 || hooked[va] || queued[va] || ex.ftol[va] {
 			return
 		}
+		// A math thunk runs as the operator it stands for, so it is never summarized
+		if _, isMath := d.mathIntrinsic(va); isMath {
+			return
+		}
+		// A method only a vtable names is disassembled when it is first queued
+		if d.Functions[va] == nil {
+			fn := d.buildFunction(va, map[uint32]bool{})
+			if fn == nil {
+				return
+			}
+			d.Functions[va] = fn
+		}
 		// A callee past the depth the chain is followed on the full budget is summarized on the small one
 		if depth > sceneCalleeDepth {
 			required = false
@@ -357,18 +452,46 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		for _, c := range d.plainCallees(w.va) {
 			sub.Opaque[c] = true
 		}
+		// The routine sees as many stack arguments as its cleanup or its reads show, four at the least
+		stackArgs := 4
+		if n := d.cleanupOf(d.Functions[w.va]) / 4; n > stackArgs {
+			stackArgs = n
+		}
+		if n := d.stackInputs(d.Functions[w.va]); n > stackArgs {
+			stackArgs = n
+		}
 		paths, err := sub.Run(w.va, func(s *execState) {
 			if w.this != 0 {
-				ex.seedThis(s, w.va, w.this, 4)
+				ex.seedThis(s, w.va, w.this, stackArgs)
 			} else {
 				s.regs[1] = Ptr{"this", 0}
-				sub.seedArgs(s, w.va, "arg", 4)
+				sub.seedArgs(s, w.va, "arg", stackArgs)
 			}
 		})
-		if err != nil {
-			return fmt.Errorf("scene path %08X: %w", w.va, err)
+		// Paths that left a loop early cover only its shortest runs, so such a routine runs block by block instead
+		if err == nil && sub.loopCut && !w.required {
+			err = fmt.Errorf("the paths leave a loop after %d turns", maxLoopUnroll)
 		}
-		if _, done := rm.Draw.paths[w.va]; !done {
+		// Paths multiplying through a loop repeat its body, so a summary past the budget runs block by block instead
+		if n := pathEffects(paths); err == nil && n > maxPathEffects {
+			err = fmt.Errorf("the paths carry %d effects, more than %d", n, maxPathEffects)
+		}
+		if err != nil {
+			// A routine the paths cannot carry, its loops among them, runs block by block instead
+			lifter := NewExecutorShared(ex)
+			for h := range hooked {
+				lifter.Opaque[h] = true
+			}
+			lifted, lerr := lifter.Lift(w.va)
+			if lerr != nil {
+				return fmt.Errorf("scene path %08X: %w; %v", w.va, err, lerr)
+			}
+			if sceneTrace {
+				fmt.Fprintf(os.Stderr, "scene %08X lifted into %d blocks after: %v\n", w.va, len(lifted.blocks), err)
+			}
+			rm.Lifted[w.va] = lifted
+			paths = lifted.asPaths()
+		} else if _, done := rm.Draw.paths[w.va]; !done {
 			rm.Draw.paths[w.va] = paths
 			rm.Draw.Functions[w.va] = pathsJSON(rm.Exprs, paths)
 		}
@@ -389,11 +512,29 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		}
 		return nil
 	}
+	// The engine reaches the natives through a Node method, so every Node method is summarized
+	for _, va := range node.Slots {
+		enqueue(va, 0, false, 0)
+	}
 	enqueue(sc.Frame, sc.Renderer, true, 0)
 	enqueue(sc.Tick, sc.Renderer, true, 0)
 	enqueue(sc.Init, sc.Renderer, true, 0)
+	enqueue(sc.Disk, 0, true, 0)
 	enqueue(sc.MainLoad, sc.Renderer, true, 0)
 	enqueue(sc.CameraTick, sc.Camera, true, 0)
+	// The dashboard's own static initializers besides the class registrations run in the runtime before the
+	// renderer starts, the C runtime's own being the runtime's business as the rest of that library is
+	inits, err := d.staticInitializers()
+	if err != nil {
+		return err
+	}
+	for _, va := range inits {
+		if d.callsWithin(va, registrar, 1) || d.Functions[va].Symbol != nil {
+			continue
+		}
+		sc.Initializers = append(sc.Initializers, va)
+		enqueue(va, 0, false, 0)
+	}
 	classes := make([]string, 0, len(sc.Natives))
 	for class := range sc.Natives {
 		classes = append(classes, class)
@@ -407,7 +548,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			enqueue(fns[name], 0, true, 0)
+			enqueue(fns[name], 0, requiredNatives[class], 0)
 		}
 	}
 	required := map[string]bool{}
@@ -460,9 +601,6 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			slots.Hook = nt.Slots[rm.Draw.FieldSetSlot/4]
 		}
 		sc.Slots[name] = slots
-		if name == "Text" {
-			continue
-		}
 		for _, va := range []uint32{slots.Draw, slots.Tick, slots.Hook} {
 			enqueue(va, 0, required[name], 0)
 		}
@@ -486,7 +624,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		for len(queue) > 0 {
 			w := queue[0]
 			queue = queue[1:]
-			if _, done := rm.Draw.paths[w.va]; !done {
+			if !rm.summarized(w.va) {
 				if err := summarize(w); err != nil {
 					if w.required {
 						return fmt.Errorf("xbe: %w", err)
@@ -498,9 +636,17 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			for _, c := range d.plainCallees(w.va) {
 				enqueue(c, staticCallees[c], w.required, w.depth+1)
 			}
-			// A routine the dashboard hands a library call as a callback is run by the runtime as well
-			for _, p := range rm.Draw.paths[w.va] {
+			// A routine the dashboard hands a library call as a callback is run by the runtime as well, and so is
+			// every method of a class the routine builds an object of
+			for _, p := range rm.pathsOf(w.va) {
 				for _, e := range p.Effects {
+					if e.Kind == "store" && e.Size == 4 {
+						if c, ok := isConst(e.Value); ok && d.isVtable(c) {
+							for _, m := range d.vtableSlots(c) {
+								enqueue(m, 0, false, w.depth+1)
+							}
+						}
+					}
 					if e.Kind != "call" {
 						continue
 					}
@@ -508,7 +654,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 					if n, _ := fmt.Sscanf(e.Fn, "vcall@%X", &slot); n == 1 {
 						enqueueSlot(slot, w.depth+1)
 					}
-					for _, a := range e.Args {
+					for _, a := range append([]Expr{e.Value}, e.Args...) {
 						c, ok := isConst(a)
 						if !ok || d.Functions[c] == nil || d.Functions[c].Symbol != nil || d.inLibrary(c) {
 							continue
@@ -538,10 +684,35 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	if err := sc.deriveControl(rm, types, summarize); err != nil {
 		return err
 	}
+	if err := sc.deriveScriptCalls(rm, d, node); err != nil {
+		return err
+	}
+	// A class whose load creates a device texture its own routines fill runs that load from the image
+	for _, nt := range types {
+		nt.OwnTexture = d.createsOwnTexture(nt, rm.Draw.LoadSlot, rm.Draw.TextureSlot, sc.ImageLoad)
+	}
+	rm.deriveLibrary(d, ex, sc, types, hooked)
+	resource, err := d.resourceLayout()
+	if err != nil {
+		return err
+	}
+	rm.Resource = resource
+	rm.SurfaceDesc = SurfaceDescLayout{Format: surfaceDescFormat, Width: surfaceDescWidth, Height: surfaceDescHeight}
+	gpu, err := d.gpuRegisterBase()
+	if err != nil {
+		return err
+	}
+	rm.GPU = gpu
 	for _, paths := range rm.Draw.paths {
 		for _, p := range paths {
 			rm.collectStrings(d, p, rm.Draw.Strings)
 		}
+	}
+	for _, lf := range rm.Lifted {
+		for _, p := range lf.asPaths() {
+			rm.collectStrings(d, p, rm.Draw.Strings)
+		}
+		lf.serialize(rm.Exprs)
 	}
 	for _, nt := range types {
 		for _, p := range nt.ctorPaths {
@@ -550,6 +721,278 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	}
 	rm.Scene = sc
 	return nil
+}
+
+// Reports whether a routine is carried in the model, as paths or as lifted blocks
+func (rm *RenderModel) summarized(va uint32) bool {
+	_, asPaths := rm.Draw.paths[va]
+	_, asBlocks := rm.Lifted[va]
+	return asPaths || asBlocks
+}
+
+// The paths of a routine, a lifted routine's blocks read as paths
+func (rm *RenderModel) pathsOf(va uint32) []Path {
+	if lf, ok := rm.Lifted[va]; ok {
+		return lf.asPaths()
+	}
+	return rm.Draw.paths[va]
+}
+
+// The dispatcher is the Node method switching on a method record's signature code around a call through the
+// record's pointer, its argument conversions being the virtual calls it reads a field of, the number value being
+// the one object it builds and the string value the one the natives build
+func (sc *SceneModel) deriveScriptCalls(rm *RenderModel, d *Disassembly, node *NodeType) error {
+	for _, va := range node.Slots {
+		lf, ok := rm.Lifted[va]
+		if !ok {
+			continue
+		}
+		switched, pointer := false, false
+		for _, b := range lf.blocks {
+			if b.term.kind == "switch" && len(b.term.targets) >= 8 {
+				switched = true
+			}
+			for _, e := range b.effects {
+				if e.Kind == "call" && e.Fn == pointerCallName {
+					pointer = true
+				}
+			}
+		}
+		if !switched || !pointer {
+			continue
+		}
+		if sc.Script.Call != 0 {
+			return fmt.Errorf("xbe: Node methods %08X and %08X both dispatch script natives", sc.Script.Call, va)
+		}
+		sc.Script.Call = va
+	}
+	if sc.Script.Call == 0 {
+		return fmt.Errorf("xbe: no Node method dispatches script natives")
+	}
+	effects := rm.Lifted[sc.Script.Call].allEffects()
+	// The conversions are the virtual calls made on more than one value, a field of their results being read as a
+	// float for the number and handed on for the string, the release reading nothing back
+	slotOf := map[int]int32{}
+	calls := map[int32]int{}
+	for _, e := range effects {
+		var slot int32
+		if e.Kind == "call" && len(e.Fn) > 6 && e.Fn[:6] == "vcall@" {
+			if n, _ := fmt.Sscanf(e.Fn, "vcall@%X", &slot); n == 1 {
+				slotOf[e.Seq] = slot
+				calls[slot]++
+			}
+		}
+	}
+	fields := map[int32]map[int32]bool{}
+	floated := map[int32]bool{}
+	for _, e := range rm.Lifted[sc.Script.Call].asPaths() {
+		for _, x := range pathExprs(e) {
+			mapExpr(x, func(e Expr) (Expr, bool) {
+				if u, ok := e.(Un); ok && u.Op == "bits2f" {
+					if l, ok := u.A.(Load); ok {
+						if slot, ok := resultSlot(l, slotOf); ok {
+							floated[slot] = true
+						}
+					}
+				}
+				if l, ok := e.(Load); ok {
+					if slot, ok := resultSlot(l, slotOf); ok {
+						if fields[slot] == nil {
+							fields[slot] = map[int32]bool{}
+						}
+						fields[slot][l.Off] = true
+					}
+				}
+				return nil, false
+			})
+		}
+	}
+	// A value is resolved through the slot whose result is compared with the value it was called on, in the
+	// dispatcher itself or in the helper it hands each value to
+	resolvers := map[int32]bool{}
+	for _, va := range append([]uint32{sc.Script.Call}, d.plainCallees(sc.Script.Call)...) {
+		for _, slot := range comparedSlots(rm.pathsOf(va)) {
+			resolvers[slot] = true
+		}
+	}
+	if len(resolvers) != 1 {
+		return fmt.Errorf("xbe: the script dispatcher %08X resolves values through %d slots (%X)", sc.Script.Call, len(resolvers), slices.Sorted(maps.Keys(resolvers)))
+	}
+	sc.Script.Resolve = slices.Sorted(maps.Keys(resolvers))[0]
+	for _, slot := range slices.Sorted(maps.Keys(calls)) {
+		if slot == sc.Script.Resolve || calls[slot] < 2 {
+			continue
+		}
+		read := slices.Sorted(maps.Keys(fields[slot]))
+		switch {
+		case len(read) == 0 && sc.Script.Release == 0:
+			sc.Script.Release = slot
+		case len(read) == 1 && floated[slot] && sc.Script.ToNumber == 0:
+			sc.Script.ToNumber, sc.Script.NumberField = slot, read[0]
+		case len(read) == 1 && !floated[slot] && sc.Script.ToString == 0:
+			sc.Script.ToString, sc.Script.StringField = slot, read[0]
+		default:
+			return fmt.Errorf("xbe: the script dispatcher %08X converts values through slot %X in no known way (fields %v)", sc.Script.Call, slot, read)
+		}
+	}
+	if sc.Script.Release == 0 || sc.Script.ToNumber == 0 || sc.Script.ToString == 0 {
+		return fmt.Errorf("xbe: the script dispatcher %08X converts values through slots %X, %X and %X, expected a number, a string and a release", sc.Script.Call, sc.Script.ToNumber, sc.Script.ToString, sc.Script.Release)
+	}
+	// The number value is the one object the dispatcher builds, itself or through a helper, its vtable the one stored
+	vtables := map[uint32]bool{}
+	for _, e := range effects {
+		if v, ok := storedVtable(d, e); ok {
+			vtables[v] = true
+		}
+	}
+	for _, c := range d.plainCallees(sc.Script.Call) {
+		for _, p := range rm.pathsOf(c) {
+			for _, e := range p.Effects {
+				if v, ok := storedVtable(d, e); ok {
+					vtables[v] = true
+				}
+			}
+		}
+	}
+	if len(vtables) != 1 {
+		return fmt.Errorf("xbe: the script dispatcher %08X builds values of %d classes (%X)", sc.Script.Call, len(vtables), slices.Sorted(maps.Keys(vtables)))
+	}
+	sc.Script.NumberVtable = slices.Sorted(maps.Keys(vtables))[0]
+	// A native returning a string hands the object it allocated to the string value constructor, which keeps the
+	// characters it copies in the field the dispatcher reads them from
+	for _, fns := range sc.Natives {
+		for _, va := range fns {
+			for _, p := range rm.pathsOf(va) {
+				for _, e := range p.Effects {
+					var ctor uint32
+					if e.Kind != "call" || !scanSub(e.Fn, &ctor) || !takesNewObject(e) {
+						continue
+					}
+					vtable, field, ok := valueConstructor(rm.pathsOf(ctor), "operator_new_array")
+					if !ok || !d.isVtable(vtable) || field != sc.Script.StringField {
+						continue
+					}
+					if sc.Script.StringVtable != 0 && sc.Script.StringVtable != vtable {
+						return fmt.Errorf("xbe: natives box strings as both %08X and %08X", sc.Script.StringVtable, vtable)
+					}
+					sc.Script.StringVtable = vtable
+				}
+			}
+		}
+	}
+	if sc.Script.StringVtable == 0 {
+		return fmt.Errorf("xbe: no native boxes a string through a constructor filling field +%X", sc.Script.StringField)
+	}
+	return nil
+}
+
+// The virtual call slots whose results a routine's guards compare with another value, each one reading nothing back
+func comparedSlots(paths []Path) []int32 {
+	slots := map[int32]bool{}
+	for _, p := range paths {
+		for _, g := range p.Guards {
+			c, ok := g.(Cond)
+			if !ok || (c.Op != "eq" && c.Op != "ne") {
+				continue
+			}
+			for _, side := range []Expr{c.A, c.B} {
+				var slot int32
+				if cr, ok := side.(CallResult); ok && len(cr.Args) == 1 {
+					if n, _ := fmt.Sscanf(cr.Fn, "vcall@%X", &slot); n == 1 {
+						slots[slot] = true
+					}
+				}
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(slots))
+}
+
+// The conversion slot a load of a virtual call's result belongs to
+func resultSlot(l Load, slotOf map[int]int32) (int32, bool) {
+	var seq int
+	if l.Addr != nil || !strings.HasPrefix(l.Base, "res") {
+		return 0, false
+	}
+	if n, _ := fmt.Sscanf(l.Base, "res%d", &seq); n != 1 {
+		return 0, false
+	}
+	slot, ok := slotOf[seq]
+	return slot, ok
+}
+
+// Reports whether a call takes the object a plain allocation handed back, as its receiver or an argument
+func takesNewObject(e Effect) bool {
+	for _, a := range append([]Expr{e.This}, e.Args...) {
+		if cr, ok := a.(CallResult); ok && cr.Fn == "operator_new" {
+			return true
+		}
+	}
+	return false
+}
+
+// The vtable a store effect writes into the start of an object, if it writes one
+func storedVtable(d *Disassembly, e Effect) (uint32, bool) {
+	if e.Kind != "store" || e.Size != 4 {
+		return 0, false
+	}
+	c, ok := isConst(e.Value)
+	if !ok || !d.isVtable(c) {
+		return 0, false
+	}
+	return c, true
+}
+
+// Reports whether any path calls a library routine by name
+func callsLibrary(paths []Path, name string) bool {
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind == "call" && e.Fn == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Reads the vtable a constructor stores at its object's start and the field it fills from an allocation
+func valueConstructor(paths []Path, filledFrom string) (uint32, int32, bool) {
+	var vtable uint32
+	field, found := int32(-1), false
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "store" {
+				continue
+			}
+			// The object arrives as an argument or as the receiver, a store into it being relative to either
+			var base Expr = Sym{"this"}
+			off := e.Off
+			if e.Addr != nil {
+				base, off = e.Addr, 0
+				if b, ok := e.Addr.(Bin); ok && b.Op == "add" {
+					if c, ok := isConst(b.B); ok {
+						base, off = b.A, int32(c)
+					}
+				}
+				if p, isThis := base.(Ptr); isThis && p.Base == "this" {
+					base, off = Sym{"this"}, off+p.Off
+				}
+			} else if e.Base != "this" {
+				continue
+			}
+			if _, isArg := base.(Sym); !isArg {
+				continue
+			}
+			if c, ok := isConst(e.Value); ok && off == 0 && e.Size == 4 {
+				vtable = c
+				continue
+			}
+			if cr, ok := e.Value.(CallResult); ok && cr.Fn == filledFrom {
+				field, found = off, true
+			}
+		}
+	}
+	return vtable, field, vtable != 0 && found
 }
 
 // The input target is the global the binder the Level tick hands its control field to stores that node in
@@ -564,7 +1007,7 @@ func (sc *SceneModel) deriveControl(rm *RenderModel, types map[string]*NodeType,
 	for _, p := range rm.Draw.paths[tick] {
 		for _, e := range p.Effects {
 			var va uint32
-			if e.Kind == "call" && len(e.Args) == 1 && e.Args[0] == control && scanSub(e.Fn, &va) {
+			if e.Kind == "call" && len(e.Args) == 1 && sameExpr(e.Args[0], control) && scanSub(e.Fn, &va) {
 				helpers[va] = true
 			}
 		}
@@ -605,6 +1048,28 @@ func (sc *SceneModel) deriveControl(rm *RenderModel, types map[string]*NodeType,
 	}
 	sc.Control = slices.Sorted(maps.Keys(globals))[0]
 	return nil
+}
+
+// The roles of the stack arguments a startup hands the main load, the renderer where it passes its own address
+// and the path buffer elsewhere
+func mainLoadArgs(d *Disassembly, startup *Function, mainLoad, renderer uint32, seed map[x86asm.Reg]uint32) []string {
+	roles := []string{}
+	for i := range startup.Instructions {
+		in := &startup.Instructions[i]
+		if in.Inst.Op != x86asm.CALL || resolveTarget(in) != mainLoad {
+			continue
+		}
+		args := d.siteArgumentsFrom(startup, i, seed)
+		for k, v := range args.stack {
+			if args.known[k] && v == renderer {
+				roles = append(roles, "renderer")
+			} else {
+				roles = append(roles, "buffer")
+			}
+		}
+		break
+	}
+	return roles
 }
 
 // Reads the address out of a plain helper call name
@@ -932,7 +1397,7 @@ func (sc *SceneModel) derivePathJoin(d *Disassembly, ex *Executor) error {
 	paths, partial, _, _ := sub.RunWithRetries(join, func(s *execState) {
 		s.regs[1] = Sym{"in0"}
 		for i, r := range regs {
-			s.regs[regIndex[r]] = Sym{fmt.Sprintf("in%d", 1+i)}
+			s.setInput(r, Sym{fmt.Sprintf("in%d", 1+i)})
 		}
 		args := make([]Expr, stackCount)
 		for i := range args {

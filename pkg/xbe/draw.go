@@ -25,8 +25,10 @@ type NodeType struct {
 	Construct []PathJSON `json:"construct"`
 	// InitError says why the constructor could not be run for its defaults.
 	InitError string `json:"init_error,omitempty"`
-	ctorPaths []Path
-	factory   bool // the constructor allocates its own object
+	// OwnTexture marks a class whose load creates a device texture that its own routines fill
+	OwnTexture bool `json:"own_texture,omitempty"`
+	ctorPaths  []Path
+	factory    bool // the constructor allocates its own object
 }
 
 // NodeField is one scene file field of a node class at its object offset.
@@ -48,19 +50,11 @@ type SphereBuffer struct {
 	Stride uint32 `json:"stride"`
 }
 
-// TextDraw is the render state the text draw routine sets before and after its glyph draw.
-type TextDraw struct {
-	VA     uint32      `json:"va"`
-	Before [][2]uint32 `json:"before"`
-	After  [][2]uint32 `json:"after"`
-}
-
 // DrawModel is the derived draw path from a shape node down to the indexed draw call.
 type DrawModel struct {
 	Slot           int32                 `json:"slot"`
 	TextureSlot    int32                 `json:"texture_slot"`
 	FieldSetSlot   int32                 `json:"field_set_slot"`
-	TextDraw       TextDraw              `json:"text_draw"`
 	KindCheck      uint32                `json:"kind_check"`
 	MeshLoaded     uint32                `json:"mesh_loaded"`
 	ShaderLookup   uint32                `json:"shader_lookup"`
@@ -69,6 +63,7 @@ type DrawModel struct {
 	BufferDraw     uint32                `json:"buffer_draw"`
 	BufferFields   map[string]int32      `json:"buffer_fields"`
 	TextureField   int32                 `json:"texture_field"`
+	IndexData      uint32                `json:"index_data"`
 	LoadSlot       int32                 `json:"load_slot"`
 	Sphere         SphereBuffer          `json:"sphere"`
 	Functions      map[uint32][]PathJSON `json:"functions"`
@@ -85,8 +80,16 @@ type siteArgs struct {
 
 // Evaluates the immediates a call site passes on the stack and in registers, tracking copies and zeroing within the function
 func (d *Disassembly) siteArguments(fn *Function, i int) siteArgs {
+	return d.siteArgumentsFrom(fn, i, nil)
+}
+
+// Evaluates a call site's arguments with the addresses some registers hold when the function starts
+func (d *Disassembly) siteArgumentsFrom(fn *Function, i int, seed map[x86asm.Reg]uint32) siteArgs {
 	ins := fn.Instructions
 	regs := map[x86asm.Reg]uint32{}
+	for r, a := range seed {
+		regs[wideRegister(r)] = a
+	}
 	var pushes []uint32
 	var known []bool
 	for j := 0; j < i; j++ {
@@ -423,7 +426,6 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, uint32, error) {
 func (d *Disassembly) ctorInits(ex *Executor, nt *NodeType, allocators []uint32) (map[int32]NodeInit, []Path, error) {
 	ctor := nt.Ctor
 	sub := NewExecutorShared(ex)
-	sub.CopyUnknown = true
 	if nt.factory {
 		sub.Allocators = map[uint32]bool{}
 		for _, va := range allocators {
@@ -735,11 +737,6 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 			return err
 		}
 	}
-	textDraw, err := rm.textDrawStates(d, types["Text"].Slots[slot/4])
-	if err != nil {
-		return err
-	}
-	dm.TextDraw = textDraw
 	if err := summarize(bufferDraw); err != nil {
 		return err
 	}
@@ -778,6 +775,13 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 				if off, ok := thisField(e.Args[0]); ok {
 					dm.BufferFields["primitive"] = off
 				}
+				// The XDK's inlined indexed draw hands the device its own index data global, offset by the start index
+				if global, ok := indexDataGlobal(e.Args[2]); ok {
+					if dm.IndexData != 0 && dm.IndexData != global {
+						return fmt.Errorf("xbe: buffer draw %08X draws through index data globals %08X and %08X", bufferDraw, dm.IndexData, global)
+					}
+					dm.IndexData = global
+				}
 				// The count derives from one field besides the primitive type that scales it.
 				set := map[string]bool{}
 				exprSyms(e.Args[1], set)
@@ -808,6 +812,9 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		if _, ok := dm.BufferFields[name]; !ok {
 			return fmt.Errorf("xbe: buffer draw %08X does not reveal the %s field", bufferDraw, name)
 		}
+	}
+	if dm.IndexData == 0 {
+		return fmt.Errorf("xbe: buffer draw %08X draws through no index data global", bufferDraw)
 	}
 	// The load slot is the virtual call on the mesh whose Sphere override stores a buffer format and stride
 	if err := summarize(dm.MeshLoaded); err != nil {
@@ -871,6 +878,24 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	}
 	rm.Draw = dm
 	return nil
+}
+
+// The global an index pointer argument loads, offset or not
+func indexDataGlobal(e Expr) (uint32, bool) {
+	switch v := e.(type) {
+	case Load:
+		if v.Base == "" && v.Addr == nil && v.Size == 4 {
+			return uint32(v.Off), true
+		}
+	case Bin:
+		if v.Op == "add" {
+			if g, ok := indexDataGlobal(v.A); ok {
+				return g, true
+			}
+			return indexDataGlobal(v.B)
+		}
+	}
+	return 0, false
 }
 
 // Finds the object field whose value the paths store into a global
@@ -986,6 +1011,10 @@ func (rm *RenderModel) collectStrings(d *Disassembly, p Path, out map[uint32]str
 			walk(v.B)
 		case Not:
 			walk(v.A)
+		case Sel:
+			walk(v.C)
+			walk(v.A)
+			walk(v.B)
 		case Load:
 			if v.Addr != nil {
 				walk(v.Addr)
@@ -1099,137 +1128,6 @@ func argWord(e Expr) bool {
 		return ok && s.Name == "arg0" && a.Op == "add" && isZero && c == 0
 	}
 	return false
-}
-
-// Collects the render states the text draw sets, split at the virtual glyph draw after the first, whether it
-// calls the wrapper or sets them through the XDK routines and state tables the wrapper inlined
-func (rm *RenderModel) textDrawStates(d *Disassembly, va uint32) (TextDraw, error) {
-	fn := d.Functions[va]
-	if fn == nil {
-		return TextDraw{}, fmt.Errorf("xbe: text draw %08X is not disassembled", va)
-	}
-	td := TextDraw{VA: va}
-	methods := map[uint32]uint32{}
-	for idx, name := range rm.StateNames {
-		for method, mname := range rm.NVStateNames {
-			if sameStateName(mname, name) {
-				methods[method] = idx
-			}
-		}
-	}
-	names := map[string]uint32{}
-	for idx, name := range rm.StateNames {
-		names[strings.ToUpper(strings.ReplaceAll(name, "_", ""))] = idx
-	}
-	layout, _ := d.deviceState()
-	drawn := false
-	record := func(pair [2]uint32) {
-		if drawn {
-			td.After = append(td.After, pair)
-		} else {
-			td.Before = append(td.Before, pair)
-		}
-	}
-	visited := map[uint32]bool{}
-	helpers := false
-	var walk func(fn *Function, depth int) error
-	walk = func(fn *Function, depth int) error {
-		ins := fn.Instructions
-		for i := range ins {
-			in := &ins[i]
-			// A deferred state the wrapper inlined is a constant store into the XDK's state table.
-			if in.Inst.Op == x86asm.MOV && layout != nil && layout.renders != nil {
-				if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base == 0 && m.Index == 0 {
-					if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-						if _, state, ok := layout.renders.locate(uint32(m.Disp)); ok {
-							record([2]uint32{state, uint32(imm)})
-						}
-					}
-				}
-				continue
-			}
-			if in.Inst.Op != x86asm.CALL {
-				continue
-			}
-			if _, indirect := in.Inst.Args[0].(x86asm.Mem); indirect {
-				if len(td.Before) > 0 {
-					drawn = true
-				}
-				continue
-			}
-			target := resolveTarget(in)
-			callee := d.Functions[target]
-			if callee == nil {
-				continue
-			}
-			// A dashboard helper the draw calls sets its states at the call's position.
-			if helpers && callee.Symbol == nil && target != rm.Wrapper && !visited[target] && depth < 2 && !d.inLibrary(target) {
-				visited[target] = true
-				if err := walk(callee, depth+1); err != nil {
-					return err
-				}
-				continue
-			}
-			args := d.siteArguments(fn, i)
-			value := func(loc argLocation) (uint32, bool) {
-				if loc.Reg != 0 {
-					v, ok := args.regs[loc.Reg]
-					return v, ok
-				}
-				if loc.Stack < len(args.stack) {
-					return args.stack[loc.Stack], args.known[loc.Stack]
-				}
-				return 0, false
-			}
-			switch {
-			case target == rm.Wrapper:
-				st, ok1 := value(rm.wrapperState)
-				v, ok2 := value(rm.wrapperValue)
-				if !ok1 || !ok2 {
-					return fmt.Errorf("xbe: text draw %08X calls the render state wrapper at %08X without constant arguments", va, in.VA)
-				}
-				record([2]uint32{st, v})
-			case callee.Symbol != nil && callee.Symbol.Name == "D3DDevice_SetRenderState_Simple":
-				m, ok1 := args.regs[x86asm.ECX]
-				v, ok2 := args.regs[x86asm.EDX]
-				st, known := methods[m]
-				if !ok1 || !ok2 || !known {
-					return fmt.Errorf("xbe: text draw %08X sets a simple render state at %08X without a constant method and value", va, in.VA)
-				}
-				record([2]uint32{st, v})
-			case rm.setterStates[target] != 0:
-				// A complex state's setter is known from the index the wrapper dispatches it under.
-				v, ok := value(argLocation{Stack: 0})
-				if !ok {
-					return fmt.Errorf("xbe: text draw %08X calls the setter of state %d at %08X without a constant value", va, rm.setterStates[target], in.VA)
-				}
-				record([2]uint32{rm.setterStates[target], v})
-			case callee.Symbol != nil && strings.HasPrefix(callee.Symbol.Name, "D3DDevice_SetRenderState_"):
-				st, known := names[strings.ToUpper(strings.TrimPrefix(callee.Symbol.Name, "D3DDevice_SetRenderState_"))]
-				v, ok := value(argLocation{Stack: 0})
-				if !known || !ok {
-					return fmt.Errorf("xbe: text draw %08X calls %s at %08X without a constant value", va, callee.Symbol.Name, in.VA)
-				}
-				record([2]uint32{st, v})
-			}
-		}
-		return nil
-	}
-	// The draw sets the states itself, or else through the helpers it calls.
-	for _, helpers = range []bool{false, true} {
-		td.Before, td.After, drawn = nil, nil, false
-		visited = map[uint32]bool{va: true}
-		if err := walk(fn, 0); err != nil {
-			return TextDraw{}, err
-		}
-		if len(td.Before) > 0 && len(td.After) > 0 {
-			break
-		}
-	}
-	if len(td.Before) == 0 || len(td.After) == 0 {
-		return TextDraw{}, fmt.Errorf("xbe: text draw %08X sets %d render states before and %d after its glyph draw", va, len(td.Before), len(td.After))
-	}
-	return td, nil
 }
 
 // Finds the vtable slot whose Shape method stores the mesh it draws into the current mesh global

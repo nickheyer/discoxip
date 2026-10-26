@@ -291,6 +291,32 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 			mask = mkBin("or", mask, mkBin("shl", bit, IConst{uint32(i)}))
 		}
 		ex.setOperand(s, in, args[0], 4, mask)
+	case x86asm.PSHUFW:
+		// Each result word takes the source word the immediate's two bits for it select
+		sel, _ := args[2].(x86asm.Imm)
+		src := [2]Expr{ex.bitsLane(s, in, args[1], 0), ex.bitsLane(s, in, args[1], 1)}
+		word := func(k int) Expr {
+			if k%2 == 0 {
+				return mkUn("zx16", src[k/2])
+			}
+			return mkBin("shr", src[k/2], IConst{16})
+		}
+		pick := func(i int) Expr { return word(int(sel>>(2*i)) & 3) }
+		s.mm[dm] = [2]Expr{mkBin("or", pick(0), mkBin("shl", pick(1), IConst{16})), mkBin("or", pick(2), mkBin("shl", pick(3), IConst{16}))}
+	case x86asm.PUNPCKLDQ, x86asm.PUNPCKHDQ:
+		// The low or high doublewords of the two operands interleave
+		half := 0
+		if op == x86asm.PUNPCKHDQ {
+			half = 1
+		}
+		switch {
+		case dstMMX:
+			s.mm[dm] = [2]Expr{s.mmLane(dm, half), ex.bitsLane(s, in, args[1], half)}
+		case dstXMM:
+			s.xmm[dx] = [4]Expr{s.xmmLane(dx, 2*half), ex.floatLane(s, in, args[1], 2*half), s.xmmLane(dx, 2*half+1), ex.floatLane(s, in, args[1], 2*half+1)}
+		default:
+			return false, nil
+		}
 	case x86asm.PUNPCKLWD:
 		d0 := s.mmLane(dm, 0)
 		s0 := ex.bitsLane(s, in, args[1], 0)

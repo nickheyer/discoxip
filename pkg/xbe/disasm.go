@@ -41,6 +41,8 @@ type Disassembly struct {
 	ctors           map[uint32]ctorInfo
 	clobbers        map[uint32][]x86asm.Reg
 	liveIns         map[uint32][]x86asm.Reg
+	liveFloatIns    map[uint32][]x86asm.Reg
+	savePushes      map[uint32]map[uint32]bool
 	conventions     map[uint32]callConvention
 	probe           *Executor
 	librarySections map[*Section]bool
@@ -91,6 +93,7 @@ func Disassemble(img *Image) (*Disassembly, error) {
 	}
 	d.nameSecurityCheck()
 	d.nameStackProbe()
+	d.nameMemoryRoutines()
 
 	// Step 6: Read the library bodies the optimizer expanded into the dashboard's code as the calls they replaced.
 	d.scanResourceRefs()
@@ -217,6 +220,34 @@ func (d *Disassembly) discoverFunctions() {
 	for _, va := range d.pointerTargets() {
 		entries[va] = true
 	}
+	// The cases a jump table names belong to the routine switching through it, not to functions of their own
+	for _, insn := range d.InsnByVA {
+		if insn.Inst.Op != x86asm.JMP || resolveTarget(insn) != 0 {
+			continue
+		}
+		if sec := d.sectionOf(insn.VA); sec != nil {
+			for _, t := range d.jumpTableTargets(insn, sec) {
+				delete(entries, t)
+			}
+		}
+	}
+
+	// A lone jump at an entry is a thunk, its target a function of its own, along the whole chain
+	for added := true; added; {
+		added = false
+		for va := range entries {
+			insn := d.InsnByVA[va]
+			if insn == nil || insn.Inst.Op != x86asm.JMP {
+				continue
+			}
+			t := resolveTarget(insn)
+			if t == 0 || t == va || entries[t] || d.InsnByVA[t] == nil {
+				continue
+			}
+			entries[t] = true
+			added = true
+		}
+	}
 
 	// Sort entries.
 	sortedEntries := make([]uint32, 0, len(entries))
@@ -339,6 +370,11 @@ func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool,
 			}
 			if isJump(op) {
 				t := resolveTarget(insn)
+				// A jump to the instruction after it only pads the code, so the routine carries on through it
+				if t == next && op == x86asm.JMP {
+					va = next
+					continue
+				}
 				if t == 0 {
 					for _, jt := range d.jumpTableTargets(insn, sec) {
 						work = append(work, jt)

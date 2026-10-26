@@ -35,6 +35,7 @@ var xdkParameters = map[string][]paramKind{
 	"D3DDevice_DrawVertices":                  {kindStored, kindCombined, kindCount},
 	"D3DDevice_DrawIndexedVertices":           {kindStored, kindCount, kindPointer},
 	"D3DDevice_SetTexture":                    {kindIndex, kindPointer},
+	"D3DDevice_SetPalette":                    {kindIndex, kindPointer},
 	"D3DDevice_SetStreamSource":               {kindIndex, kindPointer, kindStored},
 	"D3DDevice_SetIndices":                    {kindPointer, kindStored},
 	"D3DDevice_SetVertexShader":               {kindFlags},
@@ -124,10 +125,24 @@ func (d *Disassembly) convention(fn *Function) (callConvention, error) {
 	}
 	canonical, hasCanonical := canonicalArgBytes(sym.Name)
 	switch {
+	case sym.Cdecl && len(regs) > 0:
+		// A caller cleaned routine whose body reads registers on entry is passed them by the optimized build, ahead of
+		// the stack arguments its body reads
+		for _, r := range regs {
+			conv.params = append(conv.params, argLocation{Reg: r})
+		}
+		for i := 0; i < d.stackInputs(fn); i++ {
+			conv.params = append(conv.params, argLocation{Stack: i})
+		}
+		conv.known = true
 	case sym.Cdecl || sym.FastCall:
 	case len(regs) == 0, hasCanonical && canonical == stackBytes:
 	case !hasCanonical && len(regs) == 1 && regs[0] == x86asm.ECX:
 		// A member function reading only ecx is a plain thiscall.
+	case hasCanonical && stackBytes == 0 && len(regs) == 1 && canonical == 4:
+		// The optimized build passes the signature's one parameter in the one register the body reads
+		conv.params = []argLocation{{Reg: regs[0]}}
+		conv.known = true
 	case !hasCanonical:
 		// An internal helper has no signature, so its register inputs are listed in a fixed order before the stack.
 		for _, r := range regs {
@@ -140,7 +155,16 @@ func (d *Disassembly) convention(fn *Function) (callConvention, error) {
 	default:
 		kinds, declared := xdkParameters[sym.Name]
 		if !declared {
-			return callConvention{}, fmt.Errorf("xbe: %s at %08X takes %v in registers and %d stack bytes of its %d, and its parameters are not declared", sym.Name, fn.EntryVA, regs, stackBytes, canonical)
+			// An undeclared routine is only ever run from the image, so its callers pass the registers it reads in a fixed
+			// order before its stack arguments, as an internal helper's do
+			for _, r := range regs {
+				conv.params = append(conv.params, argLocation{Reg: r})
+			}
+			for i := 0; i < stackBytes/4; i++ {
+				conv.params = append(conv.params, argLocation{Stack: i})
+			}
+			conv.known = true
+			break
 		}
 		roles, err := d.inputRoles(fn, regs, stackBytes/4)
 		if err != nil {
@@ -240,15 +264,44 @@ func matchParameters(name string, kinds []paramKind, roles map[argLocation]roleS
 		}
 	}
 	search(0)
+	// The optimizer passes a routine's leading parameters in registers and the rest on the stack in order
+	var ordered [][]argLocation
+	for _, sol := range solutions {
+		if passedInOrder(sol) {
+			ordered = append(ordered, sol)
+		}
+	}
 	switch {
 	case len(solutions) == 1:
 		return solutions[0], nil
 	case len(solutions) > 1 && len(exact) == 1:
 		return exact[0], nil
+	case len(solutions) > 1 && len(ordered) == 1:
+		return ordered[0], nil
 	case len(solutions) == 0:
 		return nil, fmt.Errorf("xbe: no input of %s fits each declared parameter (%s)", name, strings.Join(describe, " "))
 	}
 	return nil, fmt.Errorf("xbe: %d assignments of the inputs of %s fit its declared parameters (%s)", len(solutions), name, strings.Join(describe, " "))
+}
+
+// Reports whether an assignment puts every register parameter before every stack one and the stack ones in order
+func passedInOrder(sol []argLocation) bool {
+	stacked, last := false, -1
+	for _, loc := range sol {
+		switch {
+		case loc.None:
+		case loc.Reg != 0:
+			if stacked {
+				return false
+			}
+		default:
+			if loc.Stack <= last {
+				return false
+			}
+			stacked, last = true, loc.Stack
+		}
+	}
+	return true
 }
 
 func (l argLocation) String() string {
@@ -431,6 +484,10 @@ func walkInputUses(d *Disassembly, e Expr, names map[string]argLocation, roles m
 			}
 		case Elem:
 			walk(v.A)
+		case Sel:
+			walk(v.C)
+			walk(v.A)
+			walk(v.B)
 		}
 	}
 	walk(e)

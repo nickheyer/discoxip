@@ -22,6 +22,12 @@ type construction struct {
 
 var argumentRegisters = []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX, x86asm.EBX, x86asm.ESI, x86asm.EDI}
 
+// Vector registers a routine compiled for them takes a float input in
+var floatArgumentRegisters = []x86asm.Reg{x86asm.X0, x86asm.X1, x86asm.X2, x86asm.X3}
+
+// Every vector register, all of which a call may leave changed
+var vectorRegisters = []x86asm.Reg{x86asm.X0, x86asm.X1, x86asm.X2, x86asm.X3, x86asm.X4, x86asm.X5, x86asm.X6, x86asm.X7}
+
 // Maps a register of any width to the 32 bit register it belongs to
 func wideRegister(r x86asm.Reg) x86asm.Reg {
 	idx, ok := regIndex[r]
@@ -35,13 +41,13 @@ func wideRegister(r x86asm.Reg) x86asm.Reg {
 func writtenRegisters(in *Instruction) []x86asm.Reg {
 	var out []x86asm.Reg
 	switch in.Inst.Op {
-	case x86asm.PUSH, x86asm.CMP, x86asm.TEST, x86asm.RET, x86asm.JMP, x86asm.NOP, x86asm.FLD, x86asm.FILD, x86asm.FST, x86asm.FSTP, x86asm.FIST, x86asm.FISTP,
+	case x86asm.PUSH, x86asm.CMP, x86asm.TEST, x86asm.RET, x86asm.JMP, x86asm.NOP, x86asm.OUT, x86asm.FLD, x86asm.FILD, x86asm.FST, x86asm.FSTP, x86asm.FIST, x86asm.FISTP,
 		x86asm.FCOM, x86asm.FCOMP, x86asm.FCOMPP, x86asm.FUCOM, x86asm.FUCOMP, x86asm.FUCOMPP, x86asm.FICOM, x86asm.FICOMP,
 		x86asm.FADD, x86asm.FSUB, x86asm.FSUBR, x86asm.FMUL, x86asm.FDIV, x86asm.FDIVR, x86asm.FIADD, x86asm.FISUB, x86asm.FISUBR, x86asm.FIMUL, x86asm.FIDIV, x86asm.FIDIVR,
 		x86asm.FADDP, x86asm.FSUBP, x86asm.FSUBRP, x86asm.FMULP, x86asm.FDIVP, x86asm.FDIVRP, x86asm.FXCH, x86asm.FCHS, x86asm.FABS, x86asm.FLD1, x86asm.FLDZ, x86asm.FLDCW, x86asm.FNSTCW:
 		return nil
 	case x86asm.CALL:
-		return []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX}
+		return callerSaved
 	case x86asm.CDQ, x86asm.CWD:
 		return []x86asm.Reg{x86asm.EDX}
 	case x86asm.DIV, x86asm.IDIV, x86asm.MUL:
@@ -83,12 +89,17 @@ func registerMove(in *Instruction) (dst, src x86asm.Reg, ok bool) {
 	return d, s, true
 }
 
-var callerSaved = []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX}
+var callerSaved = append([]x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX}, vectorRegisters...)
 
-// Lists the caller saved registers a call target writes, itself or through the functions it calls
+// Lists the caller saved registers a call target writes, itself or through the functions it calls or jumps out to,
+// a target with no body the image carries writing any of them
 func (d *Disassembly) callClobbers(target uint32) []x86asm.Reg {
 	fn, ok := d.Functions[target]
-	if !ok || fn.Symbol != nil {
+	if ok && fn.Symbol != nil && fn.Symbol.Name == "_security_check_cookie" {
+		// The cookie check compares and returns, leaving every register as it found it
+		return nil
+	}
+	if !ok {
 		return callerSaved
 	}
 	if d.clobbers == nil {
@@ -99,10 +110,11 @@ func (d *Disassembly) callClobbers(target uint32) []x86asm.Reg {
 	}
 	d.clobbers[target] = nil
 	set := map[x86asm.Reg]bool{}
+	index := fn.instructionIndex()
 	for i := range fn.Instructions {
 		in := &fn.Instructions[i]
 		var written []x86asm.Reg
-		if in.Inst.Op == x86asm.CALL {
+		if _, within := index[resolveTarget(in)]; in.Inst.Op == x86asm.CALL || (in.Inst.Op == x86asm.JMP && !within) {
 			written = d.callClobbers(resolveTarget(in))
 		} else {
 			written = writtenRegisters(in)
@@ -381,7 +393,17 @@ func registersRead(in *Instruction, prologueSave bool) []x86asm.Reg {
 	add := func(r x86asm.Reg) {
 		if _, ok := regIndex[r]; ok {
 			out = append(out, wideRegister(r))
+		} else if _, ok := xmmIndex(r); ok {
+			out = append(out, r)
 		}
+	}
+	// A move of a register onto itself is the compiler's padding and reads nothing
+	if dst, src, ok := registerMove(in); ok && dst == src {
+		return nil
+	}
+	// Clearing a vector register against itself reads nothing
+	if (in.Inst.Op == x86asm.XORPS || in.Inst.Op == x86asm.PXOR || in.Inst.Op == x86asm.XORPD) && argCount(in) == 2 && sameArg(in.Inst.Args[0], in.Inst.Args[1]) {
+		return nil
 	}
 	switch in.Inst.Op {
 	case x86asm.CDQ, x86asm.CWD:
@@ -430,8 +452,10 @@ func registersRead(in *Instruction, prologueSave bool) []x86asm.Reg {
 // Reports whether an instruction reads its destination operand before writing it
 func readsFirstOperand(in *Instruction) bool {
 	switch in.Inst.Op {
-	case x86asm.MOV, x86asm.MOVZX, x86asm.MOVSX, x86asm.LEA, x86asm.POP, x86asm.SETE, x86asm.SETNE, x86asm.SETL, x86asm.SETGE, x86asm.SETLE, x86asm.SETG, x86asm.SETB, x86asm.SETAE, x86asm.SETBE, x86asm.SETA, x86asm.SETS, x86asm.SETNS, x86asm.SETP, x86asm.SETNP,
-		x86asm.MOVD, x86asm.MOVSS, x86asm.MOVAPS, x86asm.MOVUPS, x86asm.CVTSI2SS, x86asm.CVTTSS2SI, x86asm.CVTSS2SI, x86asm.FNSTSW, x86asm.LAHF:
+	case x86asm.MOV, x86asm.MOVZX, x86asm.MOVSX, x86asm.LEA, x86asm.POP, x86asm.IN, x86asm.SETE, x86asm.SETNE, x86asm.SETL, x86asm.SETGE, x86asm.SETLE, x86asm.SETG, x86asm.SETB, x86asm.SETAE, x86asm.SETBE, x86asm.SETA, x86asm.SETS, x86asm.SETNS, x86asm.SETP, x86asm.SETNP,
+		x86asm.MOVD, x86asm.MOVSS, x86asm.MOVAPS, x86asm.MOVUPS, x86asm.CVTSI2SS, x86asm.CVTTSS2SI, x86asm.CVTSS2SI, x86asm.FNSTSW, x86asm.LAHF,
+		x86asm.MOVSD_XMM, x86asm.MOVQ, x86asm.MOVLPS, x86asm.MOVDQA, x86asm.MOVDQU, x86asm.MOVNTPS, x86asm.SQRTSS, x86asm.SQRTPS, x86asm.RSQRTSS, x86asm.RSQRTPS, x86asm.RCPSS, x86asm.RCPPS,
+		x86asm.CVTSS2SD, x86asm.CVTSD2SS, x86asm.CVTSI2SD, x86asm.CVTTSD2SI, x86asm.CVTSD2SI, x86asm.CVTDQ2PS, x86asm.CVTPS2DQ, x86asm.CVTTPS2DQ, x86asm.PSHUFD, x86asm.PSHUFW:
 		return false
 	case x86asm.XOR, x86asm.SUB, x86asm.SBB:
 		if argCount(in) == 2 {
@@ -443,6 +467,15 @@ func readsFirstOperand(in *Instruction) bool {
 		}
 	case x86asm.IMUL:
 		return argCount(in) < 3
+	case x86asm.OR, x86asm.AND:
+		// Or with every bit set and and with none fix the word whatever it held
+		if r, isReg := in.Inst.Args[0].(x86asm.Reg); isReg && argCount(in) == 2 {
+			if size, _ := regSize(r); size == 4 {
+				if v, isImm := in.Inst.Args[1].(x86asm.Imm); isImm && ((in.Inst.Op == x86asm.OR && uint32(v) == 0xFFFFFFFF) || (in.Inst.Op == x86asm.AND && uint32(v) == 0)) {
+					return false
+				}
+			}
+		}
 	}
 	return true
 }

@@ -18,10 +18,17 @@ var mathIntrinsics = map[string]mathIntrinsic{
 	"fmod": {"fmod", 2}, "pow": {"fpow", 2}, "atan2": {"fatan2", 2},
 }
 
-// Recognizes a runtime math thunk by the function name its descriptor names after the descriptor's leading byte
+// Recognizes a runtime math thunk by the function name its descriptor names after the descriptor's leading byte,
+// the power thunk by the exponent and base it spills off the x87 stack for its core
 func (d *Disassembly) mathIntrinsic(target uint32) (mathIntrinsic, bool) {
 	fn := d.Functions[target]
-	if fn == nil || len(fn.Instructions) != 2 || fn.Instructions[0].Inst.Op != x86asm.MOV || fn.Instructions[1].Inst.Op != x86asm.JMP {
+	if fn == nil {
+		return mathIntrinsic{}, false
+	}
+	if d.powThunk(fn) {
+		return mathIntrinsics["pow"], true
+	}
+	if len(fn.Instructions) != 2 || fn.Instructions[0].Inst.Op != x86asm.MOV || fn.Instructions[1].Inst.Op != x86asm.JMP {
 		return mathIntrinsic{}, false
 	}
 	r, ok := fn.Instructions[0].Inst.Args[0].(x86asm.Reg)
@@ -35,6 +42,74 @@ func (d *Disassembly) mathIntrinsic(target uint32) (mathIntrinsic, bool) {
 	}
 	m, ok := mathIntrinsics[readCString(raw[1:], 0)]
 	return m, ok
+}
+
+// Recognizes the power thunk as a short routine swapping the x87 top, spilling it and calling a core that scales by a logarithm
+func (d *Disassembly) powThunk(fn *Function) bool {
+	if len(fn.Instructions) > 12 {
+		return false
+	}
+	swapped, spilled, core := false, 0, uint32(0)
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		switch in.Inst.Op {
+		case x86asm.FXCH:
+			swapped = true
+		case x86asm.FSTP, x86asm.FST:
+			if _, ok := in.Inst.Args[0].(x86asm.Mem); ok {
+				spilled++
+			}
+		case x86asm.CALL:
+			core = resolveTarget(in)
+		}
+	}
+	if !swapped || spilled < 2 || core == 0 || d.Functions[core] == nil {
+		return false
+	}
+	logs, scales := false, false
+	for i := range d.Functions[core].Instructions {
+		switch d.Functions[core].Instructions[i].Inst.Op {
+		case x86asm.FYL2X:
+			logs = true
+		case x86asm.FSCALE:
+			scales = true
+		}
+	}
+	return logs && scales
+}
+
+// Names the C runtime copy and fill routines by their shape, a repeated string move or store dispatching through jump tables
+func (d *Disassembly) nameMemoryRoutines() {
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil || len(fn.Instructions) > 400 {
+			continue
+		}
+		moves, stores, tables, calls := false, false, 0, false
+		for i := range fn.Instructions {
+			in := &fn.Instructions[i]
+			switch in.Inst.Op {
+			case x86asm.MOVSD:
+				moves = moves || hasRep(in)
+			case x86asm.STOSD:
+				stores = stores || hasRep(in)
+			case x86asm.CALL:
+				calls = true
+			case x86asm.JMP:
+				if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Index != 0 && m.Scale == 4 && m.Base == 0 {
+					tables++
+				}
+			}
+		}
+		if calls || tables < 2 || moves == stores {
+			continue
+		}
+		if moves {
+			d.nameByUsage(va, "_memcpy")
+		} else {
+			d.nameByUsage(va, "_memset")
+		}
+	}
 }
 
 // Recognizes the stack cookie check the optimizer calls on return from every guarded function

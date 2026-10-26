@@ -12,6 +12,7 @@ const (
 	createVertexBuffer = "D3DDevice_CreateVertexBuffer2"
 	lockVertexBuffer   = "D3DVertexBuffer_Lock2"
 	setTextureCall     = "D3DDevice_SetTexture"
+	setPaletteCall     = "D3DDevice_SetPalette"
 	requestSpace       = "D3D::MakeRequestedSpace"
 	blockOnTime        = "D3D_BlockOnTime"
 	destroyResource    = "D3D::DestroyResource"
@@ -77,6 +78,11 @@ func (d *Disassembly) scanResourceCalls() {
 			continue
 		}
 		if t, ok := d.stageTokens(fn, r.device); ok {
+			// Binding a texture marks the stage's status word when the slot empties, binding a palette marks nothing
+			if t.status == 0 {
+				d.nameByUsage(va, setPaletteCall)
+				continue
+			}
 			t.va = va
 			r.textures = append(r.textures, t)
 			d.nameByUsage(va, setTextureCall)
@@ -548,7 +554,7 @@ func (ex *Executor) foldResources(p Path, r *resourceCalls) (Path, bool, error) 
 		// Memory the lock handed back reads and writes as the buffer of the call, the way a plain build has it
 		if l, isLoad := e.(Load); isLoad && l.Addr != nil {
 			if seq, off, found := r.dataAddress(l.Addr); found && locks[seq].Fn != "" {
-				return Load{Base: fmt.Sprintf("res%d", seq), Off: off, Size: l.Size}, true
+				return Load{Base: fmt.Sprintf("res%d", seq), Off: off, Size: l.Size, Epoch: l.Epoch}, true
 			}
 		}
 		if s, _, ok := maskedAllocation(e, r); ok && locks[s].Fn != "" {
@@ -650,7 +656,7 @@ func (ex *Executor) foldResources(p Path, r *resourceCalls) (Path, bool, error) 
 			for j, x := range b.Elems {
 				elems[j] = mapExpr(x, subst)
 			}
-			buffers[k] = ArgBuffer{Index: b.Index, Elems: elems}
+			buffers[k] = ArgBuffer{Index: b.Index, Elems: elems, Sizes: b.Sizes}
 		}
 		e.Buffers = buffers
 		out.Effects = append(out.Effects, e)

@@ -59,7 +59,14 @@ func init() {
 	}
 	renderCmd.Flags().StringVarP(&xbeRenderOutput, "output", "o", "", "output file (default: stdout)")
 
-	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, symbolsCmd, renderCmd)
+	liftCmd := &cobra.Command{
+		Use:   "lift <file.xbe> <va>...",
+		Short: "Lift routines block by block and print the blocks",
+		Args:  cobra.MinimumNArgs(2),
+		RunE:  runXBELift,
+	}
+
+	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, symbolsCmd, renderCmd, liftCmd)
 	rootCmd.AddCommand(xbeCmd)
 }
 
@@ -232,7 +239,7 @@ func runXBERender(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "transforms %v clock %+v hierarchy alpha %08X accessor %+v wrapper %08X\n", rm.Transforms, rm.Clock, rm.HierarchyAlpha, rm.Accessor, rm.Wrapper)
 	fmt.Fprintf(os.Stderr, "fixed function %+v\n", rm.FixedFunction)
 	fmt.Fprintf(os.Stderr, "state names %v\n", rm.StateNames)
-	fmt.Fprintf(os.Stderr, "defaults paths %d node constant paths %d\n", len(rm.Defaults), len(rm.NodeConstants))
+	fmt.Fprintf(os.Stderr, "defaults paths %d lifted routines %d\n", len(rm.Defaults), len(rm.Lifted))
 	data, err := json.MarshalIndent(rm, "", " ")
 	if err != nil {
 		return err
@@ -245,4 +252,33 @@ func runXBERender(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	return os.WriteFile(xbeRenderOutput, data, 0o644)
+}
+
+// Lifts each routine named by address and prints its blocks, effects, register outputs and terminators
+func runXBELift(cmd *cobra.Command, args []string) error {
+	img, err := xbe.Open(args[0])
+	if err != nil {
+		return err
+	}
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+	ex := xbe.NewExecutor(d)
+	for _, a := range args[1:] {
+		var va uint32
+		if _, err := fmt.Sscanf(a, "%x", &va); err != nil {
+			return fmt.Errorf("lift: %q is no address", a)
+		}
+		lf, err := ex.Lift(va)
+		if err != nil {
+			fmt.Printf("== %08X: %v\n", va, err)
+		} else {
+			fmt.Printf("== %08X\n", va)
+		}
+		if lf != nil {
+			fmt.Print(lf)
+		}
+	}
+	return nil
 }

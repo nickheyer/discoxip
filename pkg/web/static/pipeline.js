@@ -14,12 +14,15 @@ const TOP = { 1: 'DISABLE', 2: 'SELECTARG1', 3: 'SELECTARG2', 4: 'MODULATE', 5: 
 // Xbox render state enums use OpenGL numbering
 const GL_NEVER = 0x200, GL_ALWAYS = 0x207, GL_CW = 0x900, GL_CCW = 0x901;
 
-// D3D transform states and primitive types
+// D3D transform states and the Xbox primitive types
 const TS_VIEW = 0, TS_PROJECTION = 1, TS_WORLD = 6;
-const PT_TRIANGLELIST = 4, PT_TRIANGLESTRIP = 5, PT_TRIANGLEFAN = 6;
+const PT_TRIANGLELIST = 5, PT_TRIANGLESTRIP = 6, PT_TRIANGLEFAN = 7, PT_QUADLIST = 8, PT_QUADSTRIP = 9, PT_POLYGON = 10;
 
 // Flexible vertex format bits
 const FVF_XYZ = 0x002, FVF_XYZRHW = 0x004, FVF_NORMAL = 0x010, FVF_DIFFUSE = 0x040, FVF_SPECULAR = 0x080, FVF_TEXCOUNT_SHIFT = 8, FVF_TEXCOUNT_MASK = 0xF00;
+
+// NV2A texture color format whose eight bit texels index the stage's palette of D3DCOLOR entries
+const COLOR_SZ_I8_A8R8G8B8 = 0x0B;
 
 export class DevicePipeline {
   constructor(THREE, model, textures) {
@@ -86,7 +89,7 @@ export class DevicePipeline {
     u.u_tfactor.value = new THREE.Vector4(((tf >>> 16) & 255) / 255, ((tf >>> 8) & 255) / 255, (tf & 255) / 255, (tf >>> 24) / 255);
     for (const st of plan.stages) {
       if (st.texture) {
-        const tex = this.resolveTexture(snapshot.textures[st.index], st);
+        const tex = this.resolveTexture(snapshot.textures[st.index], snapshot.palettes[st.index], st);
         u['u_tex' + st.index].value = tex;
       }
       if (st.transform) {
@@ -98,9 +101,9 @@ export class DevicePipeline {
     this.applyRenderStates(material, snapshot.rs);
   }
 
-  // Wrap modes come from the stage's address states, applied to the bound texture
-  resolveTexture(handle, st) {
-    const tex = this.textures.resolve(handle);
+  // Wrap modes come from the stage's address states, applied to the bound texture, a palettized one read through the stage's palette
+  resolveTexture(handle, palette, st) {
+    const tex = this.textures.resolve(handle, palette);
     if (!tex) throw new Error(`texture ${JSON.stringify(handle)} bound at stage ${st.index} is not loaded`);
     const THREE = this.THREE;
     const wrapU = this.wrapModes[st.addressU], wrapV = this.wrapModes[st.addressV];
@@ -205,7 +208,9 @@ export class DevicePipeline {
     }
     let constantCount = 0;
     if (program) for (const c of program.constants) if (c >= 0 && c + 1 > constantCount) constantCount = c + 1;
-    const key = JSON.stringify({ p: program ? program.va : 0, attributes, stages: stages.map((s) => [s.colorOp, s.alphaOp, s.colorArg0, s.colorArg1, s.colorArg2, s.alphaArg0, s.alphaArg1, s.alphaArg2, s.resultArg, s.texcoord, s.transform, s.texture]), alphaTest });
+    let key = `${program ? program.va : 0}|${alphaTest}|`;
+    for (const name in attributes) key += `${name}=${attributes[name]},`;
+    for (const s of stages) key += `|${s.colorOp},${s.alphaOp},${s.colorArg0},${s.colorArg1},${s.colorArg2},${s.alphaArg0},${s.alphaArg1},${s.alphaArg2},${s.resultArg},${s.texcoord},${s.transform},${s.texture ? 1 : 0}`;
     return { key, program, declaration, stages, alphaTest, attributes, constantCount };
   }
 
@@ -332,6 +337,27 @@ function hex8(v) {
 }
 
 // Describes exported mesh geometry for the pipeline: attributes by semantic and by byte offset
+// Bytes of palette a texture of a color format can index, its every index reaching a D3DCOLOR entry
+export function paletteBytes(format) {
+  if (format !== COLOR_SZ_I8_A8R8G8B8) throw new Error(`texture color format 0x${format.toString(16)} indexes no palette`);
+  return 4 * 256;
+}
+
+// Decodes a level's texels into RGBA bytes in row order the way the GPU samples its color format, each texel read
+// from the swizzled one the unswizzle table names
+export function decodeTexels(format, bpp, texels, unswizzled, palette, pixels) {
+  if (format !== COLOR_SZ_I8_A8R8G8B8) throw new Error(`texture color format 0x${format.toString(16)} is not decoded by the GPU model`);
+  if (bpp !== 1) throw new Error(`indexed texels of ${bpp} bytes`);
+  if (!palette) throw new Error('an indexed texture is bound with no palette on its stage');
+  for (let i = 0; i < unswizzled.length; i++) {
+    const e = 4 * texels[unswizzled[i]];
+    pixels[4 * i] = palette[e + 2];
+    pixels[4 * i + 1] = palette[e + 1];
+    pixels[4 * i + 2] = palette[e];
+    pixels[4 * i + 3] = palette[e + 3];
+  }
+}
+
 export function describeGeometry(entry) {
   const byOffset = {};
   for (const a of entry.attributes) byOffset[a.offset] = a;
@@ -352,21 +378,28 @@ export function describeFVF(fvf) {
   return { format: fvf, stride: offset, attributes, byOffset: Object.fromEntries(attributes.map((a) => [a.offset, a])) };
 }
 
-// Indices that draw a D3D primitive range of a non indexed stream as triangles
-export function primitiveIndices(primitive, start, count) {
+// The triangle list a run of vertex indices draws as an Xbox primitive type
+export function primitiveTriangles(primitive, idx) {
   const out = [];
   switch (primitive) {
     case PT_TRIANGLELIST:
-      for (let i = 0; i < count * 3; i++) out.push(start + i);
+      for (let i = 0; i + 2 < idx.length; i += 3) out.push(idx[i], idx[i + 1], idx[i + 2]);
       break;
     case PT_TRIANGLESTRIP:
-      for (let i = 0; i < count; i++) {
-        if (i % 2 === 0) out.push(start + i, start + i + 1, start + i + 2);
-        else out.push(start + i + 1, start + i, start + i + 2);
+      for (let i = 0; i + 2 < idx.length; i++) {
+        if (i % 2 === 0) out.push(idx[i], idx[i + 1], idx[i + 2]);
+        else out.push(idx[i + 1], idx[i], idx[i + 2]);
       }
       break;
     case PT_TRIANGLEFAN:
-      for (let i = 0; i < count; i++) out.push(start, start + i + 1, start + i + 2);
+    case PT_POLYGON:
+      for (let i = 1; i + 1 < idx.length; i++) out.push(idx[0], idx[i], idx[i + 1]);
+      break;
+    case PT_QUADLIST:
+      for (let i = 0; i + 3 < idx.length; i += 4) out.push(idx[i], idx[i + 1], idx[i + 2], idx[i], idx[i + 2], idx[i + 3]);
+      break;
+    case PT_QUADSTRIP:
+      for (let i = 0; i + 3 < idx.length; i += 2) out.push(idx[i], idx[i + 1], idx[i + 3], idx[i], idx[i + 3], idx[i + 2]);
       break;
     default:
       throw new Error(`primitive type ${primitive} is not drawn by the pipeline`);

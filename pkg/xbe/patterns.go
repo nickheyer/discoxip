@@ -467,6 +467,10 @@ func decorateSymbol(raw string) Symbol {
 	case raw == "??_V@YAXPAX@Z":
 		s.Name = "operator_delete_array"
 		s.Cdecl = true
+	case raw == "?swprintf@@YAHPA_WIPB_WZZ":
+		// The counted C++ overload takes the buffer size before the format, as the C _snwprintf does
+		s.Name = "_snwprintf"
+		s.Cdecl = true
 	case strings.HasPrefix(raw, "?"):
 		parts := strings.Split(strings.TrimPrefix(raw, "?"), "@")
 		if len(parts) >= 2 && parts[1] != "" {

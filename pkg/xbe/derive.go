@@ -92,7 +92,6 @@ type RenderModel struct {
 	StateNames     map[uint32]string             `json:"render_state_names"`
 	StageNames     map[uint32]string             `json:"texture_stage_names"`
 	Defaults       []PathJSON                    `json:"render_state_defaults"`
-	NodeConstants  []PathJSON                    `json:"node_constants"`
 	Clock          *ClockGlobal                  `json:"clock"`
 	HierarchyAlpha uint32                        `json:"hierarchy_alpha"`
 	Formats        []uint32                      `json:"vertex_formats"`
@@ -107,13 +106,18 @@ type RenderModel struct {
 	Memory         ImageMemory                   `json:"memory"`
 	Types          map[string]*NodeType          `json:"node_types"`
 	Draw           *DrawModel                    `json:"draw"`
+	Lifted         map[uint32]*LiftedFunction    `json:"lifted"`
+	Library        map[uint32]string             `json:"library"`
+	Resource       *ResourceLayout               `json:"resource"`
+	SurfaceDesc    SurfaceDescLayout             `json:"surface_desc"`
+	GPU            uint32                        `json:"gpu"`
 	System         *SystemModel                  `json:"system"`
 	Scene          *SceneModel                   `json:"scene"`
 	Allocators     []uint32                      `json:"allocators"`
 	Registry       *MaterialRegistry             `json:"material_registry"`
 	memory         []byte
 	defaultPaths   []Path
-	nodePaths      []Path
+	nodePaths      []Path // paths of the routines loading the node constants from the matrix stack top
 	shaderLookup   uint32
 	lookups        []shaderLookup
 	accessorSites  []accessorSite
@@ -166,9 +170,8 @@ func stage(name string) {
 // DeriveRender runs every derivation and assembles the render model.
 func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	build := int(d.Image.LibBuild("D3D8"))
-	rm := &RenderModel{XDK: build, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool()}
+	rm := &RenderModel{XDK: build, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Lifted: map[uint32]*LiftedFunction{}}
 	rm.StageNames = TextureStageStateNames(build)
-	rm.NVStateNames = nv097StateNames
 	// The render state wrapper comes first so the state tables it writes are known before any path is summarized.
 	stage("render states")
 	if err := rm.deriveRenderStates(d); err != nil {
@@ -235,8 +238,8 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	if err := rm.deriveRenderDefaults(d, ms); err != nil {
 		return nil, err
 	}
-	stage("node constants")
-	if err := rm.deriveNodeConstants(d, ms); err != nil {
+	stage("constant loaders")
+	if err := rm.deriveConstantLoaders(d, ms); err != nil {
 		return nil, err
 	}
 	stage("clock")
@@ -269,7 +272,6 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	}
 	rm.Textures = textures
 	rm.Vertex = fixedFunctionRegisters
-	rm.NVStateNames = nv097StateNames
 	stage("current mesh")
 	if err := rm.deriveCurrentMesh(d); err != nil {
 		return nil, err
@@ -291,7 +293,7 @@ func DeriveRender(d *Disassembly) (*RenderModel, error) {
 	}
 	rm.System = sm
 	stage("scene")
-	if err := rm.deriveScene(d, ms, types, sm); err != nil {
+	if err := rm.deriveScene(d, ms, types, sm, registrar); err != nil {
 		return nil, err
 	}
 	// The device layout comes from the transform setter, which only the builds writing the device directly reveal
@@ -324,7 +326,11 @@ func (rm *RenderModel) MemoryBytes() []byte {
 
 // Maps the loaded image as the memory the runtime starts the executable with
 func (rm *RenderModel) deriveMemory(d *Disassembly) error {
-	rm.Memory, rm.memory = d.Image.Memory()
+	var err error
+	rm.Memory, rm.memory, err = d.Image.Memory()
+	if err != nil {
+		return err
+	}
 	if len(rm.memory) == 0 {
 		return fmt.Errorf("xbe: the image maps no memory for the runtime to start from")
 	}
@@ -588,10 +594,14 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 	rm.Wrapper = wrapper
 	table := tables[wrapper]
 	names := map[uint32]string{}
+	methods := map[uint32]uint32{}
 	for idx := uint32(0); idx < 256; idx++ {
 		v, ok := d.Image.ReadU32(table + idx*4)
 		if !ok {
 			break
+		}
+		if v>>18 == 1 {
+			methods[idx] = v & 0x1FFF
 		}
 		if name, ok := NV097StateName(v); ok && v>>18 == 1 {
 			names[idx] = name
@@ -653,7 +663,7 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 	}
 	for _, va := range slices.Sorted(maps.Keys(rm.setterStates)) {
 		fn := d.Functions[va]
-		if shared[fn.Symbol.Name] < 2 {
+		if shared[fn.Symbol.Name] < 2 && !strings.HasPrefix(fn.Symbol.Name, "Collisions_") {
 			continue
 		}
 		name, ok := names[rm.setterStates[va]]
@@ -690,6 +700,19 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 			return fmt.Errorf("xbe: render state %d is dispatched as %s and also deferred", idx, prev)
 		}
 		names[idx] = cross[idx]
+	}
+	// Every simple state the wrapper pushes as a single method takes its XDK name, and a method the hardware names leave
+	// out is known by it
+	for idx := sections[0]; idx < sections[1]; idx++ {
+		if _, pushed := methods[idx]; pushed && names[idx] == "" && cross[idx] != "" {
+			names[idx] = cross[idx]
+		}
+	}
+	rm.NVStateNames = maps.Clone(nv097StateNames)
+	for idx, m := range methods {
+		if name, ok := names[idx]; ok && rm.NVStateNames[m] == "" {
+			rm.NVStateNames[m] = name
+		}
 	}
 	rm.StateNames = names
 	rm.stateCounts = counts
@@ -910,12 +933,12 @@ func stateNameFromSymbol(sym *Symbol, ref string) string {
 	return strings.TrimPrefix(sym.Name, "D3DDevice_SetRenderState_")
 }
 
-// Runs the function that loads the per node vertex shader constants
-func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) error {
-	// It is the function whose paths load four rows into vertex shader constant register zero.
+// Runs every routine that loads the per node vertex shader constants, which read the matrix stack top
+func (rm *RenderModel) deriveConstantLoaders(d *Disassembly, ms *MaterialSystem) error {
+	// They are the functions whose paths load four rows into vertex shader constant register zero.
 	probe := NewExecutor(d)
 	ms.hideFrom(probe)
-	var target uint32
+	targets := map[uint32]bool{}
 	for _, va := range d.functionVAs() {
 		fn := d.Functions[va]
 		if fn.Symbol != nil {
@@ -954,24 +977,27 @@ func (rm *RenderModel) deriveNodeConstants(d *Disassembly, ms *MaterialSystem) e
 				fmt.Sscanf(strings.TrimPrefix(e.Fn, "D3DDevice_SetVertexShaderConstant"), "%d", &rows)
 			}
 			if rows == 4 {
-				if target != 0 && target != va {
-					return fmt.Errorf("xbe: both %08X and %08X load four rows into vertex shader constant zero", target, va)
-				}
-				target = va
+				targets[va] = true
 			}
 		}
 	}
-	if target == 0 {
+	if len(targets) == 0 {
 		return fmt.Errorf("xbe: no node constant loader found")
 	}
 	ex := NewExecutor(d)
 	ms.hideFrom(ex)
-	paths, err := ex.Run(target, func(s *execState) {})
-	if err != nil {
-		return fmt.Errorf("node constants %08X: %w", target, err)
+	var failures []string
+	for _, target := range slices.Sorted(maps.Keys(targets)) {
+		paths, err := ex.Run(target, func(s *execState) {})
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%08X: %v", target, err))
+			continue
+		}
+		rm.nodePaths = append(rm.nodePaths, paths...)
 	}
-	rm.NodeConstants = pathsJSON(rm.Exprs, paths)
-	rm.nodePaths = paths
+	if len(rm.nodePaths) == 0 {
+		return fmt.Errorf("xbe: no node constant loader runs to completion (%s)", strings.Join(failures, "; "))
+	}
 	if rm.WorldSlot == 0 {
 		return fmt.Errorf("xbe: no transform setting routine takes the world matrix from a virtual accessor")
 	}

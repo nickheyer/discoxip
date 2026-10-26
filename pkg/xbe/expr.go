@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 	"strings"
 )
@@ -28,12 +29,13 @@ type Ptr struct {
 	Off  int32
 }
 
-// Load reads memory at a symbolic location.
+// Load reads memory at a symbolic location, as the memory stood after the effects recorded before it.
 type Load struct {
-	Base string
-	Off  int32
-	Size int
-	Addr Expr // set when the address itself is symbolic
+	Base  string
+	Off   int32
+	Size  int
+	Addr  Expr // set when the address itself is symbolic
+	Epoch int  // effects recorded before the load, which the runtime reads the memory as of
 }
 
 // Bin is a binary integer or float operation.
@@ -72,12 +74,18 @@ type Elem struct {
 	Index int
 }
 
+// Sel is one of two values chosen by a predicate, the conditional move's result.
+type Sel struct {
+	C, A, B Expr
+}
+
 // CallResult is the value returned by an opaque call.
 type CallResult struct {
-	Fn   string
-	Args []Expr
-	Seq  int
-	This Expr // ecx at the call for helpers of unknown convention
+	Fn     string
+	Args   []Expr
+	Seq    int
+	This   Expr   // ecx at the call for helpers of unknown convention
+	Target uint32 // the routine a named call reaches, where the image carries it
 }
 
 func (IConst) exprTag()     {}
@@ -93,6 +101,7 @@ func (Not) exprTag()        {}
 func (CallResult) exprTag() {}
 func (Block) exprTag()      {}
 func (Elem) exprTag()       {}
+func (Sel) exprTag()        {}
 
 // Serializes an expression tree as nested JSON objects
 func exprJSON(e Expr) map[string]any {
@@ -115,6 +124,9 @@ func exprJSON(e Expr) map[string]any {
 		if v.Addr != nil {
 			m["addr"] = exprJSON(v.Addr)
 		}
+		if v.Epoch > 0 {
+			m["e"] = v.Epoch
+		}
 		return m
 	case Bin:
 		return map[string]any{"k": "bin", "op": v.Op, "a": exprJSON(v.A), "b": exprJSON(v.B)}
@@ -135,6 +147,9 @@ func exprJSON(e Expr) map[string]any {
 		if v.This != nil {
 			m["this"] = exprJSON(v.This)
 		}
+		if v.Target != 0 {
+			m["target"] = v.Target
+		}
 		return m
 	case RetAddr:
 		return map[string]any{"k": "retaddr", "va": v.VA}
@@ -146,6 +161,8 @@ func exprJSON(e Expr) map[string]any {
 		return map[string]any{"k": "block", "elems": elems}
 	case Elem:
 		return map[string]any{"k": "elem", "a": exprJSON(v.A), "i": v.Index}
+	case Sel:
+		return map[string]any{"k": "sel", "c": exprJSON(v.C), "a": exprJSON(v.A), "b": exprJSON(v.B)}
 	}
 	panic(fmt.Sprintf("exprJSON: %T", e))
 }
@@ -156,9 +173,11 @@ type ExprPool struct {
 	index map[string]int
 }
 
-// NewExprPool makes an empty pool.
+// NewExprPool makes a pool whose index zero holds the undefined value, so an omitted index names no expression.
 func NewExprPool() *ExprPool {
-	return &ExprPool{index: map[string]int{}}
+	pool := &ExprPool{index: map[string]int{}}
+	pool.Add(nil)
+	return pool
 }
 
 // Add interns an expression and returns its node index.
@@ -168,7 +187,7 @@ func (pool *ExprPool) Add(e Expr) int {
 
 // Interns a serialized node after replacing its children with their indices
 func (pool *ExprPool) intern(node map[string]any) int {
-	for _, key := range []string{"a", "b", "addr", "this"} {
+	for _, key := range []string{"a", "b", "c", "addr", "this"} {
 		if child, ok := node[key]; ok {
 			node[key] = pool.intern(child.(map[string]any))
 		}
@@ -259,6 +278,8 @@ func ExprString(e Expr) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	case Elem:
 		return fmt.Sprintf("%s[%d]", ExprString(v.A), v.Index)
+	case Sel:
+		return fmt.Sprintf("(%s ? %s : %s)", ExprString(v.C), ExprString(v.A), ExprString(v.B))
 	}
 	return fmt.Sprintf("%T", e)
 }
@@ -303,11 +324,13 @@ func mkBin(op string, a, b Expr) Expr {
 			}
 		}
 	}
-	// Opaque call results that enter pointer arithmetic are treated as object bases.
-	if cr, ok := a.(CallResult); ok && (op == "add" || op == "sub") {
+	// An opaque call result entering pointer arithmetic is an object base, two results added being plain integers
+	_, aResult := a.(CallResult)
+	_, bResult := b.(CallResult)
+	if cr, ok := a.(CallResult); ok && !bResult && (op == "add" || op == "sub") {
 		a = Ptr{fmt.Sprintf("res%d", cr.Seq), 0}
 	}
-	if cr, ok := b.(CallResult); ok && op == "add" {
+	if cr, ok := b.(CallResult); ok && !aResult && op == "add" {
 		b = Ptr{fmt.Sprintf("res%d", cr.Seq), 0}
 	}
 	if p, ok := a.(Ptr); ok {
@@ -376,7 +399,21 @@ func mkBin(op string, a, b Expr) Expr {
 }
 
 // Float operations with two operands
-var floatBinOps = map[string]bool{"fadd": true, "fsub": true, "fmul": true, "fdiv": true, "fmin": true, "fmax": true, "fmod": true, "fpow": true, "fatan2": true}
+var floatBinOps = map[string]bool{"fadd": true, "fsub": true, "fmul": true, "fdiv": true, "fmin": true, "fmax": true, "fmod": true, "fpow": true, "fatan2": true, "frem": true}
+
+// Builds a selection between two values, folding a decided predicate and a choice between equals
+func mkSel(c, a, b Expr) Expr {
+	if v, ok := isConst(c); ok {
+		if v != 0 {
+			return a
+		}
+		return b
+	}
+	if sameExpr(a, b) {
+		return a
+	}
+	return Sel{c, a, b}
+}
 
 // Builds a float operation, folding constants
 func mkFBin(op string, a, b Expr) Expr {
@@ -401,6 +438,8 @@ func mkFBin(op string, a, b Expr) Expr {
 				return FConst{math.Pow(av, bv)}
 			case "fatan2":
 				return FConst{math.Atan2(av, bv)}
+			case "frem":
+				return FConst{math.Remainder(av, bv)}
 			}
 		}
 	}
@@ -426,6 +465,10 @@ func mkUn(op string, a Expr) Expr {
 			return FConst{float64(int32(av))}
 		case "bits2f":
 			return FConst{float64(math.Float32frombits(av))}
+		case "bsf":
+			return IConst{uint32(bits.TrailingZeros32(av)) & 31}
+		case "bsr":
+			return IConst{uint32(31-bits.LeadingZeros32(av)) & 31}
 		}
 	}
 	if av, ok := isFConst(a); ok {
@@ -452,6 +495,12 @@ func mkUn(op string, a Expr) Expr {
 			return FConst{math.Log(av)}
 		case "flog10":
 			return FConst{math.Log10(av)}
+		case "flog2":
+			return FConst{math.Log2(av)}
+		case "ftrunc":
+			return FConst{math.Trunc(av)}
+		case "fround":
+			return FConst{math.RoundToEven(av)}
 		case "fatan":
 			return FConst{math.Atan(av)}
 		case "fasin":
@@ -546,8 +595,9 @@ func mkCond(op string, a, b Expr) Expr {
 		if pb, ok := b.(Ptr); ok && pa.Base == pb.Base {
 			return mkCond(op, IConst{uint32(pa.Off)}, IConst{uint32(pb.Off)})
 		}
-		// A pointer to an object the path holds is never null, where a global holds one only once set
-		if _, held := globalObjectAddress(Ptr{pa.Base, 0}); bok && bv == 0 && pa.Base != "" && !held {
+		// A pointer to an object the path holds is never null, where a global holds one only once set and the
+		// receiver is whatever the caller passed, a null among the possibilities
+		if _, held := globalObjectAddress(Ptr{pa.Base, 0}); bok && bv == 0 && pa.Base != "" && pa.Base != "this" && !held {
 			switch op {
 			case "eq":
 				return IConst{0}
@@ -642,6 +692,10 @@ func exprSyms(e Expr, out map[string]bool) {
 		}
 	case Elem:
 		exprSyms(v.A, out)
+	case Sel:
+		exprSyms(v.C, out)
+		exprSyms(v.A, out)
+		exprSyms(v.B, out)
 	}
 }
 
@@ -694,6 +748,9 @@ func sameExprWithin(a, b Expr, budget *int) bool {
 	case Elem:
 		y, ok := b.(Elem)
 		return ok && x.Index == y.Index && sameExprWithin(x.A, y.A, budget)
+	case Sel:
+		y, ok := b.(Sel)
+		return ok && sameExprWithin(x.C, y.C, budget) && sameExprWithin(x.A, y.A, budget) && sameExprWithin(x.B, y.B, budget)
 	case Block:
 		y, ok := b.(Block)
 		if !ok || len(x.Elems) != len(y.Elems) {
@@ -739,6 +796,10 @@ func countNodes(e Expr, budget *int) {
 		countNodes(v.A, budget)
 	case Elem:
 		countNodes(v.A, budget)
+	case Sel:
+		countNodes(v.C, budget)
+		countNodes(v.A, budget)
+		countNodes(v.B, budget)
 	case Block:
 		for _, x := range v.Elems {
 			countNodes(x, budget)

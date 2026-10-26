@@ -15,13 +15,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nickheyer/discoxip/pkg/font"
 	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/nickheyer/discoxip/pkg/xap"
 	"github.com/nickheyer/discoxip/pkg/xbe"
 )
 
-//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js static/system.js
+//go:embed static/index.html static/runtime.js static/derived.js static/pipeline.js static/system.js static/console.js static/gpu.js
 var staticFiles embed.FS
 
 // Export generates a self-contained web application from extracted XIP data and the disassembled dashboard executable.
@@ -125,10 +124,11 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
 		fmt.Fprintf(os.Stderr, "  Copied %d audio files\n", audioCount)
 	}
 
-	fontCount := exportFonts(inputDir, filepath.Join(outputDir, "data", "fonts"))
-	if fontCount > 0 {
-		fmt.Fprintf(os.Stderr, "  Exported %d fonts\n", fontCount)
+	fileCount, err := copyConsoleFiles(consoleDir, filepath.Join(outputDir, "data", "files"))
+	if err != nil {
+		return err
 	}
+	fmt.Fprintf(os.Stderr, "  Copied %d font files the dashboard opens itself\n", fileCount)
 
 	configData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -138,7 +138,7 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly) error {
 		return err
 	}
 
-	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js", "static/system.js"} {
+	for _, name := range []string{"static/index.html", "static/runtime.js", "static/derived.js", "static/pipeline.js", "static/system.js", "static/console.js", "static/gpu.js"} {
 		data, err := staticFiles.ReadFile(name)
 		if err != nil {
 			return fmt.Errorf("web: reading embedded %s: %w", name, err)
@@ -213,6 +213,38 @@ func fontVersion(dir string) int {
 		}
 	}
 	return 0
+}
+
+// Copies the font files the dashboard opens through the console's file routines, under the paths it names them by
+func copyConsoleFiles(dir, dstDir string) (int, error) {
+	count := 0
+	root := filepath.Clean(dir)
+	err := filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
+		if err != nil || e.IsDir() || !strings.EqualFold(filepath.Ext(path), ".xtf") {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(dstDir, strings.ToLower(filepath.ToSlash(rel)))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("web: copying console files: %w", err)
+	}
+	return count, nil
 }
 
 // The files the console keeps on the partition the dashboard runs from, named the way its own paths do
@@ -736,47 +768,6 @@ func copyAudio(srcDir, dstDir string) int {
 		count++
 		return nil
 	})
-	return count
-}
-
-// --- Font export ---
-
-func exportFonts(srcDir, dstDir string) int {
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		return 0
-	}
-
-	count := 0
-	for _, e := range entries {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".xtf") {
-			continue
-		}
-
-		f, err := font.Open(filepath.Join(srcDir, e.Name()))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "    warning: font %s: %v\n", e.Name(), err)
-			continue
-		}
-
-		if err := os.MkdirAll(dstDir, 0o755); err != nil {
-			return count
-		}
-
-		baseName := sanitizeFilename(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
-		jsonPath := filepath.Join(dstDir, baseName+".json")
-
-		out, err := os.Create(jsonPath)
-		if err != nil {
-			continue
-		}
-		if err := font.ExportJSON(out, f, 0x024F); err != nil {
-			out.Close()
-			continue
-		}
-		out.Close()
-		count++
-	}
 	return count
 }
 

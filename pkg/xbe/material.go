@@ -45,19 +45,21 @@ type EffectJSON struct {
 	This    int          `json:"this,omitempty"`
 	HasThis bool         `json:"has_this,omitempty"`
 	Seq     int          `json:"seq,omitempty"`
+	Target  uint32       `json:"target,omitempty"`
 	Buffers []BufferJSON `json:"buffers,omitempty"`
 }
 
-// BufferJSON is the serialized snapshot of memory behind a pointer argument.
+// BufferJSON is the serialized snapshot of memory behind a pointer argument, each element with its byte size.
 type BufferJSON struct {
 	Index int   `json:"index"`
 	Elems []int `json:"elems"`
+	Sizes []int `json:"sizes"`
 }
 
 func pathsJSON(pool *ExprPool, paths []Path) []PathJSON {
 	out := []PathJSON{}
 	for _, p := range paths {
-		pj := PathJSON{Return: pool.Add(p.Return), Guards: []int{}, GuardPos: []int{}, Effects: []EffectJSON{}}
+		pj := PathJSON{Return: pool.Add(p.Return), Guards: []int{}, GuardPos: []int{}, Effects: effectsJSON(pool, p.Effects)}
 		for i, g := range p.Guards {
 			pj.Guards = append(pj.Guards, pool.Add(g))
 			pos := len(p.Effects)
@@ -65,31 +67,6 @@ func pathsJSON(pool *ExprPool, paths []Path) []PathJSON {
 				pos = p.GuardPos[i]
 			}
 			pj.GuardPos = append(pj.GuardPos, pos)
-		}
-		for _, e := range p.Effects {
-			ej := EffectJSON{Kind: e.Kind, VA: e.VA, Base: e.Base, Off: e.Off, Size: e.Size, Fn: e.Fn, Seq: e.Seq}
-			if e.Value != nil {
-				ej.Value = pool.Add(e.Value)
-			}
-			if e.Addr != nil {
-				ej.Addr = pool.Add(e.Addr)
-				ej.HasAddr = true
-			}
-			for _, a := range e.Args {
-				ej.Args = append(ej.Args, pool.Add(a))
-			}
-			if e.This != nil {
-				ej.This = pool.Add(e.This)
-				ej.HasThis = true
-			}
-			for _, b := range e.Buffers {
-				bj := BufferJSON{Index: b.Index, Elems: []int{}}
-				for _, el := range b.Elems {
-					bj.Elems = append(bj.Elems, pool.Add(el))
-				}
-				ej.Buffers = append(ej.Buffers, bj)
-			}
-			pj.Effects = append(pj.Effects, ej)
 		}
 		out = append(out, pj)
 	}
@@ -310,7 +287,7 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 		if objMem[e.Base] == nil {
 			objMem[e.Base] = map[int32]memVal{}
 		}
-		objMem[e.Base][e.Off] = memVal{e.Size, e.Value}
+		objMem[e.Base][e.Off] = memVal{size: e.Size, v: e.Value}
 	}
 	// The name field is the offset at which the most constructed objects hold a wide string pointer.
 	nameCounts := map[int32]int{}
