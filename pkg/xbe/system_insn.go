@@ -203,9 +203,10 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		count := mkBin("sub", s.getReg(x86asm.ECX), IConst{1})
 		s.setReg(x86asm.ECX, count)
 		cond := mkCond("ne", count, IConst{0})
-		if op == x86asm.LOOPE {
+		switch op {
+		case x86asm.LOOPE:
 			cond = mkBin("and", cond, ex.condition(s, x86asm.JE))
-		} else if op == x86asm.LOOPNE {
+		case x86asm.LOOPNE:
 			cond = mkBin("and", cond, ex.condition(s, x86asm.JNE))
 		}
 		rel := args[0].(x86asm.Rel)

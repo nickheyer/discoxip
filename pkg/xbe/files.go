@@ -38,6 +38,32 @@ func (img *Image) wideStrings() []wideString {
 	return out
 }
 
+// Every terminated printable string of three or more characters the image holds, wide ones first
+func (img *Image) Strings() []string {
+	var out []string
+	for _, ws := range img.wideStrings() {
+		out = append(out, ws.Text)
+	}
+	for i := range img.Sections {
+		sec := &img.Sections[i]
+		data := sec.Data[:sec.RawSize]
+		start := -1
+		for off, b := range data {
+			if b >= 0x20 && b <= 0x7E {
+				if start < 0 {
+					start = off
+				}
+				continue
+			}
+			if start >= 0 && b == 0 && off-start >= 3 {
+				out = append(out, string(data[start:off]))
+			}
+			start = -1
+		}
+	}
+	return out
+}
+
 // NamedFiles returns the bare file names with an extension the image names, in address order.
 func (img *Image) NamedFiles(ext string) []string {
 	var out []string

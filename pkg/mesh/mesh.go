@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 )
@@ -88,6 +89,9 @@ func Read(r io.Reader, size int64) (*Mesh, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) < size {
+		return nil, fmt.Errorf("%w: %d of %d bytes", ErrTruncatedXM, len(data), size)
 	}
 
 	ct := Detect(data, size)

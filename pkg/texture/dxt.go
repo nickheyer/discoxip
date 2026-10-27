@@ -15,7 +15,7 @@ func decodeDXT1(data []byte, width, height int) []byte {
 				continue
 			}
 			block := data[blockIdx : blockIdx+8]
-			decodeDXT1Block(block, out, bx*4, by*4, width, height)
+			decodeDXT1Block(block, out, bx*4, by*4, width, height, false)
 		}
 	}
 	return out
@@ -37,7 +37,7 @@ func decodeDXT3(data []byte, width, height int) []byte {
 			colorBlock := data[blockIdx+8 : blockIdx+16]
 
 			// Decode color (same as DXT1 but always 4-color mode)
-			decodeDXT1Block(colorBlock, out, bx*4, by*4, width, height)
+			decodeDXT1Block(colorBlock, out, bx*4, by*4, width, height, true)
 
 			// Override alpha from explicit 4-bit alpha block
 			for row := range 4 {
@@ -76,8 +76,8 @@ func decodeDXT5(data []byte, width, height int) []byte {
 			alphaBlock := data[blockIdx : blockIdx+8]
 			colorBlock := data[blockIdx+8 : blockIdx+16]
 
-			// Decode color
-			decodeDXT1Block(colorBlock, out, bx*4, by*4, width, height)
+			// Decode color (same as DXT1 but always 4-color mode)
+			decodeDXT1Block(colorBlock, out, bx*4, by*4, width, height, true)
 
 			// Interpolated alpha
 			a0 := alphaBlock[0]
@@ -129,8 +129,8 @@ func decodeDXT5(data []byte, width, height int) []byte {
 	return out
 }
 
-// decodeDXT1Block decodes a single DXT1 4x4 color block into the output buffer.
-func decodeDXT1Block(block []byte, out []byte, bx, by, width, height int) {
+// Decodes one 4x4 color block, the three color form only when the endpoints allow it and fourColor is false
+func decodeDXT1Block(block []byte, out []byte, bx, by, width, height int, fourColor bool) {
 	c0 := binary.LittleEndian.Uint16(block[0:2])
 	c1 := binary.LittleEndian.Uint16(block[2:4])
 	bits := binary.LittleEndian.Uint32(block[4:8])
@@ -139,7 +139,7 @@ func decodeDXT1Block(block []byte, out []byte, bx, by, width, height int) {
 	colors[0] = rgb565ToRGBA(c0)
 	colors[1] = rgb565ToRGBA(c1)
 
-	if c0 > c1 {
+	if fourColor || c0 > c1 {
 		// 4-color block
 		colors[2] = [4]byte{
 			byte((2*int(colors[0][0]) + int(colors[1][0])) / 3),

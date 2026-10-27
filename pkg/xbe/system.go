@@ -1,7 +1,10 @@
 package xbe
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -64,19 +67,29 @@ type TimeZoneDate struct {
 	Hour      int `json:"hour"`
 }
 
+// TIME_ZONE_INFORMATION and SYSTEMTIME words
 const (
-	methodRecordSize   = 24
-	methodRecordName   = 0x14
-	methodTableSlot    = 20
-	timeZoneEntryBias  = 6
-	timeZoneEntryStd   = 0xC
-	timeZoneEntryStdDt = 0x10
-	timeZoneEntryDlt   = 0x14
-	timeZoneEntryDltDt = 0x18
+	tziBias     = 0x00
+	tziStdName  = 0x04
+	tziStdDate  = 0x44
+	tziStdBias  = 0x54
+	tziDltName  = 0x58
+	tziDltDate  = 0x98
+	tziDltBias  = 0xA8
+	stMonth     = 2
+	stDayOfWeek = 4
+	stDay       = 6
+	stHour      = 8
 )
 
+// Entry field offsets read off the converter filling a time zone information from an entry
+type timeZoneLayout struct {
+	key, bias, stdBias, dltBias, stdName, dltName, stdDate, dltDate uint32
+	month, week, dayOfWeek, hour                                    uint32
+}
+
 // DeriveSystem reads the script method tables and the data tables the natives index.
-func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, error) {
+func DeriveSystem(d, kd *Disassembly, kernel *KernelInput, types map[string]*NodeType, drawSlot int32) (*SystemModel, error) {
 	sm := &SystemModel{Methods: map[string][]string{}, methodFunctions: map[string]map[string]uint32{}}
 	if err := sm.deriveMethods(d, types); err != nil {
 		return nil, err
@@ -88,7 +101,7 @@ func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, err
 	if err != nil {
 		return nil, err
 	}
-	if err := sm.deriveTranslations(d, setLanguage); err != nil {
+	if err := sm.deriveTranslations(d, kd, kernel, setLanguage); err != nil {
 		return nil, err
 	}
 	textFn, err := sm.function("Translator", "GetTimeZoneText")
@@ -156,7 +169,7 @@ func DeriveSystem(d *Disassembly, types map[string]*NodeType) (*SystemModel, err
 			return nil, err
 		}
 	}
-	if err := sm.deriveClockFormats(d, types); err != nil {
+	if err := sm.deriveClockFormats(d, types, drawSlot); err != nil {
 		return nil, err
 	}
 	if err := sm.deriveDiscTypes(d, types); err != nil {
@@ -213,14 +226,14 @@ func (sm *SystemModel) deriveDiscTypes(d *Disassembly, types map[string]*NodeTyp
 }
 
 // The clock formatter is the text draw callee naming both date orders and both hour formats plus the meridiem words
-func (sm *SystemModel) deriveClockFormats(d *Disassembly, types map[string]*NodeType) error {
+func (sm *SystemModel) deriveClockFormats(d *Disassembly, types map[string]*NodeType, drawSlot int32) error {
 	text := types["Text"]
-	if text == nil || len(text.Slots) <= 16 {
+	if text == nil || len(text.Slots) <= int(drawSlot/4) {
 		return fmt.Errorf("xbe: Text draw slot is not registered")
 	}
-	draw := d.Functions[text.Slots[16]]
+	draw := d.Functions[text.Slots[drawSlot/4]]
 	if draw == nil {
-		return fmt.Errorf("xbe: Text draw %08X is not disassembled", text.Slots[16])
+		return fmt.Errorf("xbe: Text draw %08X is not disassembled", text.Slots[drawSlot/4])
 	}
 	for _, t := range draw.CallTargets {
 		fn := d.Functions[t]
@@ -260,7 +273,7 @@ func (sm *SystemModel) deriveClockFormats(d *Disassembly, types map[string]*Node
 		sm.Clock = ClockFormats{Formats: []string{roles["ymd"], roles["dmy"], roles["time12"], roles["time24"]}, Meridiem: meridiem}
 		return nil
 	}
-	return fmt.Errorf("xbe: Text draw %08X calls no clock formatter", text.Slots[16])
+	return fmt.Errorf("xbe: Text draw %08X calls no clock formatter", text.Slots[drawSlot/4])
 }
 
 // Lists the distinct printable wide strings a function addresses, in instruction order
@@ -630,17 +643,97 @@ func (d *Disassembly) methodTableBase(va uint32) (uint32, bool) {
 	return uint32(b[1]) | uint32(b[2])<<8 | uint32(b[3])<<16 | uint32(b[4])<<24, true
 }
 
+// The vtable slot of the method table accessor and the stride and offsets of its records
+type methodTableLayout struct {
+	slot    int
+	stride  uint32
+	nameOff uint32
+	fnOff   uint32
+}
+
+// The first address at or past a point in a sorted list
+func firstAtOrAfter(addrs []uint32, at uint32) (uint32, bool) {
+	i := sort.Search(len(addrs), func(i int) bool { return addrs[i] >= at })
+	if i == len(addrs) {
+		return 0, false
+	}
+	return addrs[i], true
+}
+
+// Finds the one vtable slot whose accessors return tables the record stores fill, with the bases they return
+func (d *Disassembly) methodTableLayout(types map[string]*NodeType, names map[uint32]string, fns map[uint32]uint32) (methodTableLayout, map[string]uint32, error) {
+	nameAddrs := slices.Sorted(maps.Keys(names))
+	fnAddrs := slices.Sorted(maps.Keys(fns))
+	slots := 0
+	for _, nt := range types {
+		slots = max(slots, len(nt.Slots))
+	}
+	var layouts []methodTableLayout
+	var tables []map[string]uint32
+	for s := 0; s < slots; s++ {
+		bases := map[string]uint32{}
+		for name, nt := range types {
+			if s >= len(nt.Slots) {
+				continue
+			}
+			if base, ok := d.methodTableBase(nt.Slots[s]); ok && d.isDataAddress(base) {
+				bases[name] = base
+			}
+		}
+		layout, ok := recordLayout(bases, nameAddrs, fnAddrs)
+		if !ok {
+			continue
+		}
+		layout.slot = s
+		layouts = append(layouts, layout)
+		tables = append(tables, bases)
+	}
+	if len(layouts) != 1 {
+		return methodTableLayout{}, nil, fmt.Errorf("xbe: %d vtable slots return tables the method record stores fill", len(layouts))
+	}
+	return layouts[0], tables[0], nil
+}
+
+// Reads record stride and first name and native offsets off every table, false where they disagree
+func recordLayout(bases map[string]uint32, nameAddrs, fnAddrs []uint32) (methodTableLayout, bool) {
+	if len(bases) == 0 {
+		return methodTableLayout{}, false
+	}
+	layout := methodTableLayout{}
+	for _, base := range bases {
+		n1, ok := firstAtOrAfter(nameAddrs, base)
+		if !ok {
+			return methodTableLayout{}, false
+		}
+		if n2, ok := firstAtOrAfter(nameAddrs, n1+1); ok && (layout.stride == 0 || n2-n1 < layout.stride) {
+			layout.stride = n2 - n1
+		}
+	}
+	if layout.stride == 0 {
+		return methodTableLayout{}, false
+	}
+	first := true
+	for _, base := range bases {
+		n1, _ := firstAtOrAfter(nameAddrs, base)
+		f1, ok := firstAtOrAfter(fnAddrs, base)
+		if !ok || n1-base >= layout.stride || f1-base >= layout.stride {
+			return methodTableLayout{}, false
+		}
+		if first {
+			layout.nameOff, layout.fnOff, first = n1-base, f1-base, false
+		} else if layout.nameOff != n1-base || layout.fnOff != f1-base {
+			return methodTableLayout{}, false
+		}
+	}
+	return layout, true
+}
+
 // Walks each class's registration records in table order
 func (sm *SystemModel) deriveMethods(d *Disassembly, types map[string]*NodeType) error {
 	names, fns := d.methodRecordStores()
-	bases := map[string]uint32{}
-	for name, nt := range types {
-		if len(nt.Slots) <= methodTableSlot/4 {
-			continue
-		}
-		if base, ok := d.methodTableBase(nt.Slots[methodTableSlot/4]); ok {
-			bases[name] = base
-		}
+	layout, bases, err := d.methodTableLayout(types, names, fns)
+	if err != nil {
+		return err
 	}
 	for name, nt := range types {
 		base, ok := bases[name]
@@ -649,12 +742,12 @@ func (sm *SystemModel) deriveMethods(d *Disassembly, types map[string]*NodeType)
 		}
 		list := []string{}
 		byName := map[string]uint32{}
-		for rec := base; ; rec += methodRecordSize {
-			method, ok := names[rec+methodRecordName]
+		for rec := base; ; rec += layout.stride {
+			method, ok := names[rec+layout.nameOff]
 			if !ok {
 				break
 			}
-			fn, ok := fns[rec]
+			fn, ok := fns[rec+layout.fnOff]
 			if !ok {
 				return fmt.Errorf("xbe: class %s method %s has no native copied into its record at %08X", name, method, rec)
 			}
@@ -708,219 +801,6 @@ func scaledTableBase(fn *Function, scale uint8) (uint32, bool) {
 	return 0, false
 }
 
-// Translator SetLanguage loads the section named by a pointer table indexed with the language
-func (sm *SystemModel) deriveTranslations(d *Disassembly, va uint32) error {
-	fn := d.Functions[va]
-	if fn == nil {
-		return fmt.Errorf("xbe: translator SetLanguage %08X is not disassembled", va)
-	}
-	table, ok := scaledTableBase(fn, 4)
-	if !ok {
-		return fmt.Errorf("xbe: translator SetLanguage %08X indexes no section name table", va)
-	}
-	for i := uint32(0); ; i++ {
-		p, ok := d.Image.ReadU32(table + 4*i)
-		if !ok || p == 0 {
-			break
-		}
-		raw, ok := d.Image.ReadBytes(p, 64)
-		if !ok {
-			return fmt.Errorf("xbe: language %d section name at %08X lies outside the image", i, p)
-		}
-		name := readCString(raw, 0)
-		sec := d.Image.FindSection(name)
-		if sec == nil {
-			return fmt.Errorf("xbe: language section %q is not in the image", name)
-		}
-		strings, err := parseTranslationSection(sec.Data[:sec.VirtualSize])
-		if err != nil {
-			return fmt.Errorf("xbe: language section %q: %w", name, err)
-		}
-		sm.Languages = append(sm.Languages, name)
-		sm.Translations = append(sm.Translations, strings)
-	}
-	if len(sm.Languages) == 0 {
-		return fmt.Errorf("xbe: translator section table %08X names no languages", table)
-	}
-	return nil
-}
-
-// Parses key = value lines the way the executable's loader does, keeping the first of duplicate keys
-func parseTranslationSection(data []byte) (map[string]string, error) {
-	if len(data) < 2 || data[0] != 0xFF || data[1] != 0xFE {
-		return nil, fmt.Errorf("section does not start with a byte order mark")
-	}
-	p := make([]uint16, len(data)/2+1)
-	for i := 0; i+1 < len(data); i += 2 {
-		p[i/2] = uint16(data[i]) | uint16(data[i+1])<<8
-	}
-	out := map[string]string{}
-	isBlank := func(c uint16) bool { return c == ' ' || c == '\t' }
-	i := 1
-	for p[i] != 0 {
-		for isBlank(p[i]) {
-			i++
-		}
-		if p[i] == '#' {
-			for p[i] != 0 && p[i] != '\r' && p[i] != '\n' {
-				i++
-			}
-		}
-		if p[i] == '\r' {
-			i++
-			if p[i] == '\n' {
-				i++
-			}
-			continue
-		}
-		var keyStart int
-		if p[i] == '"' {
-			i++
-			keyStart = i
-			for p[i] != 0 && p[i] != '\r' && p[i] != '\n' && p[i] != '"' {
-				i++
-			}
-		} else {
-			keyStart = i
-			for p[i] > ' ' {
-				if p[i] == '=' {
-					break
-				}
-				if p[i] == '_' {
-					if p[i+1] == '=' || p[i+1] == ' ' {
-						p[i] = ':'
-					} else {
-						p[i] = ' '
-					}
-				}
-				i++
-			}
-		}
-		key := append([]uint16(nil), p[keyStart:i]...)
-		if p[i] == '"' {
-			i++
-		}
-		for isBlank(p[i]) {
-			i++
-		}
-		if p[i] != '=' {
-			break
-		}
-		i++
-		for isBlank(p[i]) {
-			i++
-		}
-		if p[i] == '"' {
-			i++
-		}
-		valueStart := i
-		for p[i] != 0 && p[i] != '\r' && p[i] != '\n' && p[i] != '"' {
-			i++
-		}
-		value := append([]uint16(nil), p[valueStart:i]...)
-		if p[i] == '"' {
-			i++
-		}
-		for isBlank(p[i]) {
-			i++
-		}
-		if p[i] == '#' {
-			for p[i] != 0 && p[i] != '\r' {
-				i++
-			}
-		}
-		if p[i] != '\r' {
-			break
-		}
-		i++
-		if p[i] == '\n' {
-			i++
-		}
-		if len(key) == 0 || len(value) == 0 {
-			continue
-		}
-		unescaped, err := unescapeTranslation(value)
-		if err != nil {
-			break
-		}
-		k := string(utf16.Decode(key))
-		if _, dup := out[k]; !dup {
-			out[k] = string(utf16.Decode(unescaped))
-		}
-	}
-	return out, nil
-}
-
-// Expands the backslash escapes the script string reader accepts
-func unescapeTranslation(s []uint16) ([]uint16, error) {
-	out := make([]uint16, 0, len(s))
-	hexDigit := func(c uint16) (uint16, bool) {
-		switch {
-		case c >= '0' && c <= '9':
-			return c - '0', true
-		case c >= 'A' && c <= 'F':
-			return c - 'A' + 10, true
-		case c >= 'a' && c <= 'f':
-			return c - 'a' + 10, true
-		}
-		return 0, false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c != '\\' {
-			out = append(out, c)
-			continue
-		}
-		i++
-		if i >= len(s) {
-			return nil, fmt.Errorf("backslash at end of string")
-		}
-		c = s[i]
-		switch c {
-		case 'b':
-			out = append(out, 8)
-		case 'f':
-			out = append(out, 12)
-		case 'n':
-			out = append(out, 10)
-		case 'r':
-			out = append(out, 13)
-		case 't':
-			out = append(out, 9)
-		case 'u', 'x':
-			digits := 4
-			if c == 'x' {
-				digits = 2
-			}
-			if len(s)-i-1 < digits {
-				return nil, fmt.Errorf("invalid character escape sequence")
-			}
-			var v uint16
-			for k := 0; k < digits; k++ {
-				i++
-				h, ok := hexDigit(s[i])
-				if !ok {
-					return nil, fmt.Errorf("invalid hex character")
-				}
-				v = v<<4 | h
-			}
-			out = append(out, v)
-		default:
-			if c >= '0' && c <= '7' {
-				v := c - '0'
-				for k := 0; k < 2 && i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '7'; k++ {
-					i++
-					v = v*8 + s[i] - '0'
-				}
-				out = append(out, v)
-			} else {
-				out = append(out, c)
-			}
-		}
-	}
-	return out, nil
-}
-
 // The text native scales the zone by the entry size into the table, the count native returning the count
 func (sm *SystemModel) deriveTimeZones(d *Disassembly, textVA, countVA uint32) error {
 	text, count := d.Functions[textVA], d.Functions[countVA]
@@ -954,16 +834,20 @@ func (sm *SystemModel) deriveTimeZones(d *Disassembly, textVA, countVA uint32) e
 	if err != nil {
 		return fmt.Errorf("xbe: time zone count native: %w", err)
 	}
+	layout, err := d.timeZoneLayout(textVA, base, stride)
+	if err != nil {
+		return err
+	}
 	for i := 0; i < n; i++ {
 		e := base + uint32(i)*stride
-		keyPtr, _ := d.Image.ReadU32(e)
-		bias, _ := d.Image.ReadU16(e + timeZoneEntryBias)
-		stdBias, _ := d.Image.ReadU16(e + timeZoneEntryBias + 2)
-		dltBias, _ := d.Image.ReadU16(e + timeZoneEntryBias + 4)
-		stdPtr, _ := d.Image.ReadU32(e + timeZoneEntryStd)
-		dltPtr, _ := d.Image.ReadU32(e + timeZoneEntryDlt)
-		stdDate, ok1 := d.Image.ReadBytes(e+timeZoneEntryStdDt, 4)
-		dltDate, ok2 := d.Image.ReadBytes(e+timeZoneEntryDltDt, 4)
+		keyPtr, _ := d.Image.ReadU32(e + layout.key)
+		bias, _ := d.Image.ReadU16(e + layout.bias)
+		stdBias, _ := d.Image.ReadU16(e + layout.stdBias)
+		dltBias, _ := d.Image.ReadU16(e + layout.dltBias)
+		stdPtr, _ := d.Image.ReadU32(e + layout.stdName)
+		dltPtr, _ := d.Image.ReadU32(e + layout.dltName)
+		stdDate, ok1 := d.Image.ReadBytes(e+layout.stdDate, 4)
+		dltDate, ok2 := d.Image.ReadBytes(e+layout.dltDate, 4)
 		if keyPtr == 0 || stdPtr == 0 || !ok1 || !ok2 {
 			return fmt.Errorf("xbe: time zone entry %d at %08X is incomplete", i, e)
 		}
@@ -971,11 +855,379 @@ func (sm *SystemModel) deriveTimeZones(d *Disassembly, textVA, countVA uint32) e
 		if dltPtr != 0 {
 			tz.DltName = d.Image.ReadWideString(dltPtr)
 		}
-		tz.StdDate = TimeZoneDate{Month: int(stdDate[0]), Week: int(stdDate[1]), DayOfWeek: int(stdDate[2]), Hour: int(stdDate[3])}
-		tz.DltDate = TimeZoneDate{Month: int(dltDate[0]), Week: int(dltDate[1]), DayOfWeek: int(dltDate[2]), Hour: int(dltDate[3])}
+		date := func(b []byte) TimeZoneDate {
+			return TimeZoneDate{Month: int(b[layout.month]), Week: int(b[layout.week]), DayOfWeek: int(b[layout.dayOfWeek]), Hour: int(b[layout.hour])}
+		}
+		tz.StdDate, tz.DltDate = date(stdDate), date(dltDate)
 		sm.TimeZones = append(sm.TimeZones, tz)
 	}
 	return nil
+}
+
+// Reads the entry layout off every converter filling a time zone information, the key off the text native
+func (d *Disassembly) timeZoneLayout(textVA, base, stride uint32) (timeZoneLayout, error) {
+	keys := d.entryLoads(textVA, base, stride)
+	if len(keys) != 1 {
+		return timeZoneLayout{}, fmt.Errorf("xbe: time zone text native %08X reads %d entry words (%v)", textVA, len(keys), keys)
+	}
+	var layouts []timeZoneLayout
+	var converters []uint32
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil || d.inLibrary(va) || !scalesTable(fn, base, stride) {
+			continue
+		}
+		l, ok := d.converterLayout(va, base, stride)
+		if !ok {
+			continue
+		}
+		if len(layouts) > 0 && l != layouts[0] {
+			return timeZoneLayout{}, fmt.Errorf("xbe: time zone converters %08X and %08X read entries differently (%+v, %+v)", converters[0], va, layouts[0], l)
+		}
+		layouts, converters = append(layouts, l), append(converters, va)
+	}
+	if len(layouts) == 0 {
+		return timeZoneLayout{}, fmt.Errorf("xbe: no routine fills a time zone information from the table at %08X", base)
+	}
+	layout := layouts[0]
+	layout.key = keys[0]
+	return layout, nil
+}
+
+// Reports whether a routine scales by a table's entry size and names the table's base
+func scalesTable(fn *Function, base, stride uint32) bool {
+	scales, names := false, false
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		for _, a := range in.Inst.Args {
+			switch v := a.(type) {
+			case x86asm.Imm:
+				if in.Inst.Op == x86asm.IMUL && uint32(v) == stride {
+					scales = true
+				}
+				if uint32(v) == base {
+					names = true
+				}
+			case x86asm.Mem:
+				if uint32(v.Disp) >= base && uint32(v.Disp) < base+stride {
+					names = true
+				}
+			}
+		}
+	}
+	return scales && names
+}
+
+// Runs a routine on symbolic inputs and lists the distinct entry offsets of the table it loads
+func (d *Disassembly) entryLoads(va, base, stride uint32) []uint32 {
+	paths, ok := d.symbolicPaths(va)
+	if !ok {
+		return nil
+	}
+	seen := map[uint32]bool{}
+	for _, p := range paths {
+		for _, x := range pathExprs(p) {
+			mapExpr(x, func(e Expr) (Expr, bool) {
+				if l, ok := e.(Load); ok {
+					if k, ok := entryOffset(l, base, stride); ok {
+						seen[k] = true
+					}
+				}
+				return nil, false
+			})
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// Runs a routine on a symbolic receiver and symbolic register and stack inputs with its callees kept as calls
+func (d *Disassembly) symbolicPaths(va uint32) ([]Path, bool) {
+	fn := d.Functions[va]
+	if fn == nil {
+		return nil, false
+	}
+	ex := NewExecutorShared(d.baseExecutor())
+	ex.PathLimit, ex.StepLimit = 64, 20000
+	for _, c := range d.plainCallees(va) {
+		ex.Opaque[c] = true
+	}
+	stackArgs := max(d.cleanupOf(fn)/4, d.stackInputs(fn))
+	paths, err := ex.Run(va, func(s *execState) {
+		s.regs[1] = Ptr{"this", 0}
+		ex.seedArgs(s, va, "arg", stackArgs)
+	})
+	// A routine outrunning the path budget still shows the paths it completed
+	var limit *ExecError
+	if err != nil && (!errors.As(err, &limit) || !limit.Limit) {
+		return nil, false
+	}
+	return paths, true
+}
+
+// Reads where a converter stores each entry field into the time zone information it fills through one input
+func (d *Disassembly) converterLayout(va, base, stride uint32) (timeZoneLayout, bool) {
+	paths, ok := d.symbolicPaths(va)
+	if !ok {
+		return timeZoneLayout{}, false
+	}
+	fields := map[uint32]uint32{}
+	names := map[uint32]map[uint32]bool{}
+	dates := map[uint32]uint32{}
+	helpers := map[uint32]uint32{}
+	outs := map[string]bool{}
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			switch e.Kind {
+			case "store":
+				out, x, ok := inputOffset(e.Addr)
+				if !ok {
+					continue
+				}
+				l, ok := innerLoad(e.Value)
+				if !ok {
+					continue
+				}
+				k, ok := entryOffset(l, base, stride)
+				if !ok {
+					continue
+				}
+				if prev, dup := fields[x]; dup && prev != k {
+					return timeZoneLayout{}, false
+				}
+				fields[x], outs[out] = k, true
+			case "call":
+				// A copy takes the information field and the entry word, a date helper the field and the entry bytes
+				var out string
+				x, entry, word, hasOut, hasEntry, hasWord := uint32(0), uint32(0), uint32(0), false, false, false
+				for _, a := range e.Args {
+					if name, off, ok := inputOffset(a); ok && !hasOut {
+						out, x, hasOut = name, off, true
+					} else if l, ok := a.(Load); ok && l.Size == 4 {
+						if k, ok := entryOffset(l, base, stride); ok {
+							word, hasWord = k, true
+						}
+					} else if k, ok := entryAddrOffset(a, base, stride); ok {
+						entry, hasEntry = k, true
+					}
+				}
+				if !hasOut {
+					continue
+				}
+				switch {
+				case hasWord:
+					if names[x] == nil {
+						names[x] = map[uint32]bool{}
+					}
+					names[x][word], outs[out] = true, true
+				case hasEntry:
+					var helper uint32
+					if scanSub(e.Fn, &helper) {
+						dates[x], helpers[x], outs[out] = entry, helper, true
+					}
+				}
+			}
+		}
+	}
+	if len(outs) != 1 {
+		return timeZoneLayout{}, false
+	}
+	var layout timeZoneLayout
+	var found bool
+	if layout.bias, found = fields[tziBias]; !found {
+		return timeZoneLayout{}, false
+	}
+	if layout.stdBias, found = fields[tziStdBias]; !found {
+		return timeZoneLayout{}, false
+	}
+	if layout.dltBias, found = fields[tziDltBias]; !found {
+		return timeZoneLayout{}, false
+	}
+	if len(names[tziStdName]) != 1 {
+		return timeZoneLayout{}, false
+	}
+	for k := range names[tziStdName] {
+		layout.stdName = k
+	}
+	var dlt []uint32
+	for k := range names[tziDltName] {
+		if k != layout.stdName {
+			dlt = append(dlt, k)
+		}
+	}
+	if len(dlt) != 1 {
+		return timeZoneLayout{}, false
+	}
+	layout.dltName = dlt[0]
+	stdDate, stdBytes, ok1 := d.packedDate(tziStdDate, fields, dates, helpers)
+	dltDate, dltBytes, ok2 := d.packedDate(tziDltDate, fields, dates, helpers)
+	if !ok1 || !ok2 || stdBytes != dltBytes {
+		return timeZoneLayout{}, false
+	}
+	layout.stdDate, layout.dltDate = stdDate, dltDate
+	layout.month, layout.week, layout.dayOfWeek, layout.hour = stdBytes[0], stdBytes[1], stdBytes[2], stdBytes[3]
+	return layout, true
+}
+
+// A packed date is the four entry bytes spread over the month, week, day of week and hour words
+func (d *Disassembly) packedDate(tzi uint32, fields, dates, helpers map[uint32]uint32) (uint32, [4]uint32, bool) {
+	words := [4]uint32{stMonth, stDay, stDayOfWeek, stHour}
+	var bytes [4]uint32
+	if entry, viaHelper := dates[tzi]; viaHelper {
+		spread, ok := d.dateSpread(helpers[tzi])
+		if !ok {
+			return 0, bytes, false
+		}
+		for i, w := range words {
+			b, ok := spread[w]
+			if !ok {
+				return 0, bytes, false
+			}
+			bytes[i] = b
+		}
+		return entry, bytes, true
+	}
+	first := uint32(0)
+	for i, w := range words {
+		k, ok := fields[tzi+w]
+		if !ok {
+			return 0, bytes, false
+		}
+		if i == 0 || k < first {
+			first = k
+		}
+		bytes[i] = k
+	}
+	for i := range bytes {
+		bytes[i] -= first
+	}
+	return first, bytes, true
+}
+
+// Reads which byte of its source a date helper stores into each word of its destination
+func (d *Disassembly) dateSpread(helper uint32) (map[uint32]uint32, bool) {
+	paths, ok := d.symbolicPaths(helper)
+	if !ok {
+		return nil, false
+	}
+	spread := map[uint32]uint32{}
+	for _, p := range paths {
+		for _, e := range p.Effects {
+			if e.Kind != "store" {
+				continue
+			}
+			dst, w, ok := inputOffset(e.Addr)
+			if !ok {
+				continue
+			}
+			l, ok := innerLoad(e.Value)
+			if !ok {
+				continue
+			}
+			var src string
+			var b uint32
+			if l.Addr == nil {
+				src, b, ok = l.Base, uint32(l.Off), l.Off >= 0
+			} else {
+				src, b, ok = inputOffset(l.Addr)
+			}
+			if !ok || src == dst {
+				continue
+			}
+			if prev, dup := spread[w]; dup && prev != b {
+				return nil, false
+			}
+			spread[w] = b
+		}
+	}
+	return spread, len(spread) > 0
+}
+
+// The input an address names and the offset past it
+func inputOffset(e Expr) (string, uint32, bool) {
+	switch v := e.(type) {
+	case Sym:
+		return v.Name, 0, true
+	case Ptr:
+		if v.Base != "" && v.Base != "stack" && v.Off >= 0 {
+			return v.Base, uint32(v.Off), true
+		}
+	case Bin:
+		if v.Op != "add" {
+			return "", 0, false
+		}
+		if c, ok := isConst(v.B); ok {
+			if name, off, ok := inputOffset(v.A); ok {
+				return name, off + c, true
+			}
+		}
+		if c, ok := isConst(v.A); ok {
+			if name, off, ok := inputOffset(v.B); ok {
+				return name, off + c, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// The one load an expression wraps in conversions and masks
+func innerLoad(e Expr) (Load, bool) {
+	switch v := e.(type) {
+	case Load:
+		return v, true
+	case Un:
+		return innerLoad(v.A)
+	case Bin:
+		a, okA := innerLoad(v.A)
+		b, okB := innerLoad(v.B)
+		if okA && !okB {
+			return a, true
+		}
+		if okB && !okA {
+			return b, true
+		}
+	}
+	return Load{}, false
+}
+
+// The offset into a table entry a load reads through an index scaled by the stride past the base
+func entryOffset(l Load, base, stride uint32) (uint32, bool) {
+	if l.Addr == nil {
+		return 0, false
+	}
+	return entryAddrOffset(l.Addr, base, stride)
+}
+
+// The offset into a table entry an address names through an index scaled by the stride past the base
+func entryAddrOffset(addr Expr, base, stride uint32) (uint32, bool) {
+	consts, scaled := uint32(0), 0
+	var walk func(e Expr) bool
+	walk = func(e Expr) bool {
+		if c, ok := isConst(e); ok {
+			consts += c
+			return true
+		}
+		switch v := e.(type) {
+		case Bin:
+			switch v.Op {
+			case "add":
+				return walk(v.A) && walk(v.B)
+			case "mul":
+				if c, ok := isConst(v.B); ok && c == stride {
+					scaled++
+					return true
+				}
+				if c, ok := isConst(v.A); ok && c == stride {
+					scaled++
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !walk(addr) || scaled != 1 || consts < base || consts-base >= stride {
+		return 0, false
+	}
+	return consts - base, true
 }
 
 // The month length native sign extends a word indexed by the month

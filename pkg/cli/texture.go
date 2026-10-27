@@ -113,8 +113,8 @@ func runTextureExportAll(cmd *cobra.Command, args []string) error {
 		if e.IsDir() {
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(e.Name()))
-		if ext != ".xbx" {
+		ext := filepath.Ext(e.Name())
+		if !strings.EqualFold(ext, ".xbx") {
 			continue
 		}
 

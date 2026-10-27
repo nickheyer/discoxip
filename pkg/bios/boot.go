@@ -4,8 +4,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/xbe"
 	"golang.org/x/arch/x86/x86asm"
@@ -66,9 +69,6 @@ type Boot struct {
 	GDT      Descriptor        `json:"gdt"`
 	CR0      uint32            `json:"cr0"`
 }
-
-// The partition the kernel launches the dashboard from
-const LaunchPartition = 2
 
 // The names the boot writes its memory runs under
 const (
@@ -188,8 +188,12 @@ func WriteBoot(b *Bank, dir, launchDir string) error {
 	if err != nil {
 		return err
 	}
+	launch, err := launchPartition(lifted.Kernel, launchDir)
+	if err != nil {
+		return err
+	}
 	hdd, dvd := DefaultDrives()
-	disk, diskData, err := BuildDisk(partitions, LaunchPartition, launchDir, hdd, dvd)
+	disk, diskData, err := BuildDisk(partitions, launch, launchDir, hdd, dvd)
 	if err != nil {
 		return err
 	}
@@ -221,4 +225,85 @@ func WriteBoot(b *Bank, dir, launchDir string) error {
 	}
 	fmt.Printf("  disk of %d sectors, %d bytes of volume data in %d runs\n", disk.Sectors, len(diskData), len(disk.Runs))
 	return nil
+}
+
+// Reads the partition number out of the kernel path naming an executable the launch directory holds
+func launchPartition(kernel *xbe.Image, launchDir string) (uint32, error) {
+	names, err := executableNames(launchDir)
+	if err != nil {
+		return 0, err
+	}
+	var paths []string
+	for _, s := range kernelStrings(kernel) {
+		lower := strings.ToLower(s)
+		for _, name := range names {
+			if strings.HasSuffix(lower, `\`+name) {
+				paths = append(paths, s)
+			}
+		}
+	}
+	if len(paths) != 1 {
+		return 0, fmt.Errorf("bios: %d kernel paths name an executable of %s (%v of %v)", len(paths), launchDir, paths, names)
+	}
+	lower := strings.ToLower(paths[0])
+	at := strings.LastIndex(lower, strings.ToLower(partitionName))
+	if at < 0 {
+		return 0, fmt.Errorf("bios: the launch path %q names no %s", paths[0], partitionName)
+	}
+	digits := lower[at+len(partitionName):]
+	digits = digits[:strings.IndexFunc(digits+`\`, func(r rune) bool { return r < '0' || r > '9' })]
+	n, err := strconv.ParseUint(digits, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("bios: the launch path %q numbers no partition", paths[0])
+	}
+	return uint32(n), nil
+}
+
+// The lower cased names of the executables under a directory, told by the magic their first bytes carry
+func executableNames(dir string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		magic := make([]byte, len(xbe.Magic))
+		if n, _ := f.Read(magic); n == len(magic) && string(magic) == xbe.Magic {
+			out = append(out, strings.ToLower(filepath.Base(path)))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("bios: %s holds no executable", dir)
+	}
+	return out, nil
+}
+
+// Every terminated run of printable bytes in the kernel image
+func kernelStrings(img *xbe.Image) []string {
+	var out []string
+	for i := range img.Sections {
+		data := img.Sections[i].Data
+		start := -1
+		for off, b := range data {
+			printable := b >= ' ' && b <= '~'
+			if printable && start < 0 {
+				start = off
+			}
+			if !printable {
+				if start >= 0 && b == 0 {
+					out = append(out, string(data[start:off]))
+				}
+				start = -1
+			}
+		}
+	}
+	return out
 }

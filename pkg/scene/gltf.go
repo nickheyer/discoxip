@@ -393,6 +393,9 @@ func (b *glbBuilder) buildMesh(md *MeshData, name string, matIdx *int) int {
 		return -1
 	}
 
+	for len(b.binBuf)%4 != 0 {
+		b.binBuf = append(b.binBuf, 0)
+	}
 	posOffset := len(b.binBuf)
 	posData := encodePositions(verts)
 	b.binBuf = append(b.binBuf, posData...)

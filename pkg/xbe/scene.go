@@ -943,18 +943,6 @@ func storedVtable(d *Disassembly, e Effect) (uint32, bool) {
 	return c, true
 }
 
-// Reports whether any path calls a library routine by name
-func callsLibrary(paths []Path, name string) bool {
-	for _, p := range paths {
-		for _, e := range p.Effects {
-			if e.Kind == "call" && e.Fn == name {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // Reads the vtable a constructor stores at its object's start and the field it fills from an allocation
 func valueConstructor(paths []Path, filledFrom string) (uint32, int32, bool) {
 	var vtable uint32

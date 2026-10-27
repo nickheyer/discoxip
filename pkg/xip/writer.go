@@ -38,12 +38,8 @@ func (w *Writer) Flush() error {
 		return w.entries[i].Name < w.entries[j].Name
 	})
 
-	// Collect unique directory paths
-	dirs := collectDirs(w.entries)
-
-	// Total file records = dirs + files
-	numFiles := uint16(len(dirs) + len(w.entries))
-	numNames := uint16(len(dirs) + len(w.entries))
+	numFiles := uint16(len(w.entries))
+	numNames := uint16(len(w.entries))
 
 	// Build name block and fileName records
 	type record struct {
@@ -52,19 +48,6 @@ func (w *Writer) Flush() error {
 	}
 	var records []record
 	var nameBlock []byte
-
-	// Directory records first
-	for _, d := range dirs {
-		nameOff := uint16(len(nameBlock))
-		nameBlock = appendString(nameBlock, d)
-		records = append(records, record{
-			fd: fileData{Type: uint32(FileTypeDir)},
-			fn: fileName{DataIndex: uint16(len(records)), NameOffset: nameOff},
-		})
-	}
-
-	// File records — offsets computed below
-	fileStartIdx := len(records)
 	for _, e := range w.entries {
 		nameOff := uint16(len(nameBlock))
 		nameBlock = appendString(nameBlock, e.Name)
@@ -90,7 +73,7 @@ func (w *Writer) Flush() error {
 	// Compute per-file offsets and total data size
 	var dataSize uint32
 	for i, e := range w.entries {
-		records[fileStartIdx+i].fd.Offset = dataSize
+		records[i].fd.Offset = dataSize
 		dataSize += e.Size
 	}
 
@@ -137,24 +120,6 @@ func (w *Writer) Flush() error {
 	}
 
 	return nil
-}
-
-// collectDirs returns sorted unique directory paths from entries.
-func collectDirs(entries []WriteEntry) []string {
-	seen := make(map[string]bool)
-	for _, e := range entries {
-		parts := strings.Split(e.Name, "/")
-		for i := 1; i < len(parts); i++ {
-			dir := strings.Join(parts[:i], "/")
-			seen[dir] = true
-		}
-	}
-	dirs := make([]string, 0, len(seen))
-	for d := range seen {
-		dirs = append(dirs, d)
-	}
-	sort.Strings(dirs)
-	return dirs
 }
 
 // appendString appends a null-terminated string (with backslashes) to buf.

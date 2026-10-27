@@ -11,7 +11,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo de
 COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS   := -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=$(VERSION) -X github.com/nickheyer/discoxip/pkg/cli.Commit=$(COMMIT)"
 
-.PHONY: all build dev pipeline decompile serve test vet fmt clean
+.PHONY: all build dev pipeline decompile serve test test-samples vet fmt clean
 
 all: build
 
@@ -33,6 +33,9 @@ serve:
 
 test:
 	go test ./...
+
+test-samples:
+	go test -tags samples -timeout 30m -run Samples ./pkg/cli/
 
 vet:
 	go vet ./...

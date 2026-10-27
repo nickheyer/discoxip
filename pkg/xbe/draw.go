@@ -1,6 +1,7 @@
 package xbe
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -146,12 +147,6 @@ func (d *Disassembly) siteArgumentsFrom(fn *Function, i int, seed map[x86asm.Reg
 	return out
 }
 
-// registrarSlot names where the registrar takes one of its arguments.
-type registrarSlot struct {
-	loc  argLocation
-	role string
-}
-
 // Finds the registrar as the function most often called with a class name, and how its call sites lay out the
 // name, size, constructor, parent descriptor, field table and descriptor arguments
 func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error) {
@@ -223,49 +218,76 @@ func (d *Disassembly) findRegistrar() (uint32, map[uint32][]registration, error)
 		return 0, false
 	}
 	// Each slot is classified by what nearly every site passes in it, a stray value never settling the role.
-	roles := map[argLocation]string{}
+	type slotStats struct {
+		names, ctors, numbers, data, zero, known int
+		distinct                                 map[uint32]bool
+	}
+	stats := map[argLocation]*slotStats{}
 	for _, loc := range slots {
-		names, ctors, numbers, data, zero := 0, 0, 0, 0, 0
-		distinct := map[uint32]bool{}
-		fields := 0
-		known := 0
-		for _, st := range sites[best] {
-			v, ok := value(st, loc)
+		st := &slotStats{distinct: map[uint32]bool{}}
+		for _, site := range sites[best] {
+			v, ok := value(site, loc)
 			if !ok {
 				continue
 			}
-			known++
-			distinct[v] = true
+			st.known++
+			st.distinct[v] = true
 			switch {
 			case v == 0:
-				zero++
+				st.zero++
 			case d.sectionOf(v) == nil:
-				numbers++
+				st.numbers++
 			case d.namesObject(v):
-				names++
+				st.names++
 			case d.Functions[v] != nil && d.Functions[v].Symbol == nil:
-				ctors++
+				st.ctors++
 			case d.isDataAddress(v):
-				data++
-				if np, ok := d.Image.ReadU32(v + 20); ok && d.namesObject(np) {
-					fields++
-				}
+				st.data++
 			}
 		}
-		mostly := func(n int) bool { return known > 0 && n*10 >= known*9 }
+		stats[loc] = st
+	}
+	mostly := func(n, known int) bool { return known > 0 && n*10 >= known*9 }
+	roles := map[argLocation]string{}
+	var pointers []argLocation
+	for _, loc := range slots {
+		st := stats[loc]
 		switch {
-		case mostly(names):
+		case mostly(st.names, st.known):
 			roles[loc] = "name"
-		case mostly(ctors + zero):
+		case mostly(st.ctors+st.zero, st.known):
 			roles[loc] = "ctor"
-		case mostly(numbers):
+		case mostly(st.numbers, st.known):
 			roles[loc] = "size"
-		case mostly(data+zero) && fields > 0:
+		case mostly(st.data+st.zero, st.known):
+			pointers = append(pointers, loc)
+		}
+	}
+	// The parent slot names descriptors other sites pass in the descriptor slot, the field table slot names neither
+	var links [][2]argLocation
+	for _, p := range pointers {
+		for _, q := range pointers {
+			if p == q {
+				continue
+			}
+			linked := true
+			for v := range stats[p].distinct {
+				if v != 0 && !stats[q].distinct[v] {
+					linked = false
+				}
+			}
+			if linked {
+				links = append(links, [2]argLocation{p, q})
+			}
+		}
+	}
+	if len(links) != 1 {
+		return 0, nil, fmt.Errorf("xbe: registrar %08X call sites link descriptors through %d pointer slot pairs", best, len(links))
+	}
+	roles[links[0][0]], roles[links[0][1]] = "parent", "desc"
+	for _, loc := range pointers {
+		if _, done := roles[loc]; !done {
 			roles[loc] = "table"
-		case mostly(data) && len(distinct) == known:
-			roles[loc] = "desc"
-		case mostly(data + zero):
-			roles[loc] = "parent"
 		}
 	}
 	byRole := map[string]argLocation{}
@@ -359,23 +381,12 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, uint32, error) {
 	}
 	byDesc := map[uint32]string{}
 	types := map[string]*NodeType{}
+	tables := map[string]uint32{}
 	for _, r := range sites[registrar] {
 		nt := &NodeType{Name: r.name, Desc: r.desc, Size: r.size, Ctor: d.realCtor(r.ctor), Fields: map[int32]NodeField{}, Init: map[int32]NodeInit{}}
 		byDesc[r.desc] = r.name
 		if r.table != 0 {
-			for i := uint32(0); i < 64; i++ {
-				off, _ := d.Image.ReadU32(r.table + 12 + 12*i)
-				typ, _ := d.Image.ReadU32(r.table + 16 + 12*i)
-				np, _ := d.Image.ReadU32(r.table + 20 + 12*i)
-				if np == 0 {
-					break
-				}
-				name := d.Image.ReadUTF16(np)
-				if name == "" || !isPrintable(name) {
-					return nil, 0, fmt.Errorf("xbe: node type %s field %d has no name", r.name, i)
-				}
-				nt.Fields[int32(off)] = NodeField{Name: name, Type: typ}
-			}
+			tables[r.name] = r.table
 		}
 		if fn := d.Functions[nt.Ctor]; fn != nil {
 			nt.Vtable, _ = ctorShape(d, fn)
@@ -397,6 +408,15 @@ func DeriveNodeTypes(d *Disassembly) (map[string]*NodeType, uint32, error) {
 			nt.Slots = d.vtableSlots(nt.Vtable)
 		}
 		types[r.name] = nt
+	}
+	layout, err := d.fieldTableLayout(types, tables)
+	if err != nil {
+		return nil, 0, err
+	}
+	for name, table := range tables {
+		if err := d.readFieldTable(types[name], table, layout); err != nil {
+			return nil, 0, err
+		}
 	}
 	for _, r := range sites[registrar] {
 		if r.parent != 0 {
@@ -1230,4 +1250,264 @@ func usageOf(paths []Path, d *Disassembly, name string) (uint32, bool) {
 		}
 	}
 	return found, found != 0
+}
+
+// The vtable slot returning a class's field table and the byte layout of the table's records
+type fieldTableLayout struct {
+	slot   int32
+	header uint32
+	stride uint32
+	name   uint32
+	offset uint32
+	typ    uint32
+}
+
+// Finds the one vtable slot whose accessor returns the field table every class registered
+func (d *Disassembly) fieldTableSlot(types map[string]*NodeType, tables map[string]uint32) (int32, error) {
+	slots := 0
+	for _, nt := range types {
+		slots = max(slots, len(nt.Slots))
+	}
+	var found []int32
+	for s := 0; s < slots; s++ {
+		matched, all := 0, true
+		for name, table := range tables {
+			nt := types[name]
+			if nt.Vtable == 0 || s >= len(nt.Slots) {
+				continue
+			}
+			base, accessor := d.methodTableBase(nt.Slots[s])
+			if !accessor || base != table {
+				all = false
+				break
+			}
+			matched++
+		}
+		if all && matched > 0 {
+			found = append(found, int32(4*s))
+		}
+	}
+	if len(found) != 1 {
+		return 0, fmt.Errorf("xbe: %d vtable slots return the registered field tables", len(found))
+	}
+	return found[0], nil
+}
+
+// Reports whether a routine calls through a vtable slot
+func callsSlot(fn *Function, slot int32) bool {
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op != x86asm.CALL {
+			continue
+		}
+		if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base != 0 && m.Index == 0 && int32(m.Disp) == slot {
+			return true
+		}
+	}
+	return false
+}
+
+// Reads record header, stride and name offset off the table walkers and picks the offset word no class repeats
+func (d *Disassembly) fieldTableLayout(types map[string]*NodeType, tables map[string]uint32) (fieldTableLayout, error) {
+	slot, err := d.fieldTableSlot(types, tables)
+	if err != nil {
+		return fieldTableLayout{}, err
+	}
+	ex := d.baseExecutor()
+	var layout fieldTableLayout
+	var walkers []uint32
+	for _, va := range d.functionVAs() {
+		fn := d.Functions[va]
+		if fn.Symbol != nil || d.inLibrary(va) || !callsSlot(fn, slot) {
+			continue
+		}
+		l, ok := d.walkerLayout(ex, va, slot)
+		if !ok {
+			continue
+		}
+		if len(walkers) > 0 && l != layout {
+			return fieldTableLayout{}, fmt.Errorf("xbe: field table walkers %08X and %08X read records differently (%+v, %+v)", walkers[0], va, layout, l)
+		}
+		layout, walkers = l, append(walkers, va)
+	}
+	if len(walkers) == 0 {
+		return fieldTableLayout{}, fmt.Errorf("xbe: no routine walks the field tables through vtable slot %d", slot/4)
+	}
+	words := layout.stride / 4
+	var candidates []uint32
+	for w := uint32(0); w < words; w++ {
+		if w*4 != layout.name {
+			candidates = append(candidates, w*4)
+		}
+	}
+	unique := map[uint32]bool{}
+	for _, c := range candidates {
+		unique[c] = true
+	}
+	for name, table := range tables {
+		seen := map[uint32]map[uint32]bool{}
+		for _, c := range candidates {
+			seen[c] = map[uint32]bool{}
+		}
+		for rec := table + layout.header; ; rec += layout.stride {
+			np, ok := d.Image.ReadU32(rec + layout.name)
+			if !ok {
+				return fieldTableLayout{}, fmt.Errorf("xbe: node type %s field table runs past the image at %08X", name, rec)
+			}
+			if np == 0 {
+				break
+			}
+			for _, c := range candidates {
+				v, _ := d.Image.ReadU32(rec + c)
+				if seen[c][v] {
+					unique[c] = false
+				}
+				seen[c][v] = true
+			}
+		}
+	}
+	var offsets []uint32
+	for _, c := range candidates {
+		if unique[c] {
+			offsets = append(offsets, c)
+		}
+	}
+	if len(offsets) != 1 || len(candidates) != 2 {
+		return fieldTableLayout{}, fmt.Errorf("xbe: field records of %d words hold %d words no class repeats, expected one offset word beside the type", words, len(offsets))
+	}
+	layout.offset = offsets[0]
+	for _, c := range candidates {
+		if c != layout.offset {
+			layout.typ = c
+		}
+	}
+	return layout, nil
+}
+
+// Runs a walker on a symbolic object and reads the name offsets compared and the records returned
+func (d *Disassembly) walkerLayout(ex *Executor, va uint32, slot int32) (fieldTableLayout, bool) {
+	fn := d.Functions[va]
+	sub := NewExecutorShared(ex)
+	sub.PathLimit, sub.StepLimit = 4096, 20000
+	for _, c := range d.plainCallees(va) {
+		sub.Opaque[c] = true
+	}
+	stackArgs := max(d.cleanupOf(fn)/4, d.stackInputs(fn))
+	paths, err := sub.Run(va, func(s *execState) {
+		s.regs[1] = Ptr{"this", 0}
+		sub.seedArgs(s, va, "arg", stackArgs)
+	})
+	// The walk over every record of every ancestor outruns any path budget, the records found before that suffice
+	var limit *ExecError
+	if err != nil && (!errors.As(err, &limit) || !limit.Limit) {
+		return fieldTableLayout{}, false
+	}
+	accessor := fmt.Sprintf("vcall@%X", slot)
+	names := map[uint32]bool{}
+	returns := map[uint32]bool{}
+	for _, p := range paths {
+		bases := map[string]bool{}
+		for _, e := range p.Effects {
+			receiver := e.This == Expr(Ptr{"this", 0}) || (len(e.Args) > 0 && e.Args[0] == Expr(Ptr{"this", 0}))
+			if e.Kind == "call" && e.Fn == accessor && receiver {
+				bases[fmt.Sprintf("res%d", e.Seq)] = true
+			}
+		}
+		// A table is the accessor's result or the word a table starts with, which links its parent
+		var isTable func(e Expr) bool
+		isTable = func(e Expr) bool {
+			switch v := e.(type) {
+			case CallResult:
+				return bases[fmt.Sprintf("res%d", v.Seq)]
+			case Ptr:
+				return v.Off == 0 && bases[v.Base]
+			case Load:
+				if v.Size != 4 {
+					return false
+				}
+				if v.Addr == nil {
+					return v.Off == 0 && bases[v.Base]
+				}
+				return isTable(v.Addr)
+			}
+			return false
+		}
+		// The byte offset into a table an expression reads or names
+		tableOffset := func(e Expr) (uint32, bool) {
+			switch v := e.(type) {
+			case Ptr:
+				if bases[v.Base] && v.Off > 0 {
+					return uint32(v.Off), true
+				}
+			case Bin:
+				if c, ok := isConst(v.B); ok && v.Op == "add" && c > 0 && isTable(v.A) {
+					return c, true
+				}
+			}
+			return 0, false
+		}
+		for _, e := range p.Effects {
+			if e.Kind != "call" || e.Fn == accessor {
+				continue
+			}
+			for _, a := range e.Args {
+				l, ok := a.(Load)
+				if !ok || l.Size != 4 {
+					continue
+				}
+				if l.Addr == nil {
+					if l.Off > 0 && bases[l.Base] {
+						names[uint32(l.Off)] = true
+					}
+				} else if off, ok := tableOffset(l.Addr); ok {
+					names[off] = true
+				}
+			}
+		}
+		if off, ok := tableOffset(asPtr(p.Return)); ok {
+			returns[off] = true
+		} else if off, ok := tableOffset(p.Return); ok {
+			returns[off] = true
+		}
+	}
+	if len(names) < 2 || len(returns) == 0 {
+		return fieldTableLayout{}, false
+	}
+	nameOffs := slices.Sorted(maps.Keys(names))
+	stride := nameOffs[1] - nameOffs[0]
+	for i := 1; i < len(nameOffs); i++ {
+		if nameOffs[i]-nameOffs[i-1] != stride {
+			return fieldTableLayout{}, false
+		}
+	}
+	header := slices.Min(slices.Collect(maps.Keys(returns)))
+	for off := range returns {
+		if (off-header)%stride != 0 {
+			return fieldTableLayout{}, false
+		}
+	}
+	if nameOffs[0] < header || nameOffs[0]-header >= stride || stride%4 != 0 {
+		return fieldTableLayout{}, false
+	}
+	return fieldTableLayout{slot: slot, header: header, stride: stride, name: nameOffs[0] - header}, true
+}
+
+// Reads a class's fields out of its table, each record naming a field at an object offset with a type
+func (d *Disassembly) readFieldTable(nt *NodeType, table uint32, layout fieldTableLayout) error {
+	for rec := table + layout.header; ; rec += layout.stride {
+		np, ok := d.Image.ReadU32(rec + layout.name)
+		if !ok {
+			return fmt.Errorf("xbe: node type %s field table runs past the image at %08X", nt.Name, rec)
+		}
+		if np == 0 {
+			return nil
+		}
+		name := d.Image.ReadUTF16(np)
+		if name == "" || !isPrintable(name) {
+			return fmt.Errorf("xbe: node type %s field at %08X has no name", nt.Name, rec)
+		}
+		off, _ := d.Image.ReadU32(rec + layout.offset)
+		typ, _ := d.Image.ReadU32(rec + layout.typ)
+		nt.Fields[int32(off)] = NodeField{Name: name, Type: typ}
+	}
 }

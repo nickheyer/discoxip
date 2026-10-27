@@ -2,6 +2,7 @@ package xbe
 
 import (
 	"golang.org/x/arch/x86/x86asm"
+	"maps"
 )
 
 // Lists the instruction indices control can reach after an instruction of a function
@@ -88,7 +89,7 @@ func (d *Disassembly) staticAddressFlowFrom(fn *Function, seed map[x86asm.Reg]ui
 		}
 		for _, j := range fn.successors(i, index) {
 			if states[j] == nil {
-				states[j] = held
+				states[j] = maps.Clone(held)
 				work = append(work, j)
 				continue
 			}
@@ -205,8 +206,8 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 		}
 		for _, j := range fn.successors(i, index) {
 			if written[j] == nil {
-				written[j] = after
-				saved[j] = savedAfter
+				written[j] = maps.Clone(after)
+				saved[j] = maps.Clone(savedAfter)
 				work = append(work, j)
 				continue
 			}
@@ -298,7 +299,7 @@ func (d *Disassembly) globalLoadFlow(fn *Function) []map[x86asm.Reg]uint32 {
 		}
 		for _, j := range fn.successors(i, index) {
 			if states[j] == nil {
-				states[j] = held
+				states[j] = maps.Clone(held)
 				work = append(work, j)
 				continue
 			}

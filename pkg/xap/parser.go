@@ -90,7 +90,12 @@ func (p *parser) parseScene() (*Scene, error) {
 		if t.typ == tokIdent {
 			switch t.val {
 			case "function":
-				script := p.captureScript()
+				script, err := p.captureScript()
+				if err != nil {
+					scene.Warnings = p.warnings
+					scene.Defs = p.defs
+					return scene, err
+				}
 				scene.Items = append(scene.Items, SceneItem{Kind: SScript, Script: script})
 				continue
 			case "var":
@@ -200,12 +205,11 @@ func (p *parser) parseNodeBody(node *Node) error {
 		}
 
 		switch t.val {
-		case "function":
-			script := p.captureScript()
-			node.Scripts = append(node.Scripts, script)
-
-		case "behavior":
-			script := p.captureScript()
+		case "function", "behavior":
+			script, err := p.captureScript()
+			if err != nil {
+				return err
+			}
 			node.Scripts = append(node.Scripts, script)
 
 		case "var":
@@ -260,9 +264,10 @@ func (p *parser) parseNodeBody(node *Node) error {
 		}
 	}
 
-	if p.peek().typ == tokRBrace {
-		p.next() // consume }
+	if p.peek().typ != tokRBrace {
+		return fmt.Errorf("%w: no } closes the %s body", ErrUnexpectedEOF, node.TypeName)
 	}
+	p.next() // consume }
 	return nil
 }
 
@@ -410,9 +415,10 @@ func (p *parser) parseArrayValue() ([]Value, error) {
 			p.next() // skip unknown
 		}
 	}
-	if p.peek().typ == tokRBracket {
-		p.next() // consume ]
+	if p.peek().typ != tokRBracket {
+		return arr, fmt.Errorf("%w: no ] closes the array", ErrUnexpectedEOF)
 	}
+	p.next() // consume ]
 	return arr, nil
 }
 
@@ -495,15 +501,16 @@ func (p *parser) parseChildrenArray() ([]*Node, error) {
 		}
 	}
 
-	if p.peek().typ == tokRBracket {
-		p.next() // consume ]
+	if p.peek().typ != tokRBracket {
+		return children, fmt.Errorf("%w: no ] closes the children", ErrUnexpectedEOF)
 	}
+	p.next() // consume ]
 	return children, nil
 }
 
 // captureScript captures a verbatim script block starting with "function" or "behavior".
 // Uses raw input scanning for perfect fidelity.
-func (p *parser) captureScript() string {
+func (p *parser) captureScript() (string, error) {
 	startTok := p.peek()
 	startPos := startTok.pos
 
@@ -518,19 +525,22 @@ func (p *parser) captureScript() string {
 
 	if p.peek().typ != tokLBrace {
 		// No body found
-		return p.input[startPos:p.tokens[p.pos].pos]
+		return p.input[startPos:p.tokens[p.pos].pos], nil
 	}
 
 	// Capture the body using brace-depth scanning on raw input
 	bracePos := p.peek().pos
 	endPos := p.scanMatchingBrace(bracePos)
+	if endPos >= len(p.input) {
+		return "", fmt.Errorf("%w: no } closes the script at pos %d", ErrUnexpectedEOF, bracePos)
+	}
 
 	// Skip all tokens that fall within this range
 	for p.peek().typ != tokEOF && p.peek().pos <= endPos {
 		p.next()
 	}
 
-	return strings.TrimRightFunc(p.input[startPos:endPos+1], unicode.IsSpace)
+	return strings.TrimRightFunc(p.input[startPos:endPos+1], unicode.IsSpace), nil
 }
 
 // captureVarDecl captures a var declaration up to the semicolon or end of statement.

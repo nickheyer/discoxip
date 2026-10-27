@@ -343,7 +343,7 @@ func transformAddress(addr Expr, state Sym) (device, off, stride uint32, ok bool
 }
 
 // Recognizes a copy into one of the device's transform matrices, returning the transform state it sets
-func (ex *Executor) transformCopy(s *execState, dst Expr, bytes uint32) (uint32, bool) {
+func (ex *Executor) transformCopy(dst Expr, bytes uint32) (uint32, bool) {
 	layout, err := ex.d.deviceState()
 	if err != nil || layout == nil || bytes != layout.stride {
 		return 0, false

@@ -17,6 +17,8 @@ const (
 	lzxBlockUncompressed = 3
 	lzxFrameSize         = 32768
 	lzxMaxCodeLength     = 16
+	lzxMinWindowBits     = 15
+	lzxMaxWindowBits     = 21
 )
 
 // lzxBits reads the stream as the format lays it out, sixteen bit little endian words consumed from the top bit
@@ -146,7 +148,7 @@ type lzxDecoder struct {
 
 // Sets up a decoder for a window of the given number of bits
 func newLZXDecoder(windowBits int) (*lzxDecoder, error) {
-	if windowBits < 15 || windowBits > 21 {
+	if windowBits < lzxMinWindowBits || windowBits > lzxMaxWindowBits {
 		return nil, fmt.Errorf("lzx: window of %d bits", windowBits)
 	}
 	d := &lzxDecoder{window: make([]byte, 1<<windowBits), r0: 1, r1: 1, r2: 1}

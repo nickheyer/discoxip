@@ -5,23 +5,28 @@ import (
 	"math"
 	"math/bits"
 	"strings"
+	"unicode/utf16"
 )
 
 // MachineRun executes the lifted blocks of a machine model in Go, for a derivation that reads what a routine of the
 // image computes, every value an integer and memory starting as the image holds it
 type MachineRun struct {
-	mm      *MachineModel
-	img     *Image
-	Regs    map[string]uint32
-	mem     map[uint32]byte
-	fl      runFlags
-	IF, DF  bool
-	tsc     uint64
-	steps   int
-	results map[int]uint32
-	memo    map[exprKey]uint32
-	Stop    map[uint32]bool                       // addresses the run stops at before executing
-	Hooks   map[uint32]func(r *MachineRun) uint32 // routines the run answers itself, each returning where to continue
+	mm       *MachineModel
+	img      *Image
+	Regs     map[string]uint32
+	mem      map[uint32]byte
+	fl       runFlags
+	IF, DF   bool
+	tsc      uint64
+	steps    int
+	results  map[int]uint32
+	memo     map[exprKey]uint32
+	Stop     map[uint32]bool                       // addresses the run stops at before executing
+	Hooks    map[uint32]func(r *MachineRun) uint32 // routines the run answers itself, each returning where to continue
+	Failed   error                                 // what a hook could not answer
+	Segments map[string]uint32                     // the base the processor holds for each segment
+	Missing  func(r *MachineRun, va uint32) error  // lifts a block the run reaches that no lift covered
+	Trail    []uint32                              // the last blocks the run entered
 }
 
 type runFlags struct {
@@ -31,7 +36,7 @@ type runFlags struct {
 
 // NewMachineRun prepares a run over a model's blocks with the stack pointer and the registers given
 func NewMachineRun(mm *MachineModel, img *Image, regs map[string]uint32) *MachineRun {
-	r := &MachineRun{mm: mm, img: img, Regs: map[string]uint32{}, mem: map[uint32]byte{}, Stop: map[uint32]bool{}, Hooks: map[uint32]func(r *MachineRun) uint32{}}
+	r := &MachineRun{mm: mm, img: img, Regs: map[string]uint32{}, mem: map[uint32]byte{}, Stop: map[uint32]bool{}, Hooks: map[uint32]func(r *MachineRun) uint32{}, Segments: map[string]uint32{}}
 	for _, name := range registerNames {
 		r.Regs[name] = 0
 	}
@@ -81,15 +86,25 @@ func (r *MachineRun) Run(entry uint32, maxBlocks int) (uint32, error) {
 			return 0, fmt.Errorf("machine run: %d blocks without reaching a stop", maxBlocks)
 		}
 		b := r.mm.blocks[key]
+		if b == nil && r.Missing != nil && key == blockKey(blockKeyVA(key), nil) {
+			if err := r.Missing(r, blockKeyVA(key)); err != nil {
+				return 0, fmt.Errorf("machine run: block %s: %w", key, err)
+			}
+			b = r.mm.blocks[key]
+		}
 		if b == nil {
 			if why, failed := r.mm.Errors[key]; failed {
 				return 0, fmt.Errorf("machine run: block %s was not lifted: %s", key, why)
 			}
 			return 0, fmt.Errorf("machine run: no block %s", key)
 		}
+		r.Trail = append(r.Trail, b.va)
+		if len(r.Trail) > 32 {
+			r.Trail = r.Trail[1:]
+		}
 		next, err := r.block(b)
 		if err != nil {
-			return 0, fmt.Errorf("machine run: block %s: %w", key, err)
+			return 0, fmt.Errorf("machine run: block %s: %w (after %X)", key, err, r.Trail)
 		}
 		if r.Stop[next] {
 			return next, nil
@@ -337,6 +352,37 @@ func (r *MachineRun) cpu(fn string, args []uint32) (uint32, error) {
 		return uint32(r.tsc), nil
 	case cpuRDTSCHi:
 		return uint32(r.tsc >> 32), nil
+	case cpuSCAS:
+		// Scans memory for the accumulator, answering how many elements it compared before stopping
+		ptr, value, count, size, step, repne := args[0], args[1], args[2], int(args[3]), args[4], args[5] != 0
+		mask := uint32(1)<<(8*uint(size)) - 1
+		if size == 4 {
+			mask = 0xFFFFFFFF
+		}
+		n := uint32(0)
+		for n < count {
+			equal := r.load(ptr, size) == value&mask
+			ptr += step
+			n++
+			if equal == repne {
+				break
+			}
+		}
+		return n, nil
+	case cpuCMPS:
+		// Compares two strings, answering how many elements it compared before stopping
+		a, b, count, size, step, repne := args[0], args[1], args[2], int(args[3]), args[4], args[5] != 0
+		n := uint32(0)
+		for n < count {
+			equal := r.load(a, size) == r.load(b, size)
+			a += step
+			b += step
+			n++
+			if equal == repne {
+				break
+			}
+		}
+		return n, nil
 	default:
 		return 0, fmt.Errorf("processor operation %s", fn)
 	}
@@ -503,6 +549,12 @@ func (r *MachineRun) sym(name string) (uint32, error) {
 		return uint32(n), nil
 	case name == "self":
 		return 0, fmt.Errorf("a template copy's own address outside a copy")
+	case strings.HasPrefix(name, "segbase."):
+		base, ok := r.Segments[name[8:]]
+		if !ok {
+			return 0, fmt.Errorf("segment %s has no base", name[8:])
+		}
+		return base, nil
 	case strings.HasPrefix(name, "cond."):
 		c, err := r.condition(name[5:])
 		if err != nil {
@@ -780,4 +832,41 @@ func (r *MachineRun) evalWideDivide(v Bin) (uint32, error) {
 		return uint32(int32(n % int64(int32(d)))), nil
 	}
 	return uint32(int32(q)), nil
+}
+
+// Preload lays bytes into the run's memory before it starts
+func (r *MachineRun) Preload(addr uint32, data []byte) {
+	for i, b := range data {
+		r.mem[addr+uint32(i)] = b
+	}
+}
+
+// Written is every byte the run wrote, by address
+func (r *MachineRun) Written() map[uint32]byte {
+	out := make(map[uint32]byte, len(r.mem))
+	for k, v := range r.mem {
+		out[k] = v
+	}
+	return out
+}
+
+// Adopt copies another run's memory over this run's
+func (r *MachineRun) Adopt(o *MachineRun) {
+	for k, v := range o.mem {
+		r.mem[k] = v
+	}
+}
+
+// WideString reads the terminated UTF-16 string at an address as the run holds it
+func (r *MachineRun) WideString(addr uint32) string {
+	var units []uint16
+	for {
+		u := uint16(r.ReadU8(addr)) | uint16(r.ReadU8(addr+1))<<8
+		if u == 0 || len(units) > 1<<16 {
+			break
+		}
+		units = append(units, u)
+		addr += 2
+	}
+	return string(utf16.Decode(units))
 }

@@ -48,9 +48,6 @@ type Font struct {
 	FileSize   int64
 }
 
-// Window bits of the LZX streams the later fonts keep their meshes in, as the dashboard sets its decompressor up
-const xtfWindowBits = 17
-
 // ReadXTF parses an XTF vector font file.
 //
 // XTF layout:
@@ -157,10 +154,17 @@ func ReadXTF(r io.Reader, size int64) (*Font, error) {
 
 	// Parse mesh data for each glyph
 	chunks := map[uint32][]byte{}
+	windowBits := 0
+	if chunked {
+		var err error
+		if windowBits, err = xtfWindowBits(data, glyphs); err != nil {
+			return nil, err
+		}
+	}
 	for i := range glyphs {
 		mesh, at := data, int(glyphs[i].meshOff)
 		if chunked {
-			chunk, err := xtfChunk(data, glyphs[i].meshOff, chunks)
+			chunk, err := xtfChunk(data, glyphs[i].meshOff, windowBits, chunks)
 			if err != nil {
 				return nil, fmt.Errorf("font: glyph %d: %w", i, err)
 			}
@@ -305,8 +309,34 @@ func unicodeBlockName(cp uint16) string {
 	}
 }
 
+// Finds the one LZX window every chunk of the font decodes through, trying each window the format allows
+func xtfWindowBits(data []byte, glyphs []Glyph) (int, error) {
+	offsets := map[uint32]bool{}
+	for i := range glyphs {
+		offsets[glyphs[i].meshOff] = true
+	}
+	var fits []int
+	for bits := lzxMinWindowBits; bits <= lzxMaxWindowBits; bits++ {
+		chunks := map[uint32][]byte{}
+		decodes := true
+		for off := range offsets {
+			if _, err := xtfChunk(data, off, bits, chunks); err != nil {
+				decodes = false
+				break
+			}
+		}
+		if decodes {
+			fits = append(fits, bits)
+		}
+	}
+	if len(fits) != 1 {
+		return 0, fmt.Errorf("font: %d LZX windows decode every chunk (%v)", len(fits), fits)
+	}
+	return fits[0], nil
+}
+
 // Decompresses the chunk at a file offset once, a sized header leading its LZX stream
-func xtfChunk(data []byte, off uint32, chunks map[uint32][]byte) ([]byte, error) {
+func xtfChunk(data []byte, off uint32, windowBits int, chunks map[uint32][]byte) ([]byte, error) {
 	if chunk, done := chunks[off]; done {
 		return chunk, nil
 	}
@@ -319,9 +349,12 @@ func xtfChunk(data []byte, off uint32, chunks map[uint32][]byte) ([]byte, error)
 	if start+compressed > len(data) {
 		return nil, fmt.Errorf("chunk at %#x of %d bytes runs past the file", off, compressed)
 	}
-	chunk, err := lzxDecompress(data[start:start+compressed], decompressed, xtfWindowBits)
+	chunk, err := lzxDecompress(data[start:start+compressed], decompressed, windowBits)
 	if err != nil {
 		return nil, fmt.Errorf("chunk at %#x: %w", off, err)
+	}
+	if len(chunk) != decompressed {
+		return nil, fmt.Errorf("chunk at %#x decodes to %d bytes, not %d", off, len(chunk), decompressed)
 	}
 	chunks[off] = chunk
 	return chunk, nil

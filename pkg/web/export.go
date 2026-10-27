@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -59,6 +60,7 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *
 	config := buildConfig(xapFiles)
 	meshManifest := make(map[string]meshEntry)
 	var missing []string
+	names := append(d.Image.Strings(), kernel.Image.Strings()...)
 
 	for _, xapPath := range xapFiles {
 		baseName := strings.TrimSuffix(filepath.Base(xapPath), ".xap")
@@ -68,6 +70,7 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *
 		if err != nil {
 			return fmt.Errorf("web: parsing %s: %w", baseName, err)
 		}
+		names = append(names, sceneStrings(ast)...)
 		sceneJSON := serializeScene(ast)
 		jsonData, err := json.MarshalIndent(sceneJSON, "", "  ")
 		if err != nil {
@@ -112,7 +115,13 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *
 	if err := os.WriteFile(filepath.Join(outputDir, "data", "meshes", "manifest.json"), manifestData, 0o644); err != nil {
 		return err
 	}
-	config.Files = consoleFiles(consoleDir)
+	files, err := consoleFiles(consoleDir, names)
+	if err != nil {
+		return err
+	}
+	for _, rel := range files {
+		config.Files = append(config.Files, strings.ToLower(strings.ReplaceAll(filepath.ToSlash(rel), "/", `\`)))
+	}
 	config.Font = fontVersion(consoleDir)
 	config.Missing = missing
 
@@ -124,7 +133,7 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *
 		fmt.Fprintf(os.Stderr, "  Copied %d audio files\n", audioCount)
 	}
 
-	fileCount, err := copyConsoleFiles(consoleDir, filepath.Join(outputDir, "data", "files"))
+	fileCount, err := copyConsoleFiles(consoleDir, filepath.Join(outputDir, "data", "files"), files)
 	if err != nil {
 		return err
 	}
@@ -219,55 +228,185 @@ func fontVersion(dir string) int {
 	return 0
 }
 
-// Copies the font files the dashboard opens through the console's file routines, under the paths it names them by
-func copyConsoleFiles(dir, dstDir string) (int, error) {
+// Copies the font files among the console files, under the paths the dashboard names them by
+func copyConsoleFiles(dir, dstDir string, files []string) (int, error) {
 	count := 0
+	for _, rel := range files {
+		if !strings.EqualFold(filepath.Ext(rel), ".xtf") {
+			continue
+		}
+		dst := filepath.Join(dstDir, strings.ToLower(filepath.ToSlash(rel)))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return 0, fmt.Errorf("web: copying console files: %w", err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, rel))
+		if err != nil {
+			return 0, fmt.Errorf("web: copying console files: %w", err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return 0, fmt.Errorf("web: copying console files: %w", err)
+		}
+		count++
+	}
+	return count, nil
+}
+
+// The files under the console directory the dashboard can open, each named by the executable, the kernel or a scene
+func consoleFiles(dir string, names []string) ([]string, error) {
+	named := map[string]bool{}
+	patterns := map[string]bool{}
+	dirs := map[string]map[string]bool{}
+	for _, name := range names {
+		n := consoleName(name)
+		switch {
+		case n == "":
+		case strings.ContainsAny(n, "*?"):
+			patterns[n] = true
+		default:
+			named[n] = true
+			ext := strings.ToLower(filepath.Ext(n))
+			if ext == "" {
+				continue
+			}
+			if dirs[ext] == nil {
+				dirs[ext] = map[string]bool{}
+			}
+			d, _ := consoleSplit(n)
+			dirs[ext][d] = true
+		}
+	}
 	root := filepath.Clean(dir)
+	var out []string
 	err := filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
-		if err != nil || e.IsDir() || !strings.EqualFold(filepath.Ext(path), ".xtf") {
+		if err != nil || e.IsDir() {
 			return err
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		dst := filepath.Join(dstDir, strings.ToLower(filepath.ToSlash(rel)))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
+		if consoleNamed(consoleName(rel), named, patterns, dirs) {
+			out = append(out, rel)
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
-			return err
-		}
-		count++
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("web: copying console files: %w", err)
+		return nil, fmt.Errorf("web: listing console files: %w", err)
 	}
-	return count, nil
+	sort.Slice(out, func(i, j int) bool { return consoleName(out[i]) < consoleName(out[j]) })
+	return out, nil
 }
 
-// The files the console keeps on the partition the dashboard runs from, named the way its own paths do
-func consoleFiles(dir string) []string {
+// Whether a name and the path end in each other, or a wildcard admits it among files of its kind
+func consoleNamed(f string, named, patterns map[string]bool, dirs map[string]map[string]bool) bool {
+	for n := range named {
+		if f == n || strings.HasSuffix(f, `\`+n) || strings.HasSuffix(n, `\`+f) {
+			return true
+		}
+	}
+	d, base := consoleSplit(f)
+	for p := range patterns {
+		pd, pbase := consoleSplit(p)
+		ext := strings.ToLower(filepath.Ext(pbase))
+		if ok, _ := path.Match(pbase, base); !ok || ext == "" {
+			continue
+		}
+		where := dirs[ext]
+		if pd != "" {
+			where = map[string]bool{pd: true}
+		}
+		for w := range where {
+			if d == w || w != "" && strings.HasSuffix(d, `\`+w) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Lower cases a path as the console compares it, dropping a format prefix, a drive or device and leading separators
+func consoleName(s string) string {
+	n := strings.ToLower(strings.ReplaceAll(s, "/", `\`))
+	for strings.Contains(n, `\\`) {
+		n = strings.ReplaceAll(n, `\\`, `\`)
+	}
+	n = strings.TrimPrefix(n, "%s")
+	if i := strings.LastIndex(n, ":"); i >= 0 {
+		n = n[i+1:]
+	}
+	return strings.TrimLeft(n, `\`)
+}
+
+// The directory and base of a console path, the directory empty at the root
+func consoleSplit(n string) (string, string) {
+	if i := strings.LastIndex(n, `\`); i >= 0 {
+		return n[:i], n[i+1:]
+	}
+	return "", n
+}
+
+// Every quoted string a scene holds, in its node fields and in its script text
+func sceneStrings(s *xap.Scene) []string {
 	var out []string
-	root := filepath.Clean(dir)
-	filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
-		if err != nil || e.IsDir() {
-			return nil
+	var node func(n *xap.Node)
+	var value func(v xap.Value)
+	value = func(v xap.Value) {
+		switch v.Kind {
+		case xap.VString:
+			out = append(out, v.Str)
+		case xap.VScript:
+			out = append(out, quotedStrings(v.Str)...)
+		case xap.VNode:
+			if v.Node != nil {
+				node(v.Node)
+			}
+		case xap.VArray:
+			for _, av := range v.Array {
+				value(av)
+			}
 		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return nil
+	}
+	node = func(n *xap.Node) {
+		for _, f := range n.Fields {
+			for _, v := range f.Values {
+				value(v)
+			}
 		}
-		out = append(out, strings.ToLower(strings.ReplaceAll(rel, string(filepath.Separator), "\\")))
-		return nil
-	})
-	sort.Strings(out)
+		for _, c := range n.Children {
+			node(c)
+		}
+		for _, sc := range n.Scripts {
+			out = append(out, quotedStrings(sc)...)
+		}
+	}
+	for _, item := range s.Items {
+		switch item.Kind {
+		case xap.SNode:
+			if item.Node != nil {
+				node(item.Node)
+			}
+		case xap.SScript:
+			out = append(out, quotedStrings(item.Script)...)
+		}
+	}
 	return out
+}
+
+// The strings between pairs of double quotes in a script
+func quotedStrings(text string) []string {
+	var out []string
+	for {
+		open := strings.IndexByte(text, '"')
+		if open < 0 {
+			return out
+		}
+		close := strings.IndexByte(text[open+1:], '"')
+		if close < 0 {
+			return out
+		}
+		out = append(out, text[open+1:open+1+close])
+		text = text[open+2+close:]
+	}
 }
 
 func buildConfig(xapFiles []string) exportConfig {

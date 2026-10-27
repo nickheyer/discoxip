@@ -35,7 +35,7 @@ func (s *execState) mmLane(i, lane int) Expr {
 }
 
 // Reads one float lane of a vector register or packed memory operand
-func (ex *Executor) floatLane(s *execState, in *Instruction, a x86asm.Arg, lane int) Expr {
+func (ex *Executor) floatLane(s *execState, a x86asm.Arg, lane int) Expr {
 	switch v := a.(type) {
 	case x86asm.Reg:
 		if i, ok := xmmIndex(v); ok {
@@ -48,7 +48,7 @@ func (ex *Executor) floatLane(s *execState, in *Instruction, a x86asm.Arg, lane 
 }
 
 // Reads one lane of a vector register or packed memory operand as integer bits
-func (ex *Executor) bitsLane(s *execState, in *Instruction, a x86asm.Arg, lane int) Expr {
+func (ex *Executor) bitsLane(s *execState, a x86asm.Arg, lane int) Expr {
 	switch v := a.(type) {
 	case x86asm.Reg:
 		if i, ok := xmmIndex(v); ok {
@@ -117,12 +117,12 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 	}
 	packed := func(name string, lanes int) {
 		for i := 0; i < lanes; i++ {
-			s.xmm[dx][i] = mkFBin(name, s.xmmLane(dx, i), ex.floatLane(s, in, args[1], i))
+			s.xmm[dx][i] = mkFBin(name, s.xmmLane(dx, i), ex.floatLane(s, args[1], i))
 		}
 	}
 	unary := func(f func(Expr) Expr, lanes int) {
 		for i := 0; i < lanes; i++ {
-			s.xmm[dx][i] = f(ex.floatLane(s, in, args[1], i))
+			s.xmm[dx][i] = f(ex.floatLane(s, args[1], i))
 		}
 	}
 	logic := func(name string) {
@@ -131,7 +131,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 				s.xmm[dx][i] = FConst{0}
 				continue
 			}
-			s.xmm[dx][i] = laneLogic(name, s.xmmLane(dx, i), ex.bitsLane(s, in, args[1], i))
+			s.xmm[dx][i] = laneLogic(name, s.xmmLane(dx, i), ex.bitsLane(s, args[1], i))
 		}
 	}
 	switch op {
@@ -145,7 +145,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 			return true, nil
 		}
 		for i := 0; i < 4; i++ {
-			s.xmm[dx][i] = ex.floatLane(s, in, args[1], i)
+			s.xmm[dx][i] = ex.floatLane(s, args[1], i)
 		}
 		return true, nil
 	case x86asm.MOVSS:
@@ -155,7 +155,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		case srcXMM >= 0:
 			s.xmm[dx][0] = s.xmmLane(srcXMM, 0)
 		default:
-			s.xmm[dx] = [4]Expr{ex.floatLane(s, in, args[1], 0), FConst{0}, FConst{0}, FConst{0}}
+			s.xmm[dx] = [4]Expr{ex.floatLane(s, args[1], 0), FConst{0}, FConst{0}, FConst{0}}
 		}
 		return true, nil
 	case x86asm.MOVSD_XMM, x86asm.MOVQ, x86asm.MOVLPS, x86asm.MOVNTQ:
@@ -169,14 +169,14 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		case dstXMM && srcXMM >= 0:
 			s.xmm[dx][0], s.xmm[dx][1] = s.xmmLane(srcXMM, 0), s.xmmLane(srcXMM, 1)
 		case dstXMM:
-			s.xmm[dx][0], s.xmm[dx][1] = ex.floatLane(s, in, args[1], 0), ex.floatLane(s, in, args[1], 1)
+			s.xmm[dx][0], s.xmm[dx][1] = ex.floatLane(s, args[1], 0), ex.floatLane(s, args[1], 1)
 			if op != x86asm.MOVLPS {
 				s.xmm[dx][2], s.xmm[dx][3] = FConst{0}, FConst{0}
 			}
 		case dstMMX && srcMMX >= 0:
 			s.mm[dm] = s.mm[srcMMX]
 		case dstMMX:
-			s.mm[dm][0], s.mm[dm][1] = ex.bitsLane(s, in, args[1], 0), ex.bitsLane(s, in, args[1], 1)
+			s.mm[dm][0], s.mm[dm][1] = ex.bitsLane(s, args[1], 0), ex.bitsLane(s, args[1], 1)
 		default:
 			return true, fmt.Errorf("unsupported vector move")
 		}
@@ -187,7 +187,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 			ex.storeLane(s, in, dstMem, 1, s.xmmLane(srcXMM, 3))
 			return true, nil
 		}
-		s.xmm[dx][2], s.xmm[dx][3] = ex.floatLane(s, in, args[1], 0), ex.floatLane(s, in, args[1], 1)
+		s.xmm[dx][2], s.xmm[dx][3] = ex.floatLane(s, args[1], 0), ex.floatLane(s, args[1], 1)
 		return true, nil
 	case x86asm.MOVLHPS:
 		s.xmm[dx][2], s.xmm[dx][3] = s.xmmLane(srcXMM, 0), s.xmmLane(srcXMM, 1)
@@ -198,9 +198,9 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 	case x86asm.MOVD:
 		switch {
 		case dstXMM:
-			s.xmm[dx] = [4]Expr{mkUn("bits2f", ex.bitsLane(s, in, args[1], 0)), FConst{0}, FConst{0}, FConst{0}}
+			s.xmm[dx] = [4]Expr{mkUn("bits2f", ex.bitsLane(s, args[1], 0)), FConst{0}, FConst{0}, FConst{0}}
 		case dstMMX:
-			s.mm[dm] = [2]Expr{ex.bitsLane(s, in, args[1], 0), IConst{0}}
+			s.mm[dm] = [2]Expr{ex.bitsLane(s, args[1], 0), IConst{0}}
 		case srcXMM >= 0:
 			ex.setOperand(s, in, args[0], 4, mkUn("f2bits", s.xmmLane(srcXMM, 0)))
 		case srcMMX >= 0:
@@ -259,31 +259,31 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		var src [4]Expr
 		for i := 0; i < 4; i++ {
 			d[i] = s.xmmLane(dx, i)
-			src[i] = ex.floatLane(s, in, args[1], i)
+			src[i] = ex.floatLane(s, args[1], i)
 		}
 		s.xmm[dx] = [4]Expr{d[sel&3], d[(sel>>2)&3], src[(sel>>4)&3], src[(sel>>6)&3]}
 	case x86asm.UNPCKLPS:
-		s0, s1 := ex.floatLane(s, in, args[1], 0), ex.floatLane(s, in, args[1], 1)
+		s0, s1 := ex.floatLane(s, args[1], 0), ex.floatLane(s, args[1], 1)
 		s.xmm[dx] = [4]Expr{s.xmmLane(dx, 0), s0, s.xmmLane(dx, 1), s1}
 	case x86asm.UNPCKHPS:
-		s2, s3 := ex.floatLane(s, in, args[1], 2), ex.floatLane(s, in, args[1], 3)
+		s2, s3 := ex.floatLane(s, args[1], 2), ex.floatLane(s, args[1], 3)
 		s.xmm[dx] = [4]Expr{s.xmmLane(dx, 2), s2, s.xmmLane(dx, 3), s3}
 	case x86asm.CVTSI2SS:
 		s.xmm[dx][0] = mkUn("i2f", ex.operand(s, in, args[1], 4))
 	case x86asm.CVTTSS2SI:
-		ex.setOperand(s, in, args[0], 4, mkUn("f2i", ex.floatLane(s, in, args[1], 0)))
+		ex.setOperand(s, in, args[0], 4, mkUn("f2i", ex.floatLane(s, args[1], 0)))
 	case x86asm.CVTSS2SI:
-		ex.setOperand(s, in, args[0], 4, mkUn("f2i_rn", ex.floatLane(s, in, args[1], 0)))
+		ex.setOperand(s, in, args[0], 4, mkUn("f2i_rn", ex.floatLane(s, args[1], 0)))
 	case x86asm.CVTPS2PI, x86asm.CVTTPS2PI:
 		conv := "f2i_rn"
 		if op == x86asm.CVTTPS2PI {
 			conv = "f2i"
 		}
-		s.mm[dm] = [2]Expr{mkUn(conv, ex.floatLane(s, in, args[1], 0)), mkUn(conv, ex.floatLane(s, in, args[1], 1))}
+		s.mm[dm] = [2]Expr{mkUn(conv, ex.floatLane(s, args[1], 0)), mkUn(conv, ex.floatLane(s, args[1], 1))}
 	case x86asm.CVTPI2PS:
-		s.xmm[dx][0], s.xmm[dx][1] = mkUn("i2f", ex.bitsLane(s, in, args[1], 0)), mkUn("i2f", ex.bitsLane(s, in, args[1], 1))
+		s.xmm[dx][0], s.xmm[dx][1] = mkUn("i2f", ex.bitsLane(s, args[1], 0)), mkUn("i2f", ex.bitsLane(s, args[1], 1))
 	case x86asm.COMISS, x86asm.UCOMISS:
-		s.fl = flagState{kind: "comiss", a: s.xmmLane(dx, 0), b: ex.floatLane(s, in, args[1], 0)}
+		s.fl = flagState{kind: "comiss", a: s.xmmLane(dx, 0), b: ex.floatLane(s, args[1], 0)}
 	case x86asm.MOVMSKPS:
 		var mask Expr = IConst{0}
 		for i := 0; i < 4; i++ {
@@ -294,7 +294,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 	case x86asm.PSHUFW:
 		// Each result word takes the source word the immediate's two bits for it select
 		sel, _ := args[2].(x86asm.Imm)
-		src := [2]Expr{ex.bitsLane(s, in, args[1], 0), ex.bitsLane(s, in, args[1], 1)}
+		src := [2]Expr{ex.bitsLane(s, args[1], 0), ex.bitsLane(s, args[1], 1)}
 		word := func(k int) Expr {
 			if k%2 == 0 {
 				return mkUn("zx16", src[k/2])
@@ -311,9 +311,9 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		}
 		switch {
 		case dstMMX:
-			s.mm[dm] = [2]Expr{s.mmLane(dm, half), ex.bitsLane(s, in, args[1], half)}
+			s.mm[dm] = [2]Expr{s.mmLane(dm, half), ex.bitsLane(s, args[1], half)}
 		case dstXMM:
-			s.xmm[dx] = [4]Expr{s.xmmLane(dx, 2*half), ex.floatLane(s, in, args[1], 2*half), s.xmmLane(dx, 2*half+1), ex.floatLane(s, in, args[1], 2*half+1)}
+			s.xmm[dx] = [4]Expr{s.xmmLane(dx, 2*half), ex.floatLane(s, args[1], 2*half), s.xmmLane(dx, 2*half+1), ex.floatLane(s, args[1], 2*half+1)}
 		default:
 			return false, nil
 		}
@@ -324,7 +324,7 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 			half = 1
 		}
 		d0 := s.mmLane(dm, half)
-		s0 := ex.bitsLane(s, in, args[1], half)
+		s0 := ex.bitsLane(s, args[1], half)
 		lo := mkBin("or", mkUn("zx16", d0), mkBin("shl", mkUn("zx16", s0), IConst{16}))
 		hi := mkBin("or", mkBin("shr", d0, IConst{16}), mkBin("and", s0, IConst{0xFFFF0000}))
 		s.mm[dm] = [2]Expr{lo, hi}

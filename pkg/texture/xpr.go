@@ -86,6 +86,9 @@ func ReadXPR(r io.Reader, size int64) (*Texture, error) {
 
 	info := decodeFormatRegister(formatReg)
 	info.HeaderSize = int(h.HeaderSize)
+	if h.TotalSize < h.HeaderSize {
+		return nil, ErrTruncatedFile
+	}
 	info.DataSize = int(h.TotalSize) - int(h.HeaderSize)
 
 	// Read pixel data

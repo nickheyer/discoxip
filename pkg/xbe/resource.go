@@ -111,9 +111,10 @@ func (d *Disassembly) readCreationBody(fn *Function, r *resourceCalls) bool {
 				continue
 			}
 			attrs, size := pushes[len(pushes)-2], pushes[len(pushes)-1]
-			if allocs == 0 {
+			switch allocs {
+			case 0:
 				r.headerAttrs, r.headerSize = attrs, size
-			} else if allocs == 1 {
+			case 1:
 				r.dataAttrs = attrs
 			}
 			allocs++

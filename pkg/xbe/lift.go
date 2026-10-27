@@ -397,9 +397,6 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 				b.succs = append(b.succs, link(va))
 			}
 		}
-		if err != nil {
-			return lf, err
-		}
 	}
 	return lf, nil
 }
@@ -745,7 +742,7 @@ func effectString(e Effect, str func(Expr) string) string {
 		if e.Addr != nil {
 			return fmt.Sprintf("mem%d[%s] = %s", e.Size, str(e.Addr), str(e.Value))
 		}
-		return fmt.Sprintf("%s.%d@0x%X = %s", e.Base, e.Size, e.Off, str(e.Value))
+		return fmt.Sprintf("%s.%d@0x%X = %s", e.Base, e.Size, uint32(e.Off), str(e.Value))
 	case "copy":
 		return fmt.Sprintf("copy %s x%d from %s to %s", str(e.Value), e.Size, str(e.Args[0]), str(e.Addr))
 	case "fill":

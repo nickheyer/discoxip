@@ -204,11 +204,25 @@ func LiftMachine(d *Disassembly, roots []uint32) (*MachineModel, error) {
 
 // LiftMachineInto lifts an image the way LiftMachine does, pooling its expressions with those of other images
 func LiftMachineInto(d *Disassembly, roots []uint32, pool *ExprPool) (*MachineModel, error) {
+	return liftMachineLeaders(d, d.machineLeaders(roots), pool)
+}
+
+// LiftMachineRooted lifts only the code the roots reach, for replaying one routine of an image
+func LiftMachineRooted(d *Disassembly, roots []uint32, pool *ExprPool) (*MachineModel, error) {
+	ls := newLeaderSet(d)
+	for _, va := range roots {
+		ls.add(va, true)
+	}
+	ls.walk()
+	return liftMachineLeaders(d, ls, pool)
+}
+
+// Lifts every leader of a set into a machine model
+func liftMachineLeaders(d *Disassembly, ls *leaderSet, pool *ExprPool) (*MachineModel, error) {
 	ex := NewExecutor(d)
 	ex.machine = true
 	resultPointers = false
 	defer func() { resultPointers = true }()
-	ls := d.machineLeaders(roots)
 	leaders, dynamic := ls.leaders, ls.dynamic
 	mm := &MachineModel{Base: d.Image.BaseAddr, Blocks: map[string]*LiftedBlock{}, Errors: map[string]string{}, Exprs: pool, Templates: []*CodeTemplate{}, blocks: map[string]*liftedBlock{}, routines: map[uint32]bool{}}
 	entries := map[string]blockEntry{}
@@ -398,6 +412,29 @@ func (mm *MachineModel) Merge(other *MachineModel) error {
 		mm.Errors[key] = err
 	}
 	mm.Templates = append(mm.Templates, other.Templates...)
+	return nil
+}
+
+// Absorb adds the blocks of another model of the same image that this model lacks
+func (mm *MachineModel) Absorb(other *MachineModel) error {
+	if other.Exprs != mm.Exprs {
+		return fmt.Errorf("xbe: machine models pooled apart cannot merge")
+	}
+	for key, b := range other.blocks {
+		if _, taken := mm.blocks[key]; taken {
+			continue
+		}
+		mm.blocks[key] = b
+		mm.Blocks[key] = other.Blocks[key]
+	}
+	for va := range other.routines {
+		mm.routines[va] = true
+	}
+	for key, err := range other.Errors {
+		if _, lifted := mm.blocks[key]; !lifted {
+			mm.Errors[key] = err
+		}
+	}
 	return nil
 }
 

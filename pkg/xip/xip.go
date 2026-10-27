@@ -106,7 +106,7 @@ func NewReader(ra io.ReaderAt, size int64) (*Reader, error) {
 
 	// Name string block
 	nameBlock := make([]byte, nameBlockSize)
-	if _, err := ra.ReadAt(nameBlock, metaEnd); err != nil {
+	if n, err := ra.ReadAt(nameBlock, metaEnd); err != nil && !(err == io.EOF && n == len(nameBlock)) {
 		return nil, fmt.Errorf("xip: reading name block: %w", err)
 	}
 

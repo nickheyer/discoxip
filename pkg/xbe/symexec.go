@@ -355,7 +355,7 @@ func (ex *Executor) scanPrologues() {
 			switch in.Inst.Op {
 			case x86asm.PUSH:
 				// A push of ecx under a fresh frame pointer reserves a local, the compiler's short form of the allocation
-				if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && framed)) {
+				if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && (framed || ex.d.prologueLocal(va, cur)))) {
 					ex.savePush[cur] = true
 					cur += uint32(in.Inst.Len)
 					continue
@@ -2546,7 +2546,7 @@ func (ex *Executor) transformCopyAt(s *execState, in *Instruction, cnt uint32, k
 	if !known {
 		return false, false
 	}
-	if state, ok := ex.transformCopy(s, s.getReg(x86asm.EDI), cnt*uint32(size)); ok {
+	if state, ok := ex.transformCopy(s.getReg(x86asm.EDI), cnt*uint32(size)); ok {
 		src := s.getReg(x86asm.ESI)
 		ex.seq++
 		s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: "D3DDevice_SetTransform", Args: []Expr{IConst{state}, src}, Seq: ex.seq})
@@ -2556,7 +2556,7 @@ func (ex *Executor) transformCopyAt(s *execState, in *Instruction, cnt uint32, k
 		s.setReg(x86asm.ECX, IConst{0})
 		return true, true
 	}
-	if state, ok := ex.transformCopy(s, s.getReg(x86asm.ESI), cnt*uint32(size)); ok {
+	if state, ok := ex.transformCopy(s.getReg(x86asm.ESI), cnt*uint32(size)); ok {
 		dst := s.getReg(x86asm.EDI)
 		ex.seq++
 		s.effects = append(s.effects, Effect{Kind: "call", VA: in.VA, Fn: "D3DDevice_GetTransform", Args: []Expr{IConst{state}, dst}, Seq: ex.seq})
@@ -4356,4 +4356,53 @@ func pathInputs(paths []Path) []string {
 	keys := sortedKeys(set)
 	sort.Strings(keys)
 	return keys
+}
+
+// Reports whether a prologue push of ecx is popped back by an epilogue, reserving a local
+func (d *Disassembly) prologueLocal(va, pushVA uint32) bool {
+	fn := d.Functions[va]
+	if fn == nil {
+		return false
+	}
+	var pushes []x86asm.Reg
+	member := false
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		if in.Inst.Op == x86asm.PUSH {
+			r, ok := in.Inst.Args[0].(x86asm.Reg)
+			if !ok {
+				break
+			}
+			pushes = append(pushes, r)
+			member = member || in.VA == pushVA
+			continue
+		}
+		if dst, src, ok := registerMove(in); ok && dst == x86asm.EBP && src == x86asm.ESP {
+			continue
+		}
+		break
+	}
+	if !member {
+		return false
+	}
+	for i := range fn.Instructions {
+		if fn.Instructions[i].Inst.Op != x86asm.RET {
+			continue
+		}
+		j := i - 1
+		for k := len(pushes) - 1; k >= 0; k-- {
+			if j < 0 || fn.Instructions[j].Inst.Op != x86asm.POP {
+				break
+			}
+			r, ok := fn.Instructions[j].Inst.Args[0].(x86asm.Reg)
+			if !ok || r != pushes[k] {
+				break
+			}
+			if k == 0 {
+				return true
+			}
+			j--
+		}
+	}
+	return false
 }

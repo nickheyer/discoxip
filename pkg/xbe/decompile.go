@@ -555,6 +555,9 @@ func (df *DecompiledFunc) fmtArgAddr(d *Disassembly, arg x86asm.Arg, insn *Instr
 
 // fmtMem formats a memory operand as a dereference expression.
 func (df *DecompiledFunc) fmtMem(d *Disassembly, m x86asm.Mem) string {
+	if name, ok := df.stackVar(m); ok {
+		return name
+	}
 	addr := df.fmtMemAddr(m)
 
 	// If it's a simple [imm32] global access, try to resolve
@@ -568,31 +571,39 @@ func (df *DecompiledFunc) fmtMem(d *Disassembly, m x86asm.Mem) string {
 	return fmt.Sprintf("*(%s)", addr)
 }
 
+// The stack variable a frame relative operand without an index names
+func (df *DecompiledFunc) stackVar(m x86asm.Mem) (string, bool) {
+	if m.Base != x86asm.EBP || m.Index != 0 {
+		return "", false
+	}
+	for _, sv := range df.StackFrame {
+		if sv.Offset == int(m.Disp) {
+			return sv.Name, true
+		}
+	}
+	return "", false
+}
+
 // fmtMemAddr formats the address expression of a memory operand.
 func (df *DecompiledFunc) fmtMemAddr(m x86asm.Mem) string {
+	if name, ok := df.stackVar(m); ok {
+		return name
+	}
 	var parts []string
 
 	if m.Base != 0 {
-		base := strings.ToLower(m.Base.String())
-		if m.Base == x86asm.EBP {
-			// Map EBP-relative accesses to stack variable names
-			off := int(m.Disp)
-			for _, sv := range df.StackFrame {
-				if sv.Offset == off {
-					return sv.Name
-				}
-			}
-		}
-		parts = append(parts, base)
+		parts = append(parts, strings.ToLower(m.Base.String()))
 	}
 
 	if m.Index != 0 {
 		idx := strings.ToLower(m.Index.String())
 		if m.Scale > 1 {
-			parts = append(parts, fmt.Sprintf("%s*%d", idx, m.Scale))
-		} else {
-			parts = append(parts, idx)
+			idx = fmt.Sprintf("%s*%d", idx, m.Scale)
 		}
+		if len(parts) > 0 {
+			idx = "+" + idx
+		}
+		parts = append(parts, idx)
 	}
 
 	if m.Disp != 0 {

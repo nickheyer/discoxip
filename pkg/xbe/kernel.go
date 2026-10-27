@@ -201,14 +201,7 @@ type KernelInput struct {
 }
 
 // Lifts the kernel and joins its routines, names, exports and memory to the model beside the dashboard's
-func (rm *RenderModel) attachKernel(kernel *KernelInput) error {
-	if kernel == nil {
-		return fmt.Errorf("xbe: the render model needs the kernel image the dashboard runs on")
-	}
-	d, err := DisassembleKernel(kernel.Image, kernel.Exports)
-	if err != nil {
-		return err
-	}
+func (rm *RenderModel) attachKernel(d *Disassembly, kernel *KernelInput) error {
 	km, err := DeriveKernel(d, kernel.Exports)
 	if err != nil {
 		return err

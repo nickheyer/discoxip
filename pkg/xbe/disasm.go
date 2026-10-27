@@ -508,12 +508,12 @@ func (d *Disassembly) symbolLookup(addr uint64) (string, uint64) {
 
 	// Check kernel imports
 	if name, ok := d.Imports[va]; ok {
-		return name, 0
+		return name, addr
 	}
 
 	// Check function entries
 	if fn, ok := d.Functions[va]; ok && fn.Name != "" {
-		return fn.Name, 0
+		return fn.Name, addr
 	}
 
 	return "", 0

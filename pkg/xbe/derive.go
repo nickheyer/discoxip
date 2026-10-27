@@ -288,8 +288,16 @@ func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 	if err := rm.deriveDraw(d, ms, types); err != nil {
 		return nil, err
 	}
+	if kernel == nil {
+		return nil, fmt.Errorf("xbe: the render model needs the kernel image the dashboard runs on")
+	}
+	stage("kernel disassembly")
+	kd, err := DisassembleKernel(kernel.Image, kernel.Exports)
+	if err != nil {
+		return nil, err
+	}
 	stage("system")
-	sm, err := DeriveSystem(d, types)
+	sm, err := DeriveSystem(d, kd, kernel, types, rm.Draw.Slot)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +323,7 @@ func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 		return nil, err
 	}
 	stage("kernel")
-	if err := rm.attachKernel(kernel); err != nil {
+	if err := rm.attachKernel(kd, kernel); err != nil {
 		return nil, err
 	}
 	stage("registrations")

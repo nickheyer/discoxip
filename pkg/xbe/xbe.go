@@ -7,6 +7,7 @@
 package xbe
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -27,9 +28,12 @@ const (
 	kthunkSega   uint32 = 0x2290059D
 )
 
+// Magic opens every executable image
+const Magic = "XBEH"
+
 // rawHeader is the on-disk XBE image header (first 0x178+ bytes).
 type rawHeader struct {
-	Magic              [4]byte // "XBEH"
+	Magic              [4]byte
 	Signature          [256]byte
 	BaseAddr           uint32
 	HeadersSize        uint32
@@ -122,6 +126,33 @@ func NewImage(base, entry uint32, header []byte, sections []Section) *Image {
 	return &Image{BaseAddr: base, EntryPoint: entry, HeadersSize: uint32(len(header)), Sections: sections, raw: header}
 }
 
+// HeaderBytes is the header the loader maps at the base address
+func (img *Image) HeaderBytes() []byte {
+	if int(img.HeadersSize) > len(img.raw) {
+		return img.raw
+	}
+	return img.raw[:img.HeadersSize]
+}
+
+// LoadedHeader is the mapped header once every section has been loaded, each section counted as referenced once
+func (img *Image) LoadedHeader() ([]byte, error) {
+	out := append([]byte(nil), img.HeaderBytes()...)
+	var h rawHeader
+	if err := binary.Read(bytes.NewReader(out), binary.LittleEndian, &h); err != nil {
+		return nil, fmt.Errorf("xbe: reading the header: %w", err)
+	}
+	refCount := uint32(binary.Size(rawSection{}.Flags) * 6)
+	size := uint32(binary.Size(rawSection{}))
+	for i := uint32(0); i < h.SectionCount; i++ {
+		at := h.SectionHeadersAddr - img.BaseAddr + i*size + refCount
+		if int(at)+4 > len(out) {
+			return nil, fmt.Errorf("xbe: section header %d lies outside the mapped header", i)
+		}
+		binary.LittleEndian.PutUint32(out[at:], 1)
+	}
+	return out, nil
+}
+
 // Returns the XDK build number of the named library or 0 when absent
 func (img *Image) LibBuild(name string) uint16 {
 	for _, l := range img.Libs {
@@ -150,8 +181,8 @@ func Open(path string) (*Image, error) {
 
 // Parse parses an XBE from raw bytes.
 func Parse(data []byte) (*Image, error) {
-	if len(data) < 4 || string(data[:4]) != "XBEH" {
-		return nil, fmt.Errorf("xbe: invalid magic (expected XBEH)")
+	if len(data) < len(Magic) || string(data[:len(Magic)]) != Magic {
+		return nil, fmt.Errorf("xbe: invalid magic (expected %s)", Magic)
 	}
 
 	var h rawHeader
@@ -218,11 +249,9 @@ func Parse(data []byte) (*Image, error) {
 		secData := make([]byte, sh.VirtualSize)
 		rawEnd := int(sh.RawAddr) + int(sh.RawSize)
 		if rawEnd > len(data) {
-			rawEnd = len(data)
+			return nil, fmt.Errorf("xbe: section %s raw data at %X+%X lies past the %d byte file", name, sh.RawAddr, sh.RawSize, len(data))
 		}
-		if int(sh.RawAddr) < rawEnd {
-			copy(secData, data[sh.RawAddr:rawEnd])
-		}
+		copy(secData, data[sh.RawAddr:rawEnd])
 
 		img.Sections = append(img.Sections, Section{
 			Name:        name,
