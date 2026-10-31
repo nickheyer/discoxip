@@ -13,39 +13,48 @@ var segNames = [6]string{"ES", "CS", "SS", "DS", "FS", "GS"}
 
 // The calls the processor's own instructions become, which the runtime's processor model answers
 const (
-	cpuCLI      = "cpu_cli"
-	cpuSTI      = "cpu_sti"
-	cpuPushFD   = "cpu_pushfd"
-	cpuPopFD    = "cpu_popfd"
-	cpuIRETD    = "cpu_iretd"
-	cpuINS      = "cpu_ins"
-	cpuOUTS     = "cpu_outs"
-	cpuSCAS     = "cpu_scas"
-	cpuCMPS     = "cpu_cmps"
-	cpuWRMSR    = "cpu_wrmsr"
-	cpuRDMSRLo  = "cpu_rdmsr_lo"
-	cpuRDMSRHi  = "cpu_rdmsr_hi"
-	cpuRDTSCLo  = "cpu_rdtsc_lo"
-	cpuRDTSCHi  = "cpu_rdtsc_hi"
-	cpuCPUID    = "cpu_cpuid_"
-	cpuFXSave   = "cpu_fxsave"
-	cpuFXRstor  = "cpu_fxrstor"
-	cpuFNSave   = "cpu_fnsave"
-	cpuFRstor   = "cpu_frstor"
-	cpuFRstorST = "cpu_frstor_st"
-	cpuLGDT     = "cpu_lgdt"
-	cpuLIDT     = "cpu_lidt"
-	cpuLTR      = "cpu_ltr"
-	cpuWriteCR  = "cpu_write_cr"
-	cpuReadCR   = "cpu_read_cr"
-	cpuInvlpg   = "cpu_invlpg"
-	cpuCLD      = "cpu_cld"
-	cpuSTD      = "cpu_std"
-	cpuCLTS     = "cpu_clts"
-	cpuFNSTCW   = "cpu_fnstcw"
-	cpuFLDCW    = "cpu_fldcw"
-	cpuFNINIT   = "cpu_fninit"
-	cpuFNCLEX   = "cpu_fnclex"
+	cpuCLI       = "cpu_cli"
+	cpuSTI       = "cpu_sti"
+	cpuPushFD    = "cpu_pushfd"
+	cpuPopFD     = "cpu_popfd"
+	cpuIRETD     = "cpu_iretd"
+	cpuINS       = "cpu_ins"
+	cpuOUTS      = "cpu_outs"
+	cpuSCAS      = "cpu_scas"
+	cpuCMPS      = "cpu_cmps"
+	cpuWRMSR     = "cpu_wrmsr"
+	cpuRDMSRLo   = "cpu_rdmsr_lo"
+	cpuRDMSRHi   = "cpu_rdmsr_hi"
+	cpuRDTSCLo   = "cpu_rdtsc_lo"
+	cpuRDTSCHi   = "cpu_rdtsc_hi"
+	cpuCPUID     = "cpu_cpuid_"
+	cpuFXSave    = "cpu_fxsave"
+	cpuFXRstor   = "cpu_fxrstor"
+	cpuFNSave    = "cpu_fnsave"
+	cpuFRstor    = "cpu_frstor"
+	cpuFRstorST  = "cpu_frstor_st"
+	cpuFXRstorST = "cpu_fxrstor_st"
+	cpuLGDT      = "cpu_lgdt"
+	cpuLIDT      = "cpu_lidt"
+	cpuSGDT      = "cpu_sgdt"
+	cpuSIDT      = "cpu_sidt"
+	cpuLTR       = "cpu_ltr"
+	cpuWriteCR   = "cpu_write_cr"
+	cpuReadCR    = "cpu_read_cr"
+	cpuInvlpg    = "cpu_invlpg"
+	cpuCLD       = "cpu_cld"
+	cpuSTD       = "cpu_std"
+	cpuCLTS      = "cpu_clts"
+	cpuFNSTCW    = "cpu_fnstcw"
+	cpuFLDCW     = "cpu_fldcw"
+	cpuFNINIT    = "cpu_fninit"
+	cpuFNCLEX    = "cpu_fnclex"
+)
+
+// Where the registers lie in an x87 save area and the bytes each takes
+const (
+	fsaveRegisters    = 28
+	fsaveRegisterSize = 10
 )
 
 // Reports whether a string instruction carries the repne prefix rather than rep or repe
@@ -124,17 +133,21 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 			s.va = 0
 			return true, true, nil
 		}
-	case x86asm.CLD:
-		s.df, s.machineDF = false, false
+	case x86asm.CLD, x86asm.STD:
+		s.df, s.machineDF = op == x86asm.STD, false
 		if ex.machine {
-			ex.cpuEffect(s, in, cpuCLD)
-		}
-	case x86asm.STD:
-		s.df, s.machineDF = true, false
-		if ex.machine {
-			ex.cpuEffect(s, in, cpuSTD)
+			// A direction change ends a machine block, so every step a block reads live is the direction it was entered with
+			if op == x86asm.STD {
+				ex.cpuEffect(s, in, cpuSTD)
+			} else {
+				ex.cpuEffect(s, in, cpuCLD)
+			}
+			ex.block.term = &blockTerm{kind: "jump", target: next}
+			s.va = 0
+			return true, true, nil
 		}
 	case x86asm.CLTS:
+		ex.noteTaskSwitchCleared(s)
 		ex.cpuEffect(s, in, cpuCLTS)
 	case x86asm.STC:
 		s.fl.cf = IConst{1}
@@ -373,11 +386,23 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 			name = cpuLIDT
 		}
 		ex.cpuEffect(s, in, name, ex.addr(s, args[0].(x86asm.Mem)))
+	case x86asm.SGDT, x86asm.SIDT:
+		// The runtime stores the descriptor table register, so the memory it lands in is read back from the run
+		name := cpuSGDT
+		if op == x86asm.SIDT {
+			name = cpuSIDT
+		}
+		at := ex.addr(s, args[0].(x86asm.Mem))
+		ex.forgetAliased(s, at, 6)
+		ex.cpuEffect(s, in, name, at)
 	case x86asm.LTR:
 		ex.cpuEffect(s, in, cpuLTR, ex.operand(s, in, args[0], 2))
 	case x86asm.MOV:
 		// A control register moves as a processor call, the register's number naming it
 		if cr, ok := args[0].(x86asm.Reg); ok && cr >= x86asm.CR0 && cr <= x86asm.CR15 {
+			if cr == x86asm.CR0 {
+				ex.noteTaskSwitchCleared(s)
+			}
 			ex.cpuEffect(s, in, cpuWriteCR, IConst{uint32(cr - x86asm.CR0)}, ex.operand(s, in, args[1], 4))
 			return false, true, nil
 		}
@@ -387,6 +412,7 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		}
 		return false, false, nil
 	case x86asm.FXSAVE, x86asm.FNSAVE:
+		ex.noteNotAvailable(s, npxUnit)
 		name := cpuFXSave
 		if op == x86asm.FNSAVE {
 			name = cpuFNSave
@@ -396,16 +422,21 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 			s.fpu = nil
 		}
 	case x86asm.FXRSTOR, x86asm.FRSTOR:
+		ex.noteNotAvailable(s, npxUnit)
 		name := cpuFXRstor
 		if op == x86asm.FRSTOR {
 			name = cpuFRstor
 		}
 		at := ex.addr(s, args[0].(x86asm.Mem))
 		ex.cpuEffect(s, in, name, at)
-		// The stack comes back as the runtime restored it, one value a slot
+		// The stack comes back as the runtime restored it, one value a slot, read by the layout of the area
+		restored := cpuFRstorST
+		if op == x86asm.FXRSTOR {
+			restored = cpuFXRstorST
+		}
 		s.fpu = nil
 		for i := 0; i < 8; i++ {
-			s.fpu = append(s.fpu, ex.cpuResult(s, in, cpuFRstorST, at, IConst{uint32(i)}))
+			s.fpu = append(s.fpu, ex.cpuResult(s, in, restored, at, IConst{uint32(i)}))
 		}
 	case x86asm.LJMP:
 		// The far jump reloading the code segment after a new descriptor table lands at its offset

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -119,6 +120,14 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		delete(byName, key)
 		xipPath := paths[0]
 		archiveName := strings.TrimSuffix(filepath.Base(xipPath), filepath.Ext(xipPath))
+		executable, err := opensWith(xipPath, xbe.Magic)
+		if err != nil {
+			return err
+		}
+		if executable {
+			fmt.Fprintf(os.Stderr, "  %s is an executable the dashboard names with the archive extension\n", relPath(srcDir, xipPath))
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "  %s\n", relPath(srcDir, xipPath))
 		r, err := xip.Open(xipPath)
 		if err != nil {
@@ -148,11 +157,15 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "\nStep 4: Building web application...\n")
-	kernel, err := loadKernel()
+	kernel, _, err := loadKernel()
 	if err != nil {
 		return err
 	}
-	if err := web.Export(extractDir, srcDir, webDir, d, kernel); err != nil {
+	bank, mcpx, err := loadBoot()
+	if err != nil {
+		return err
+	}
+	if err := web.Export(extractDir, srcDir, webDir, d, kernel, bank, mcpx); err != nil {
 		return fmt.Errorf("web export: %w", err)
 	}
 
@@ -200,6 +213,20 @@ func copyFonts(srcDir, extractDir string, d *xbe.Disassembly) error {
 		fmt.Fprintf(os.Stderr, "  Copied %s\n", relPath(srcDir, chosen))
 	}
 	return nil
+}
+
+// Reports whether a file begins with a magic
+func opensWith(path, magic string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	head := make([]byte, len(magic))
+	if _, err := io.ReadFull(f, head); err != nil {
+		return false, nil
+	}
+	return string(head) == magic, nil
 }
 
 func copyFile(src, dst string) error {

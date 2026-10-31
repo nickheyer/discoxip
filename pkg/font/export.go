@@ -5,12 +5,15 @@ import (
 	"io"
 )
 
+// DefaultMaxCodepoint is the last codepoint exported when none is asked for, the end of Latin Extended-B
+const DefaultMaxCodepoint = 0x024F
+
 // ExportJSON writes the font's glyph data as JSON for web rendering.
 // Only glyphs with codepoints <= maxCodepoint are included to keep the
 // output size manageable (ASCII + Latin-1 is sufficient for dashboard text).
 func ExportJSON(w io.Writer, f *Font, maxCodepoint rune) error {
 	if maxCodepoint <= 0 {
-		maxCodepoint = 0x024F // Latin Extended-B covers most Western text
+		maxCodepoint = DefaultMaxCodepoint
 	}
 
 	type jsonGlyph struct {

@@ -20,6 +20,22 @@ type MachineModel struct {
 	Templates []*CodeTemplate         `json:"templates"`
 	blocks    map[string]*liftedBlock
 	routines  map[uint32]bool
+	flagged   map[uint32]*liftedBlock
+}
+
+// The first flag carrying lift of the block at an address, for a block lifted under no plain key
+func (mm *MachineModel) flaggedAt(va uint32) *liftedBlock {
+	if mm.flagged == nil {
+		mm.flagged = map[uint32]*liftedBlock{}
+		for _, key := range slices.Sorted(maps.Keys(mm.blocks)) {
+			if b := mm.blocks[key]; strings.Contains(key, "@") {
+				if _, have := mm.flagged[b.va]; !have {
+					mm.flagged[b.va] = b
+				}
+			}
+		}
+	}
+	return mm.flagged[va]
 }
 
 // leaderSet is every address a block may start at, the ones entered through a return, a pointer or an export marked
@@ -128,7 +144,7 @@ func (d *Disassembly) machineLeaders(roots []uint32) *leaderSet {
 // Reports whether an address lies in a section the processor executes and starts an instruction there
 func (d *Disassembly) executableAt(va uint32) bool {
 	sec := d.sectionOf(va)
-	return sec != nil && sec.Flags&0x4 != 0 && d.insnAt(va) != nil
+	return sec != nil && sec.Executable() && d.insnAt(va) != nil
 }
 
 // Every aligned word of the image that holds the address of a routine in an executable section, a word beside
@@ -162,7 +178,7 @@ func (d *Disassembly) insnAt(va uint32) *Instruction {
 		return in
 	}
 	sec := d.sectionOf(va)
-	if sec == nil || sec.Flags&0x4 == 0 {
+	if sec == nil || !sec.Executable() {
 		return nil
 	}
 	inst, err := x86asm.Decode(sec.Data[va-sec.VirtualAddr:], 32)
@@ -338,6 +354,7 @@ func (ex *Executor) liftMachineBlock(leaders map[uint32]bool, va uint32, in bloc
 	for i := 0; i < 8; i++ {
 		s.fpu = append(s.fpu, Sym{fmt.Sprintf("fpu.st%d", i)})
 	}
+	s.cw = Sym{"fpu.cw"}
 	if in.pred != nil {
 		s.fl, s.fcmp, s.axFSW = entryFlags(in.pred)
 	} else if live {
@@ -360,7 +377,7 @@ func (ex *Executor) liftMachineBlock(leaders map[uint32]bool, va uint32, in bloc
 	if run.term == nil {
 		return nil, fmt.Errorf("block %08X ends without a jump, branch or return", va)
 	}
-	b := &liftedBlock{va: va, insns: s.steps, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, xmm: map[string]Expr{}, mm: map[string]Expr{}, segs: map[string]Expr{}}
+	b := &liftedBlock{va: va, insns: s.steps, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, cw: s.cw, xmm: map[string]Expr{}, mm: map[string]Expr{}, segs: map[string]Expr{}, npx: run.npx}
 	for i, v := range s.segs {
 		if v != nil {
 			b.segs[segNames[i]] = v
@@ -405,6 +422,7 @@ func (mm *MachineModel) Merge(other *MachineModel) error {
 	for key, b := range other.blocks {
 		mm.blocks[key] = b
 	}
+	mm.flagged = nil
 	for va := range other.routines {
 		mm.routines[va] = true
 	}
@@ -427,6 +445,7 @@ func (mm *MachineModel) Absorb(other *MachineModel) error {
 		mm.blocks[key] = b
 		mm.Blocks[key] = other.Blocks[key]
 	}
+	mm.flagged = nil
 	for va := range other.routines {
 		mm.routines[va] = true
 	}
@@ -572,12 +591,7 @@ func (mm *MachineModel) RoutineBlocks(entry uint32) (blocks []*liftedBlock, call
 		seen[va] = true
 		b := mm.blocks[blockKey(va, nil)]
 		if b == nil {
-			for key, cand := range mm.blocks {
-				if cand.va == va && strings.Contains(key, "@") {
-					b = cand
-					break
-				}
-			}
+			b = mm.flaggedAt(va)
 		}
 		if b == nil {
 			continue
@@ -688,10 +702,14 @@ func (ex *Executor) machineJump(s *execState, in *Instruction) (bool, error) {
 			return true, nil
 		}
 	}
-	if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Index != 0 && m.Scale == 4 && m.Base == 0 {
+	if m, ok := jumpTableOperand(in); ok {
 		if sec := ex.d.sectionOf(in.VA); sec != nil {
-			if targets := ex.d.jumpTableTargets(in, sec); len(targets) > 0 {
-				return ex.switchJump(s, s.getReg(m.Index), targets)
+			if first, targets := ex.d.jumpTableCases(in, sec); len(targets) > 0 {
+				index := s.getReg(m.Index)
+				if first != 0 {
+					index = mkBin("add", index, IConst{uint32(-first)})
+				}
+				return ex.switchJump(s, index, targets)
 			}
 		}
 	}
@@ -762,21 +780,30 @@ func (ex *Executor) machineTrap(s *execState, in *Instruction, next uint32) (boo
 	return true, nil
 }
 
-// Moves the x87 control word between memory and the machine, and resets the unit on its init instructions
-func (ex *Executor) machineControlWord(s *execState, in *Instruction) (bool, error) {
+// Moves the x87 control word between memory and the path, resets the unit on its init instruction, and in a
+// machine lift tells the runtime of the loads and resets as well
+func (ex *Executor) controlWordStep(s *execState, in *Instruction) (bool, error) {
 	switch in.Inst.Op {
 	case x86asm.FNSTCW:
-		ex.store(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2, ex.cpuResult(s, in, cpuFNSTCW), in.VA)
+		ex.store(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2, s.controlWord(), in.VA)
 	case x86asm.FLDCW:
-		ex.cpuEffect(s, in, cpuFLDCW, ex.load(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2))
+		s.cw = ex.load(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2)
+		if ex.machine {
+			ex.cpuEffect(s, in, cpuFLDCW, s.cw)
+		}
 	case x86asm.FNINIT:
-		ex.cpuEffect(s, in, cpuFNINIT)
-		s.fpu = nil
-		for i := 0; i < 8; i++ {
-			s.fpu = append(s.fpu, ex.cpuResult(s, in, cpuFRstorST, IConst{0}, IConst{uint32(i)}))
+		s.cw = IConst{fpuInitControlWord}
+		if ex.machine {
+			ex.cpuEffect(s, in, cpuFNINIT)
+			s.fpu = nil
+			for i := 0; i < 8; i++ {
+				s.fpu = append(s.fpu, ex.cpuResult(s, in, cpuFRstorST, IConst{0}, IConst{uint32(i)}))
+			}
 		}
 	case x86asm.FNCLEX:
-		ex.cpuEffect(s, in, cpuFNCLEX)
+		if ex.machine {
+			ex.cpuEffect(s, in, cpuFNCLEX)
+		}
 	}
 	return false, nil
 }
@@ -827,7 +854,7 @@ func (s *execState) machineStoredThrough(a Expr, size int) (Expr, bool) {
 				return nil, false
 			}
 		case "copy", "fill", "call":
-			if e.Kind == "call" && (strings.HasPrefix(e.Fn, "cpu_") && e.Fn != cpuINS && e.Fn != cpuFXRstor && e.Fn != cpuFRstor && e.Fn != cpuFXSave && e.Fn != cpuFNSave || e.Fn == portOut) {
+			if e.Kind == "call" && (strings.HasPrefix(e.Fn, "cpu_") && e.Fn != cpuINS && e.Fn != cpuFXRstor && e.Fn != cpuFRstor && e.Fn != cpuFXSave && e.Fn != cpuFNSave && e.Fn != cpuSGDT && e.Fn != cpuSIDT || e.Fn == portOut) {
 				continue
 			}
 			return nil, false

@@ -364,7 +364,7 @@ type VertexElement struct {
 	Comps    int    `json:"comps"`
 }
 
-// DecodeVertexDeclaration decodes a single stream D3DVSD declaration.
+// DecodeVertexDeclaration decodes a single stream D3DVSD declaration, a skip token leaving its words unread
 func (img *Image) DecodeVertexDeclaration(va uint32) (*VertexDeclaration, error) {
 	decl := &VertexDeclaration{VA: va}
 	off := 0
@@ -386,7 +386,8 @@ func (img *Image) DecodeVertexDeclaration(va uint32) (*VertexDeclaration, error)
 			}
 		case 2:
 			if tok&(1<<28) != 0 {
-				return nil, fmt.Errorf("vsd: declaration at %08X skips data", va)
+				off += 4 * int((tok>>16)&0xF)
+				continue
 			}
 			code := (tok >> 16) & 0xFF
 			dt, ok := vertexDataTypes[code]

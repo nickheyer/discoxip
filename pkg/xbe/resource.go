@@ -65,7 +65,8 @@ func (d *Disassembly) scanResourceCalls() {
 		return
 	}
 	r := &resourceCalls{}
-	if !d.readCreationBody(d.Functions[create], r) || !d.readLockBody(d.Functions[lock], r) {
+	created := d.readCreationBody(d.Functions[create], r)
+	if !d.readLockBody(d.Functions[lock], r) {
 		return
 	}
 	for _, va := range d.functionVAs() {
@@ -88,7 +89,9 @@ func (d *Disassembly) scanResourceCalls() {
 			d.nameByUsage(va, setTextureCall)
 		}
 	}
-	d.resources = r
+	if created {
+		d.resources = r
+	}
 }
 
 // Reads the allocation sizes, attributes and header words of the vertex buffer creation
@@ -160,8 +163,8 @@ func (d *Disassembly) readLockBody(fn *Function, r *resourceCalls) bool {
 // Reads the token a routine builds from a stage, with the device field it binds into and the one it marks
 func (d *Disassembly) stageTokens(fn *Function, device uint32) (textureTokens, bool) {
 	sub := NewExecutorShared(d.baseExecutor())
-	sub.PathLimit = 64
-	sub.StepLimit = 20000
+	sub.PathLimit = DerivePaths
+	sub.StepLimit = DeriveSteps
 	for _, t := range fn.CallTargets {
 		sub.Opaque[t] = true
 	}

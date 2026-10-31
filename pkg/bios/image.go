@@ -42,11 +42,14 @@ func (b *Bank) Image() (*xbe.Image, map[uint32]uint32, error) {
 	return img, byOrdinal, nil
 }
 
-// Lifted is the 2BL and the kernel as the processor runs them, pooled together, beside the kernel image they came from
+// Lifted is the 2BL and the kernel as the processor runs them, pooled together, beside the kernel image and the
+// disassemblies they came from
 type Lifted struct {
-	Model   *xbe.MachineModel
-	Kernel  *xbe.Image
-	Exports map[uint32]uint32
+	Model     *xbe.MachineModel
+	Kernel    *xbe.Image
+	Exports   map[uint32]uint32
+	KernelDis *xbe.Disassembly
+	BldrDis   *xbe.Disassembly
 }
 
 // Machine lifts the 2BL and the kernel as the processor runs them, pooled together for the loader
@@ -83,5 +86,5 @@ func (b *Bank) Machine() (*Lifted, error) {
 	if err := mm.Merge(kernel); err != nil {
 		return nil, err
 	}
-	return &Lifted{Model: mm, Kernel: img, Exports: exports}, nil
+	return &Lifted{Model: mm, Kernel: img, Exports: exports, KernelDis: d, BldrDis: bldr}, nil
 }

@@ -51,6 +51,10 @@ func kernelTextChunks() []chunk {
 		lbl("kPopf"), by(0x50), by(0x9D), ret(), pad(),
 		lbl("kScas"), by(0xF2, 0xAE), ret(), pad(),
 		lbl("kCmps"), by(0xF3, 0xA6), ret(), pad(),
+		lbl("kSpinCall"), call("kConst"), by(0x85, 0xC0), je8("kSpinCall"), ret(), pad(),
+		lbl("kConst"), movEAXImm(0), ret(), pad(),
+		lbl("kSpinStore"), abs32([]byte{0xA3}, "kvar", 0), jmp8("kSpinStore"), pad(),
+		lbl("kCount"), by(0xB9, 3, 0, 0, 0), lbl("kCountLoop"), by(0x49), jne8("kCountLoop"), ret(), pad(),
 		lbl("kBad"), by(0xC8, 0x00, 0x00, 0x00), ret(), pad(),
 	}
 }

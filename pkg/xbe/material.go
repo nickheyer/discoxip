@@ -385,7 +385,7 @@ func DeriveMaterials(d *Disassembly) (*MaterialSystem, error) {
 				break
 			}
 			ee, ok := err.(*ExecError)
-			if !ok || !ee.Limit || len(ee.Frames) == 0 || attempt >= 8 {
+			if !ok || !ee.Limit || len(ee.Frames) == 0 || attempt >= drawRetries {
 				return nil, fmt.Errorf("material %q apply %08X: %w", m.Name, m.ApplyVA, err)
 			}
 			// The innermost inlined callee cannot be expanded, so keep it as an opaque call.

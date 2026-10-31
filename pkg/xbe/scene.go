@@ -444,7 +444,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			sub.PathLimit = 256
 		}
 		if !w.required {
-			sub.StepLimit = 20000
+			sub.StepLimit = DeriveSteps
 		}
 		for h := range hooked {
 			sub.Opaque[h] = true
@@ -1203,7 +1203,7 @@ func listShape(d *Disassembly, va uint32) (uint32, int32) {
 		in := &fn.Instructions[i]
 		if in.Inst.Op == x86asm.MOV && argCount(in) == 2 {
 			if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-				if sec := d.sectionOf(uint32(imm)); sec != nil && sec.Flags&0x1 != 0 {
+				if d.isDataAddress(uint32(imm)) {
 					head = uint32(imm)
 				}
 			}
@@ -1250,12 +1250,12 @@ func absoluteGlobals(d *Disassembly, va uint32) map[uint32]bool {
 		for _, a := range in.Inst.Args {
 			switch v := a.(type) {
 			case x86asm.Mem:
-				if v.Base == 0 && v.Index == 0 && d.sectionOf(uint32(v.Disp)) != nil && d.sectionOf(uint32(v.Disp)).Flags&0x1 != 0 {
+				if v.Base == 0 && v.Index == 0 && d.isDataAddress(uint32(v.Disp)) {
 					out[uint32(v.Disp)] = true
 				}
 			case x86asm.Imm:
 				if in.Inst.Op == x86asm.MOV || in.Inst.Op == x86asm.PUSH {
-					if sec := d.sectionOf(uint32(v)); sec != nil && sec.Flags&0x1 != 0 {
+					if d.isDataAddress(uint32(v)) {
 						out[uint32(v)] = true
 					}
 				}
@@ -1378,7 +1378,7 @@ func (sc *SceneModel) derivePathJoin(d *Disassembly, ex *Executor) error {
 	inputs := 1 + len(regs) + stackCount
 	sub := NewExecutorShared(ex)
 	sub.PathLimit = 256
-	sub.StepLimit = 20000
+	sub.StepLimit = DeriveSteps
 	for _, c := range d.plainCallees(join) {
 		sub.Opaque[c] = true
 	}
@@ -1508,7 +1508,7 @@ func (sc *SceneModel) deriveMatrixStack(rm *RenderModel) error {
 // Reports whether a method run on a static object stores a value of the size into a global on any path
 func storesGlobal(ex *Executor, va, this, global uint32, size int) bool {
 	sub := NewExecutorShared(ex)
-	paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) { ex.seedThis(s, va, this, 0) }, 6)
+	paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) { ex.seedThis(s, va, this, 0) }, methodRetries)
 	var effects []Effect
 	for _, p := range paths {
 		effects = append(effects, p.Effects...)

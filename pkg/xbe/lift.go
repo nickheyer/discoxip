@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -28,12 +29,21 @@ type LiftedBlock struct {
 	SP      int32          `json:"sp"`
 	ESP     int            `json:"esp,omitempty"`
 	FPU     []int          `json:"fpu"`
+	CW      int            `json:"cw,omitempty"`
 	XMM     map[string]int `json:"xmm,omitempty"`
 	MM      map[string]int `json:"mm,omitempty"`
 	Flags   *LiftedFlags   `json:"flags,omitempty"`
 	FCmp    *LiftedFCmp    `json:"fcmp,omitempty"`
 	Term    LiftedTerm     `json:"term"`
+	NPX     int            `json:"npx,omitempty"`
 }
+
+// How a block traps at entry under the task switched bit before any instruction of it clears the bit
+const (
+	npxNone = 0
+	npxUnit = 1
+	npxWait = 2
+)
 
 // LiftedFlags are the operands of the last flag setting instruction, an index of -1 standing for none.
 type LiftedFlags struct {
@@ -77,6 +87,7 @@ type liftedBlock struct {
 	sp      int32
 	spExpr  Expr // the stack pointer where the block moved it out of the frame
 	fpu     []Expr
+	cw      Expr
 	xmm     map[string]Expr
 	mm      map[string]Expr
 	fl      flagState
@@ -85,6 +96,8 @@ type liftedBlock struct {
 	rest    int32
 	term    *blockTerm
 	succs   []string
+	npx     int
+	loads   map[int][]Expr // the loads to read at each epoch, found once the block is run or written
 }
 
 // blockTerm is the symbolic end of a block as the executor reached it.
@@ -103,11 +116,13 @@ type blockTerm struct {
 
 // blockRun is the block the executor is lifting, with the leaders that end it and the instructions it owns.
 type blockRun struct {
-	start   uint32
-	leaders map[uint32]bool
-	inside  map[uint32]bool
-	started bool
-	term    *blockTerm
+	start     uint32
+	leaders   map[uint32]bool
+	inside    map[uint32]bool
+	started   bool
+	term      *blockTerm
+	npx       int
+	tsCleared bool
 }
 
 // Steps one lifted block may take, a block being straight line code and the helpers it executes in place
@@ -119,8 +134,8 @@ const maxLiftedBlocks = 4096
 // Names of the general registers in the executor's order
 var registerNames = [8]string{"EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"}
 
-// Stack pointer a lifted routine starts with, its return slot there and its arguments above it
-const liftedEntrySP = 0x10000
+// LiftedEntrySP is the stack pointer a lifted routine starts with, its return slot there and its arguments above it
+const LiftedEntrySP = 0x10000
 
 // blockEntry is what the executor knows of the machine where a block starts.
 type blockEntry struct {
@@ -178,7 +193,7 @@ func blockLeaders(d *Disassembly, fn *Function) (map[uint32]bool, map[uint32]boo
 			leaders[t] = true
 		}
 		if op == x86asm.JMP && sec != nil {
-			if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Index != 0 && m.Scale == 4 && m.Base == 0 {
+			if _, ok := jumpTableOperand(in); ok {
 				for _, t := range d.jumpTableTargets(in, sec) {
 					leaders[t] = true
 				}
@@ -239,48 +254,85 @@ func producesStatusWord(in *Instruction) bool {
 	return false
 }
 
-// Reports whether a block decides on flags or a status word its predecessor left
-func (fn *Function) needsEntryFlags(index map[uint32]int, leaders map[uint32]bool, va uint32) bool {
-	i, ok := index[va]
-	if !ok {
-		return false
+// Blocks deciding on flags or a status word their predecessor left, directly or through blocks setting neither
+func (fn *Function) entryFlagNeeds(index map[uint32]int, leaders map[uint32]bool) map[uint32]bool {
+	type block struct {
+		flags, fsw         bool
+		passFlags, passFsw bool
+		succs              []uint32
 	}
-	flags, fsw := true, true
-	for ; i < len(fn.Instructions); i++ {
-		in := &fn.Instructions[i]
-		if in.VA != va && leaders[in.VA] {
-			break
+	blocks := map[uint32]*block{}
+	for va := range leaders {
+		i, ok := index[va]
+		if !ok {
+			continue
 		}
-		if flags && consumesFlags(in) {
-			return true
+		b := &block{passFlags: true, passFsw: true}
+		last := i
+		for ; i < len(fn.Instructions); i++ {
+			in := &fn.Instructions[i]
+			if in.VA != va && leaders[in.VA] {
+				break
+			}
+			last = i
+			if b.passFlags && consumesFlags(in) {
+				b.flags = true
+			}
+			if b.passFsw && consumesStatusWord(in) {
+				b.fsw = true
+			}
+			if producesFlags(in) {
+				b.passFlags = false
+			}
+			if producesStatusWord(in) {
+				b.passFsw = false
+			}
+			if isJump(in.Inst.Op) || in.Inst.Op == x86asm.RET {
+				break
+			}
 		}
-		if fsw && consumesStatusWord(in) {
-			return true
+		for _, j := range fn.successors(last, index) {
+			b.succs = append(b.succs, fn.Instructions[j].VA)
 		}
-		if producesFlags(in) {
-			flags = false
-		}
-		if producesStatusWord(in) {
-			fsw = false
-		}
-		if !flags && !fsw {
-			break
-		}
-		if isJump(in.Inst.Op) || in.Inst.Op == x86asm.RET {
-			break
+		blocks[va] = b
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, b := range blocks {
+			for _, va := range b.succs {
+				s := blocks[va]
+				if s == nil {
+					continue
+				}
+				if b.passFlags && s.flags && !b.flags {
+					b.flags, changed = true, true
+				}
+				if b.passFsw && s.fsw && !b.fsw {
+					b.fsw, changed = true, true
+				}
+			}
 		}
 	}
-	return false
+	needs := map[uint32]bool{}
+	for va, b := range blocks {
+		needs[va] = b.flags || b.fsw
+	}
+	return needs
 }
 
 // The flags a block starts with when its predecessor's last flag setter decides its first branch
 func entryFlags(pred *liftedBlock) (flagState, *fcmpRec, bool) {
 	fl := flagState{kind: pred.fl.kind}
-	if pred.fl.a != nil {
-		fl.a = Sym{"flags.a"}
-	}
-	if pred.fl.b != nil {
-		fl.b = Sym{"flags.b"}
+	if pred.fl.kind == "comiss" {
+		// A scalar float compare leaves the two numbers it compared, which the processor keeps beside the record
+		fl.a, fl.b = Sym{"flags.fsw_a"}, Sym{"flags.fsw_b"}
+	} else {
+		if pred.fl.a != nil {
+			fl.a = Sym{"flags.a"}
+		}
+		if pred.fl.b != nil {
+			fl.b = Sym{"flags.b"}
+		}
 	}
 	if pred.fl.r != nil {
 		fl.r = Sym{"flags.r"}
@@ -307,6 +359,7 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 	}
 	leaders, inside := blockLeaders(ex.d, fn)
 	index := fn.instructionIndex()
+	needs := fn.entryFlagNeeds(index, leaders)
 	lf := &LiftedFunction{Entry: blockKey(entry, nil), Regs: []string{}, Blocks: map[string]*LiftedBlock{}, blocks: map[string]*liftedBlock{}}
 	for _, r := range ex.d.registerInputs(entry) {
 		if i, ok := xmmIndex(r); ok {
@@ -315,7 +368,7 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 			lf.Regs = append(lf.Regs, r.String())
 		}
 	}
-	entries := map[string]blockEntry{lf.Entry: {esp: liftedEntrySP, rest: liftedEntrySP}}
+	entries := map[string]blockEntry{lf.Entry: {esp: LiftedEntrySP, rest: LiftedEntrySP}}
 	queue := []string{lf.Entry}
 	queued := map[string]bool{lf.Entry: true}
 	lifts := 0
@@ -355,7 +408,7 @@ func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 		link := func(va uint32) string {
 			next := exit
 			var succ string
-			if fn.needsEntryFlags(index, leaders, va) {
+			if needs[va] {
 				next.pred = b
 				succ = blockKey(va, b)
 			} else {
@@ -409,11 +462,10 @@ func blockKey(va uint32, pred *liftedBlock) string {
 	return fmt.Sprintf("%08X@%08X", va, pred.va)
 }
 
-// The address a block key starts at
+// The address a block key starts at, its first eight hexadecimal digits
 func blockKeyVA(key string) uint32 {
-	var va uint32
-	fmt.Sscanf(key, "%X", &va)
-	return va
+	va, _ := strconv.ParseUint(key[:min(8, len(key))], 16, 32)
+	return uint32(va)
 }
 
 // Runs one block from a symbolic entry state and reads the state it leaves
@@ -431,6 +483,7 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 	for i := 0; i < 8; i++ {
 		s.fpu = append(s.fpu, Sym{fmt.Sprintf("fpu.st%d", i)})
 	}
+	s.cw = Sym{"fpu.cw"}
 	if in.pred != nil {
 		s.fl, s.fcmp, s.axFSW = entryFlags(in.pred)
 	}
@@ -450,13 +503,13 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 	if run.term == nil {
 		return nil, fmt.Errorf("block %08X ends without a jump, branch or return", va)
 	}
-	b := &liftedBlock{va: va, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, rest: s.rest, xmm: map[string]Expr{}, mm: map[string]Expr{}, segs: map[string]Expr{}}
+	b := &liftedBlock{va: va, effects: s.effects, term: run.term, fl: s.fl, fcmp: s.fcmp, axFSW: s.axFSW, cw: s.cw, rest: s.rest, xmm: map[string]Expr{}, mm: map[string]Expr{}, segs: map[string]Expr{}}
 	for i, v := range s.segs {
 		if v != nil {
 			b.segs[segNames[i]] = v
 		}
 	}
-	if sp, ok := s.regs[4].(Ptr); ok && sp.Base == "stack" {
+	if sp, ok := s.regs[4].(Ptr); ok && sp.Base == "stack" && !s.spMoved {
 		b.sp = sp.Off
 	} else {
 		b.spExpr = s.regs[4]
@@ -535,7 +588,7 @@ func (lf *LiftedFunction) serialize(pool *ExprPool) {
 
 // Serializes one block with its expressions pooled through the interner given
 func serializeBlock(in *interner, b *liftedBlock) *LiftedBlock {
-	lb := &LiftedBlock{VA: b.va, Insns: b.insns, Effects: effectsJSON(in, b.effects), Regs: map[string]int{}, SP: b.sp, FPU: []int{}}
+	lb := &LiftedBlock{VA: b.va, Insns: b.insns, Effects: effectsJSON(in, b.effects), Regs: map[string]int{}, SP: b.sp, FPU: []int{}, NPX: b.npx}
 	if b.spExpr != nil {
 		lb.ESP = in.add(b.spExpr)
 	}
@@ -549,6 +602,9 @@ func serializeBlock(in *interner, b *liftedBlock) *LiftedBlock {
 	}
 	for _, v := range b.fpu {
 		lb.FPU = append(lb.FPU, in.add(v))
+	}
+	if b.cw != nil {
+		lb.CW = in.add(b.cw)
 	}
 	if len(b.xmm) > 0 {
 		lb.XMM = map[string]int{}
@@ -693,6 +749,27 @@ func (b *liftedBlock) shown() []Expr {
 		out = append(out, b.segs[name])
 	}
 	return append(out, b.term.cond, b.term.index, b.term.value)
+}
+
+// Every expression a block's run evaluates, the dump's beside the float stack, the control word, the vector
+// lanes, the flag record and the pending float compare
+func (b *liftedBlock) emitted() []Expr {
+	out := append(b.shown(), b.fpu...)
+	out = append(out, b.cw)
+	for _, name := range slices.Sorted(maps.Keys(b.xmm)) {
+		out = append(out, b.xmm[name])
+	}
+	for _, name := range slices.Sorted(maps.Keys(b.mm)) {
+		out = append(out, b.mm[name])
+	}
+	out = append(out, b.fl.a, b.fl.b, b.fl.r, b.fl.cf)
+	if b.fl.fsw != nil {
+		out = append(out, b.fl.fsw.a, b.fl.fsw.b)
+	}
+	if b.fcmp != nil {
+		out = append(out, b.fcmp.a, b.fcmp.b)
+	}
+	return out
 }
 
 // graphPrinter renders a block's expressions with every compound node the block shares named once

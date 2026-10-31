@@ -17,6 +17,7 @@ const (
 	bldrSize         = 0x6000
 	bldrBase         = 0x00090000
 	preldrBlockSize  = 0x2A00
+	preldrBase       = 0x100000000 - mcpxSize - preldrBlockSize
 	preldrParamsSize = 0x80
 	preldrNonceSize  = 0x10
 	keySize          = 16

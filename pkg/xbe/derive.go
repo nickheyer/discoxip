@@ -162,6 +162,11 @@ var stageTrace = os.Getenv("DISCOXIP_STAGE_TRACE") != ""
 
 var stageStart = time.Now()
 
+// Stage prints a stage name with the seconds elapsed when stage tracing is on, for the stages other packages run
+func Stage(name string) {
+	stage(name)
+}
+
 // Prints a derivation stage name with the seconds elapsed when stage tracing is on
 func stage(name string) {
 	if stageTrace {
@@ -174,6 +179,15 @@ func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 	build := int(d.Image.LibBuild("D3D8"))
 	rm := &RenderModel{XDK: build, TLS: d.Image.TLS, Programs: map[string]*VertexProgram{}, Declarations: map[string]*VertexDeclaration{}, Transforms: map[string]string{}, Exprs: NewExprPool(), Lifted: map[uint32]*LiftedFunction{}}
 	rm.StageNames = TextureStageStateNames(build)
+	if kernel == nil {
+		return nil, fmt.Errorf("xbe: the render model needs the kernel image the dashboard runs on")
+	}
+	stage("kernel disassembly")
+	kd, err := DisassembleKernel(kernel.Image, kernel.Exports)
+	if err != nil {
+		return nil, err
+	}
+	d.LearnImports(kd)
 	// The render state wrapper comes first so the state tables it writes are known before any path is summarized.
 	stage("render states")
 	if err := rm.deriveRenderStates(d); err != nil {
@@ -286,14 +300,6 @@ func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 	rm.Types = types
 	stage("draw")
 	if err := rm.deriveDraw(d, ms, types); err != nil {
-		return nil, err
-	}
-	if kernel == nil {
-		return nil, fmt.Errorf("xbe: the render model needs the kernel image the dashboard runs on")
-	}
-	stage("kernel disassembly")
-	kd, err := DisassembleKernel(kernel.Image, kernel.Exports)
-	if err != nil {
 		return nil, err
 	}
 	stage("system")
@@ -572,9 +578,9 @@ func (rm *RenderModel) deriveTransforms(d *Disassembly) error {
 	return nil
 }
 
-// Derives render state names from the wrapper's method table and the startup defaults
-func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
-	// Candidates call the render state setters of the XDK, the wrapper among them mapping a state index to a method through a table.
+// The executable's render state wrapper, the unnamed routine indexing a method table with the most calls to the
+// library's render state setters, with every candidate's method table and setter call count
+func (d *Disassembly) renderStateWrapper() (uint32, map[uint32]uint32, map[uint32]int, error) {
 	counts := map[uint32]int{}
 	tables := map[uint32]uint32{}
 	for _, va := range d.functionVAs() {
@@ -603,7 +609,52 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 		}
 	}
 	if wrapper == 0 {
-		return fmt.Errorf("xbe: no render state wrapper indexes a method table")
+		return 0, nil, nil, fmt.Errorf("xbe: no render state wrapper indexes a method table")
+	}
+	return wrapper, tables, counts, nil
+}
+
+// The named setters the wrapper calls for one state each, by the index it tests for equality before the call
+func (d *Disassembly) wrapperSetters(wrapper uint32) map[uint32]uint32 {
+	out := map[uint32]uint32{}
+	ins := d.Functions[wrapper].Instructions
+	lastCmp := int64(-1)
+	equality := false
+	for i := range ins {
+		in := &ins[i]
+		switch in.Inst.Op {
+		case x86asm.CMP:
+			if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
+				lastCmp = int64(imm)
+				equality = false
+			}
+		case x86asm.JNE, x86asm.JE:
+			equality = true
+		case x86asm.JGE, x86asm.JL, x86asm.JG, x86asm.JLE, x86asm.JA, x86asm.JB, x86asm.JAE, x86asm.JBE:
+			equality = false
+		case x86asm.CALL:
+			if lastCmp < 0 || !equality {
+				continue
+			}
+			callee := d.Functions[resolveTarget(in)]
+			if callee == nil || callee.Symbol == nil || !strings.Contains(callee.Symbol.Name, "SetRenderState") {
+				continue
+			}
+			switch callee.Symbol.Name {
+			case "D3DDevice_SetRenderState_Simple", "D3DDevice_SetRenderState_Deferred", "D3DDevice_SetRenderStateNotInline":
+				continue
+			}
+			out[resolveTarget(in)] = uint32(lastCmp)
+		}
+	}
+	return out
+}
+
+// Derives render state names from the wrapper's method table and the startup defaults
+func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
+	wrapper, tables, counts, err := d.renderStateWrapper()
+	if err != nil {
+		return err
 	}
 	rm.Wrapper = wrapper
 	table := tables[wrapper]
@@ -722,10 +773,11 @@ func (rm *RenderModel) deriveRenderStates(d *Disassembly) error {
 			names[idx] = cross[idx]
 		}
 	}
+	// A method several states push takes the name of the lowest, the table naming it first
 	rm.NVStateNames = maps.Clone(nv097StateNames)
-	for idx, m := range methods {
-		if name, ok := names[idx]; ok && rm.NVStateNames[m] == "" {
-			rm.NVStateNames[m] = name
+	for _, idx := range slices.Sorted(maps.Keys(methods)) {
+		if name, ok := names[idx]; ok && rm.NVStateNames[methods[idx]] == "" {
+			rm.NVStateNames[methods[idx]] = name
 		}
 	}
 	rm.StateNames = names
@@ -970,7 +1022,7 @@ func (rm *RenderModel) deriveConstantLoaders(d *Disassembly, ms *MaterialSystem)
 		sub := NewExecutorShared(probe)
 		sub.StepLimit = 30000
 		sub.PathLimit = 128
-		paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) {}, 6)
+		paths, partial, _, _ := sub.RunWithRetries(va, func(s *execState) {}, methodRetries)
 		var effects []Effect
 		for _, p := range paths {
 			effects = append(effects, p.Effects...)
@@ -1047,7 +1099,7 @@ func (rm *RenderModel) deriveClock(d *Disassembly) error {
 			continue
 		}
 		sub := NewExecutorShared(ex)
-		paths, partial, _, _ := sub.RunWithRetries(fnVA, func(s *execState) { ex.seedThis(s, fnVA, thisVA, 0) }, 6)
+		paths, partial, _, _ := sub.RunWithRetries(fnVA, func(s *execState) { ex.seedThis(s, fnVA, thisVA, 0) }, methodRetries)
 		var effects []Effect
 		for _, p := range paths {
 			effects = append(effects, p.Effects...)

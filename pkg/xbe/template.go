@@ -17,20 +17,20 @@ type CodeTemplate struct {
 }
 
 // The name of the export that copies and patches the interrupt dispatch stub
-const interruptInitializer = "KeInitializeInterrupt"
+const InterruptInitializer = "KeInitializeInterrupt"
 
 // DeriveInterruptTemplate reads the interrupt dispatch stub out of the routine that copies it into each interrupt
 // object, the words that routine patches afterwards being the template's slots
 func DeriveInterruptTemplate(d *Disassembly, exports map[uint32]uint32) (*CodeTemplate, error) {
 	var init uint32
 	for ordinal, va := range exports {
-		if KernelExportName(ordinal) == interruptInitializer {
+		if KernelExportName(ordinal) == InterruptInitializer {
 			init = va
 		}
 	}
 	fn := d.Functions[init]
 	if fn == nil {
-		return nil, fmt.Errorf("xbe: the kernel has no %s routine", interruptInitializer)
+		return nil, fmt.Errorf("xbe: the kernel has no %s routine", InterruptInitializer)
 	}
 	known := map[x86asm.Reg]uint32{}
 	var pushed []uint32
@@ -74,7 +74,7 @@ func DeriveInterruptTemplate(d *Disassembly, exports map[uint32]uint32) (*CodeTe
 		}
 	}
 	if base == 0 {
-		return nil, fmt.Errorf("xbe: %s copies no code", interruptInitializer)
+		return nil, fmt.Errorf("xbe: %s copies no code", InterruptInitializer)
 	}
 	slots := map[uint32]bool{}
 	for i := range fn.Instructions {
@@ -91,7 +91,7 @@ func DeriveInterruptTemplate(d *Disassembly, exports map[uint32]uint32) (*CodeTe
 		}
 	}
 	if len(slots) == 0 {
-		return nil, fmt.Errorf("xbe: %s patches nothing in the code it copies", interruptInitializer)
+		return nil, fmt.Errorf("xbe: %s patches nothing in the code it copies", InterruptInitializer)
 	}
 	t := &CodeTemplate{Base: base, Length: length}
 	for off := range slots {
@@ -103,6 +103,19 @@ func DeriveInterruptTemplate(d *Disassembly, exports map[uint32]uint32) (*CodeTe
 		t.Bytes = append(t.Bytes, b)
 	}
 	return t, nil
+}
+
+// The addresses a block's end names, none where it computes its target
+func (t *blockTerm) staticTargets() []uint32 {
+	switch t.kind {
+	case "jump", "hlt", "int":
+		return []uint32{t.target}
+	case "branch":
+		return []uint32{t.taken, t.fall}
+	case "switch":
+		return t.targets
+	}
+	return nil
 }
 
 // Reports whether an instruction's trailing word is a slot the copy patches, and which
@@ -147,12 +160,29 @@ func (mm *MachineModel) LiftTemplate(d *Disassembly, t *CodeTemplate) error {
 		}
 		off += uint32(in.Inst.Len)
 	}
-	in := mm.Exprs.interner()
-	for va := range leaders {
-		b, err := ex.liftMachineBlock(leaders, va, blockEntry{espMoved: true}, true)
-		if err != nil {
-			return fmt.Errorf("xbe: template block %08X: %w", va, err)
+	// The leaders grow until every block the template's code reaches is lifted with its patched words live
+	blocks := map[uint32]*liftedBlock{}
+	for {
+		grown := false
+		for va := range leaders {
+			b, err := ex.liftMachineBlock(leaders, va, blockEntry{espMoved: true}, true)
+			if err != nil {
+				return fmt.Errorf("xbe: template block %08X: %w", va, err)
+			}
+			blocks[va] = b
+			for _, target := range b.term.staticTargets() {
+				if target >= t.Base && target < t.Base+t.Length && !leaders[target] {
+					leaders[target] = true
+					grown = true
+				}
+			}
 		}
+		if !grown {
+			break
+		}
+	}
+	in := mm.Exprs.interner()
+	for va, b := range blocks {
 		switch b.term.kind {
 		case "jump", "hlt", "int":
 			b.succs = []string{blockKey(b.term.target, nil)}
@@ -173,6 +203,7 @@ func (mm *MachineModel) LiftTemplate(d *Disassembly, t *CodeTemplate) error {
 		mm.blocks[key] = b
 		mm.Blocks[key] = serializeBlock(in, b)
 	}
+	mm.flagged = nil
 	mm.Templates = append(mm.Templates, t)
 	return nil
 }

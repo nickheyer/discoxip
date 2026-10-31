@@ -64,20 +64,24 @@ func (img *Image) Strings() []string {
 	return out
 }
 
-// NamedFiles returns the bare file names with an extension the image names, in address order.
+// NamedFiles returns the file names with an extension the image names, a path naming its base, in address order.
 func (img *Image) NamedFiles(ext string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, ws := range img.wideStrings() {
-		if len(ws.Text) <= len(ext) || !strings.HasSuffix(strings.ToLower(ws.Text), strings.ToLower(ext)) || strings.ContainsAny(ws.Text, `\/:%`) {
+		name := ws.Text
+		if i := strings.LastIndexAny(name, `\/`); i >= 0 {
+			name = name[i+1:]
+		}
+		if len(name) <= len(ext) || !strings.HasSuffix(strings.ToLower(name), strings.ToLower(ext)) || strings.ContainsAny(name, `:%`) {
 			continue
 		}
-		key := strings.ToLower(ws.Text)
+		key := strings.ToLower(name)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		out = append(out, ws.Text)
+		out = append(out, name)
 	}
 	return out
 }

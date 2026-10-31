@@ -48,11 +48,15 @@ func runWebExport(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	kernel, err := loadKernel()
+	kernel, _, err := loadKernel()
 	if err != nil {
 		return err
 	}
-	return web.Export(inputDir, inputDir, outputDir, d, kernel)
+	bank, mcpx, err := loadBoot()
+	if err != nil {
+		return err
+	}
+	return web.Export(inputDir, inputDir, outputDir, d, kernel, bank, mcpx)
 }
 
 // Opens and disassembles an executable
@@ -70,7 +74,7 @@ func loadLayouts(path string) (map[uint32]scene.Layout, *xbe.RenderModel, error)
 	if err != nil {
 		return nil, nil, err
 	}
-	kernel, err := loadKernel()
+	kernel, _, err := loadKernel()
 	if err != nil {
 		return nil, nil, err
 	}

@@ -39,6 +39,8 @@ type Disassembly struct {
 	// All instructions indexed by VA for fast lookup
 	InsnByVA map[uint32]*Instruction
 
+	importBytes     map[string]int  // stack bytes each kernel export removes, from the kernel's own returns
+	importNoReturn  map[string]bool // kernel exports whose routines never come back
 	ctors           map[uint32]ctorInfo
 	clobbers        map[uint32][]x86asm.Reg
 	liveIns         map[uint32][]x86asm.Reg
@@ -46,7 +48,7 @@ type Disassembly struct {
 	savePushes      map[uint32]map[uint32]bool
 	conventions     map[uint32]callConvention
 	probe           *Executor
-	librarySections map[*Section]bool
+	librarySections map[uint32]bool
 	resourceRef     map[uint32]resourceRef
 	resources       *resourceCalls
 	layout          *deviceLayout
@@ -58,6 +60,10 @@ type Disassembly struct {
 	noReturn        map[uint32]bool         // routines known never to return to their caller
 	kernel          bool                    // the image is the kernel, whose named routines lie among its own rather than in libraries
 	endsAt          map[uint32]*Instruction // the instruction ending at each address, for the machine lift's entry check
+	scans           *executorScans          // what the executors read off the image, scanned for the first of them
+	entries         []uint32                // routine entries in address order, for finding the routine at an address
+	entrySpan       uint32                  // the longest routine's size, bounding how far below an address its routine starts
+	entriesOf       int                     // routines counted when the entries were sorted
 }
 
 // Disassemble performs full recursive disassembly of the XBE image.
@@ -154,19 +160,27 @@ func (d *Disassembly) linearSweep(text *Section) {
 	}
 }
 
-// Decodes again from every call target the sweep passed over misaligned, data in a code section having
-// desynchronized it, each target tried once since one that decodes to nothing stays missing
+// Decodes again from every call target and jump table entry the sweep passed over misaligned, data in a code
+// section having desynchronized it, each target tried once since one that decodes to nothing stays missing
 func (d *Disassembly) resynchronize() {
 	tried := map[uint32]bool{}
 	for {
 		var missing []uint32
 		for _, insn := range d.InsnByVA {
-			if insn.Inst.Op != x86asm.CALL {
-				continue
+			var targets []uint32
+			switch insn.Inst.Op {
+			case x86asm.CALL:
+				if t := resolveTarget(insn); t != 0 && d.sectionOf(t) != nil {
+					targets = []uint32{t}
+				}
+			case x86asm.JMP:
+				targets = d.jumpTableWords(insn)
 			}
-			if t := resolveTarget(insn); t != 0 && !tried[t] && d.InsnByVA[t] == nil && d.sectionOf(t) != nil {
-				missing = append(missing, t)
-				tried[t] = true
+			for _, t := range targets {
+				if !tried[t] && d.InsnByVA[t] == nil {
+					missing = append(missing, t)
+					tried[t] = true
+				}
 			}
 		}
 		if len(missing) == 0 {
@@ -199,8 +213,10 @@ func (d *Disassembly) decodeFrom(va uint32) {
 
 // discoverFunctions identifies function boundaries across all disassembled sections.
 func (d *Disassembly) discoverFunctions() {
-	// Collect all CALL targets as potential function entries.
+	// Collect all CALL targets as potential function entries, the entry point, call targets and prologues being
+	// evidence of code in themselves
 	entries := make(map[uint32]bool)
+	strong := map[uint32]bool{d.Image.EntryPoint: true}
 	entries[d.Image.EntryPoint] = true
 
 	for _, insn := range d.InsnByVA {
@@ -208,6 +224,7 @@ func (d *Disassembly) discoverFunctions() {
 			target := resolveTarget(insn)
 			if target != 0 && d.InsnByVA[target] != nil {
 				entries[target] = true
+				strong[target] = true
 			}
 		}
 	}
@@ -219,6 +236,7 @@ func (d *Disassembly) discoverFunctions() {
 				if next, ok := d.InsnByVA[va+uint32(insn.Inst.Len)]; ok {
 					if next.Inst.Op == x86asm.MOV {
 						entries[va] = true
+						strong[va] = true
 					}
 				}
 			}
@@ -236,6 +254,7 @@ func (d *Disassembly) discoverFunctions() {
 		if sec := d.sectionOf(insn.VA); sec != nil {
 			for _, t := range d.jumpTableTargets(insn, sec) {
 				delete(entries, t)
+				delete(strong, t)
 			}
 		}
 	}
@@ -253,6 +272,7 @@ func (d *Disassembly) discoverFunctions() {
 				continue
 			}
 			entries[t] = true
+			strong[t] = strong[va]
 			added = true
 		}
 	}
@@ -274,7 +294,25 @@ func (d *Disassembly) discoverFunctions() {
 
 	d.recoverGaps(entries)
 
-	// Build CalledBy cross-references.
+	// A routine nothing calls that only a data word, a gap or a thunk from one names must read as code throughout,
+	// else its bytes are data, dropped until no such routine remains
+	for dropped := true; dropped; {
+		d.linkCallers()
+		dropped = false
+		for va, fn := range d.Functions {
+			if !strong[va] && !d.boundaries[va] && len(fn.CalledBy) == 0 && !d.plausibleBody(fn) {
+				delete(d.Functions, va)
+				dropped = true
+			}
+		}
+	}
+}
+
+// Links every function to the functions calling it
+func (d *Disassembly) linkCallers() {
+	for _, fn := range d.Functions {
+		fn.CalledBy = nil
+	}
 	for _, callerVA := range d.functionVAs() {
 		for _, target := range d.Functions[callerVA].CallTargets {
 			if callee, ok := d.Functions[target]; ok {
@@ -293,7 +331,7 @@ func (d *Disassembly) functionVAs() []uint32 {
 func (d *Disassembly) recoverGaps(entries map[uint32]bool) {
 	for i := range d.Image.Sections {
 		sec := &d.Image.Sections[i]
-		if sec.Flags&0x4 == 0 {
+		if !sec.Executable() {
 			continue
 		}
 		covered := make(map[uint32]bool)
@@ -319,7 +357,7 @@ func (d *Disassembly) recoverGaps(entries map[uint32]bool) {
 				va++
 				continue
 			}
-			if !plausibleStart(fn) {
+			if !d.plausibleStart(fn) {
 				// Data decoded as code is skipped whole rather than retried from every byte.
 				for _, in := range fn.Instructions {
 					for b := uint32(0); b < uint32(in.Inst.Len); b++ {
@@ -420,22 +458,81 @@ func (d *Disassembly) buildFunctionWithin(entry uint32, entries map[uint32]bool,
 	return fn
 }
 
-// Reads consecutive code pointers from an indirect jump's table until one leaves the section
-func (d *Disassembly) jumpTableTargets(insn *Instruction, sec *Section) []uint32 {
-	mem, ok := insn.Inst.Args[0].(x86asm.Mem)
-	if !ok || mem.Scale != 4 || mem.Index == 0 || mem.Disp == 0 {
-		return nil
+// The table a jump through scaled code pointers indexes, at a fixed address with no base register
+func jumpTableOperand(in *Instruction) (x86asm.Mem, bool) {
+	m, ok := in.Inst.Args[0].(x86asm.Mem)
+	if !ok || m.Index == 0 || m.Scale != 4 || m.Base != 0 || m.Disp == 0 {
+		return x86asm.Mem{}, false
+	}
+	return m, true
+}
+
+// Reads the code pointers of an indirect jump's table outward from its base in both directions until one leaves
+// the section, with the index of the lowest entry, a negated count selecting the entries below the base
+func (d *Disassembly) jumpTableCases(insn *Instruction, sec *Section) (int, []uint32) {
+	mem, ok := jumpTableOperand(insn)
+	if !ok {
+		return 0, nil
+	}
+	entry := func(i int) (uint32, bool) {
+		t, ok := d.Image.ReadU32(uint32(mem.Disp) + uint32(i*4))
+		if !ok || t < sec.VirtualAddr || t >= sec.VirtualAddr+sec.VirtualSize || d.InsnByVA[t] == nil {
+			return 0, false
+		}
+		return t, true
 	}
 	var out []uint32
-	for i := 0; i < 512; i++ {
-		t, ok := d.Image.ReadU32(uint32(mem.Disp) + uint32(i)*4)
-		if !ok || t < sec.VirtualAddr || t >= sec.VirtualAddr+sec.VirtualSize || d.InsnByVA[t] == nil {
+	for i := 0; i < jumpTableEntries; i++ {
+		t, ok := entry(i)
+		if !ok {
 			break
 		}
 		out = append(out, t)
 	}
+	if len(out) == 0 {
+		return 0, nil
+	}
+	first := 0
+	for i := -1; i >= -jumpTableEntries; i-- {
+		t, ok := entry(i)
+		if !ok {
+			break
+		}
+		out = append([]uint32{t}, out...)
+		first = i
+	}
+	return first, out
+}
+
+// The words of an indirect jump's table outward from its base in both directions while they address the jump's
+// section, decoded or not
+func (d *Disassembly) jumpTableWords(insn *Instruction) []uint32 {
+	mem, ok := jumpTableOperand(insn)
+	sec := d.sectionOf(insn.VA)
+	if !ok || sec == nil {
+		return nil
+	}
+	var out []uint32
+	for _, dir := range [][2]int{{0, 1}, {-1, -1}} {
+		for i, n := dir[0], 0; n < jumpTableEntries; i, n = i+dir[1], n+1 {
+			t, ok := d.Image.ReadU32(uint32(mem.Disp) + uint32(i*4))
+			if !ok || t < sec.VirtualAddr || t >= sec.VirtualAddr+sec.VirtualSize {
+				break
+			}
+			out = append(out, t)
+		}
+	}
 	return out
 }
+
+// The code pointers of an indirect jump's table in index order
+func (d *Disassembly) jumpTableTargets(insn *Instruction, sec *Section) []uint32 {
+	_, targets := d.jumpTableCases(insn, sec)
+	return targets
+}
+
+// Entries a jump table may hold on either side of its base
+const jumpTableEntries = 512
 
 // Returns the section containing a virtual address or nil
 func (d *Disassembly) sectionOf(va uint32) *Section {
@@ -902,23 +999,73 @@ var kernelExports = [379]string{
 	"MmDbgWriteCheck",                     // 378
 }
 
-// Reports whether the first instructions of a recovered function look like compiler output rather than data
-func plausibleStart(fn *Function) bool {
-	for i := 0; i < len(fn.Instructions) && i < 8; i++ {
-		switch fn.Instructions[i].Inst.Op {
-		case x86asm.AAS, x86asm.AAA, x86asm.AAD, x86asm.AAM, x86asm.DAA, x86asm.DAS, x86asm.BOUND, x86asm.IRET, x86asm.IRETD, x86asm.ENTER,
-			x86asm.IN, x86asm.OUT, x86asm.INSB, x86asm.INSD, x86asm.OUTSB, x86asm.OUTSD, x86asm.LODSB, x86asm.HLT, x86asm.ARPL, x86asm.LES, x86asm.LDS, x86asm.INTO, x86asm.XLATB:
-			return false
-		case x86asm.MOV, x86asm.POP:
-			if r, ok := fn.Instructions[i].Inst.Args[0].(x86asm.Reg); ok && r >= x86asm.ES && r <= x86asm.GS {
+// What an instruction says of the bytes it was decoded from
+type instructionClass int
+
+// Compiled code, a port access, a privileged halt or interrupt return, a loop on ecx only hand written code holds, data
+const (
+	compiledCode instructionClass = iota
+	portAccess
+	privilegedCode
+	ecxLoop
+	dataBytes
+)
+
+// Classifies one instruction, zero bytes decoding as add [eax], al
+func classify(in *Instruction) instructionClass {
+	switch in.Inst.Op {
+	case x86asm.AAS, x86asm.AAA, x86asm.AAD, x86asm.AAM, x86asm.DAA, x86asm.DAS, x86asm.BOUND, x86asm.ENTER, x86asm.ARPL, x86asm.LES, x86asm.LDS, x86asm.INTO, x86asm.XLATB, x86asm.LODSB:
+		return dataBytes
+	case x86asm.IN, x86asm.OUT, x86asm.INSB, x86asm.INSD, x86asm.OUTSB, x86asm.OUTSD:
+		return portAccess
+	case x86asm.IRET, x86asm.IRETD, x86asm.HLT:
+		return privilegedCode
+	case x86asm.JECXZ, x86asm.LOOP, x86asm.LOOPE, x86asm.LOOPNE:
+		return ecxLoop
+	case x86asm.INC, x86asm.DEC:
+		if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && r == x86asm.ESP {
+			return dataBytes
+		}
+	case x86asm.MOV, x86asm.POP:
+		if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && r >= x86asm.ES && r <= x86asm.GS {
+			return dataBytes
+		}
+	case x86asm.ADD:
+		if m, ok := in.Inst.Args[0].(x86asm.Mem); ok && m.Base == x86asm.EAX && m.Disp == 0 && m.Index == 0 {
+			if r, ok := in.Inst.Args[1].(x86asm.Reg); ok && r == x86asm.AL {
+				return dataBytes
+			}
+		}
+	}
+	return compiledCode
+}
+
+// Reports whether a weakly named routine reads as code throughout, ports allowed, privileged code in the kernel alone
+func (d *Disassembly) plausibleBody(fn *Function) bool {
+	for i := range fn.Instructions {
+		switch classify(&fn.Instructions[i]) {
+		case compiledCode, portAccess:
+		case privilegedCode:
+			if !d.kernel {
 				return false
 			}
-		case x86asm.ADD:
-			// Zero bytes decode as add [eax], al, which no compiler emits.
-			if m, ok := fn.Instructions[i].Inst.Args[0].(x86asm.Mem); ok && m.Base == x86asm.EAX && m.Disp == 0 && m.Index == 0 {
-				if r, ok := fn.Instructions[i].Inst.Args[1].(x86asm.Reg); ok && r == x86asm.AL {
-					return false
-				}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// Reports whether a routine opens as compiled code, or as the kernel's hand written code
+func (d *Disassembly) plausibleStart(fn *Function) bool {
+	for i := 0; i < len(fn.Instructions) && i < plausibleOpening; i++ {
+		switch classify(&fn.Instructions[i]) {
+		case compiledCode:
+		case dataBytes:
+			return false
+		default:
+			if !d.kernel {
+				return false
 			}
 		}
 	}
@@ -926,13 +1073,13 @@ func plausibleStart(fn *Function) bool {
 }
 
 // Lists the sections holding signature identified library functions
-func (d *Disassembly) libraries() map[*Section]bool {
+func (d *Disassembly) libraries() map[uint32]bool {
 	if d.librarySections == nil {
-		d.librarySections = map[*Section]bool{}
+		d.librarySections = map[uint32]bool{}
 		for fva, fn := range d.Functions {
 			if fn.Symbol != nil {
 				if s := d.sectionOf(fva); s != nil {
-					d.librarySections[s] = true
+					d.librarySections[s.VirtualAddr] = true
 				}
 			}
 		}
@@ -949,16 +1096,16 @@ func (d *Disassembly) inLibrary(va uint32) bool {
 	if sec == nil || sec == d.sectionOf(d.Image.EntryPoint) {
 		return false
 	}
-	return d.libraries()[sec]
+	return d.libraries()[sec.VirtualAddr]
 }
 
 // Reports whether an address lies in a writable section holding neither the dashboard's code nor a library's
 func (d *Disassembly) inPureData(va uint32) bool {
 	sec := d.sectionOf(va)
-	if sec == nil || sec.Flags&0x1 == 0 || sec == d.sectionOf(d.Image.EntryPoint) {
+	if sec == nil || !sec.Writable() || sec == d.sectionOf(d.Image.EntryPoint) {
 		return false
 	}
-	return !d.libraries()[sec]
+	return !d.libraries()[sec.VirtualAddr]
 }
 
 // Names an unidentified library function after the XDK routine the dashboard's use of it reveals

@@ -133,7 +133,7 @@ func extractDir(root string) error {
 // alongside XIP files to the output directory. These directories contain assets
 // referenced by XAP scripts (WAV audio files, etc.) but not packed into XIP archives.
 func copyAuxDirs(srcDir, outDir string) {
-	auxDirs := []string{"Audio"}
+	auxDirs := []string{extract.AudioDir}
 	for _, name := range auxDirs {
 		src := filepath.Join(srcDir, name)
 		info, err := os.Stat(src)

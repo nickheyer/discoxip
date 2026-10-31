@@ -16,6 +16,12 @@ import (
 
 const bufSize = 256 * 1024
 
+// The audio directory copied beside the archives and the manifest naming each mesh's pool and index range
+const (
+	AudioDir     = "Audio"
+	MeshManifest = "_meshes.json"
+)
+
 // MeshManifestEntry holds the per-mesh pool and index range info written to _meshes.json.
 type MeshManifestEntry struct {
 	Pool       string `json:"pool"`
@@ -124,7 +130,7 @@ func renamePoolFile(archiveName, name string) string {
 
 // mergeManifest loads any existing _meshes.json, merges new entries, and writes it back.
 func mergeManifest(dir string, manifest map[string]MeshManifestEntry, verbose bool) error {
-	path := filepath.Join(dir, "_meshes.json")
+	path := filepath.Join(dir, MeshManifest)
 
 	// Load existing manifest if present
 	existing := make(map[string]MeshManifestEntry)

@@ -299,6 +299,24 @@ func ExprString(e Expr) string {
 	return formatExpr(e, ExprString)
 }
 
+// Nodes an abbreviated rendering spells out before eliding the rest
+const exprStringNodes = 400
+
+// ExprStringShort renders an expression as ExprString does, nodes past a budget elided, for messages about values
+// whose shared subexpressions would otherwise unfold without bound
+func ExprStringShort(e Expr) string {
+	left := exprStringNodes
+	var render func(Expr) string
+	render = func(e Expr) string {
+		if left <= 0 {
+			return "..."
+		}
+		left--
+		return formatExpr(e, render)
+	}
+	return render(e)
+}
+
 // Renders one node in the dump notation, child handing back the text of each node it is built from
 func formatExpr(e Expr, child func(Expr) string) string {
 	switch v := e.(type) {
@@ -488,6 +506,36 @@ func mkBin(op string, a, b Expr) Expr {
 // Float operations with two operands
 var floatBinOps = map[string]bool{"fadd": true, "fsub": true, "fmul": true, "fdiv": true, "fmin": true, "fmax": true, "fmod": true, "fpow": true, "fatan2": true, "frem": true}
 
+// The x87 control word a thread starts with, the one its init instruction loads, and where the word keeps the
+// rounding mode
+const (
+	fpuDefaultControlWord = 0x027F
+	fpuInitControlWord    = 0x037F
+	fpuRoundingShift      = 10
+	fpuRoundingMask       = 3
+	fpuRoundNearest       = 0
+	fpuRoundDown          = 1
+	fpuRoundUp            = 2
+	fpuRoundTruncate      = 3
+)
+
+// Builds the integer an x87 store rounds a value to under a control word, the mode folded where the word is known
+func mkF2I(x, cw Expr) Expr {
+	c, ok := isConst(cw)
+	if !ok {
+		return Bin{"f2icw", x, cw}
+	}
+	switch (c >> fpuRoundingShift) & fpuRoundingMask {
+	case fpuRoundDown:
+		return mkUn("f2i", mkUn("ffloor", x))
+	case fpuRoundUp:
+		return mkUn("f2i", mkUn("fceil", x))
+	case fpuRoundTruncate:
+		return mkUn("f2i", x)
+	}
+	return mkUn("f2i_rn", x)
+}
+
 // Builds a selection between two values, folding a decided predicate and a choice between equals
 func mkSel(c, a, b Expr) Expr {
 	if v, ok := isConst(c); ok {
@@ -534,12 +582,24 @@ func mkFBin(op string, a, b Expr) Expr {
 }
 
 func mkUn(op string, a Expr) Expr {
+	if pair, ok := a.(Bin); ok && op == "i2f" && pair.Op == "hilo" {
+		if hi, ok := isConst(pair.A); ok {
+			if lo, ok := isConst(pair.B); ok {
+				return FConst{float64(int64(uint64(hi)<<32 | uint64(lo)))}
+			}
+		}
+	}
 	if av, ok := isConst(a); ok {
 		switch op {
 		case "zx8":
 			return IConst{av & 0xFF}
 		case "zx16":
 			return IConst{av & 0xFFFF}
+		case "parity":
+			if bits.OnesCount8(uint8(av))%2 == 0 {
+				return IConst{1}
+			}
+			return IConst{0}
 		case "sx8":
 			return IConst{uint32(int32(int8(av)))}
 		case "sx16":

@@ -86,7 +86,7 @@ func runFontExport(cmd *cobra.Command, args []string) error {
 	}
 	defer out.Close()
 
-	if err := font.ExportJSON(out, f, 0x024F); err != nil {
+	if err := font.ExportJSON(out, f, font.DefaultMaxCodepoint); err != nil {
 		return err
 	}
 

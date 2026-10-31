@@ -291,8 +291,8 @@ func accessorShape(d *Disassembly, base *Executor, va uint32) (*accessorProbe, e
 		return nil, nil
 	}
 	ex := NewExecutorShared(base)
-	ex.StepLimit = 20000
-	ex.PathLimit = 64
+	ex.StepLimit = DeriveSteps
+	ex.PathLimit = DerivePaths
 	regs := d.liveInRegisters(fn)
 	paths, err := ex.Run(va, func(s *execState) {
 		for _, r := range regs {

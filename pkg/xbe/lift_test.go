@@ -12,6 +12,7 @@ func liftText() []chunk {
 		lbl("jumpFn"), movEAXImm(5), jmp8("jumpTarget"), pad(), lbl("jumpTarget"), abs32([]byte{0xA3}, "g1", 0), ret(), pad(),
 		lbl("branchFn"), by(0x83, 0x7C, 0x24, 0x04, 0x00), je8("branchZero"), movEAXImm(1), ret(), lbl("branchZero"), movEAXImm(2), ret(), pad(),
 		lbl("switchFn"), by(0x8B, 0x44, 0x24, 0x04), abs32([]byte{0xFF, 0x24, 0x85}, "table", 0), lbl("case0"), movEAXImm(10), ret(), lbl("case1"), movEAXImm(20), ret(), lbl("case2"), movEAXImm(30), ret(), pad(),
+		lbl("downFn"), by(0x8B, 0x4C, 0x24, 0x04), by(0xF7, 0xD9), abs32([]byte{0xFF, 0x24, 0x8D}, "downBase", 0), lbl("down0"), movEAXImm(100), ret(), lbl("down1"), movEAXImm(101), ret(), lbl("down2"), movEAXImm(102), ret(), pad(),
 		lbl("trapFn"), by(0x85, 0xC0), jne8("trapOk"), lbl("trapInsn"), by(0xCC), lbl("trapOk"), ret(), pad(),
 		lbl("haltFn"), by(0x6A, 0x00), abs32([]byte{0xFF, 0x15}, "thunk.KeBugCheck", 0), ret(), pad(),
 		lbl("noreturnFn"), call("spinFn"), ret(), pad(),
@@ -35,6 +36,7 @@ func liftImage(t *testing.T) *testImage {
 	t.Helper()
 	return buildImage(t, liftText(), []chunk{
 		lbl("table"), wordAt("case0", 0), wordAt("case1", 0), wordAt("case2", 0), word(0),
+		lbl("downTable"), wordAt("down2", 0), wordAt("down1", 0), lbl("downBase"), wordAt("down0", 0), word(0),
 		lbl("vt"), wordAt("vtfn", 0),
 	}, []chunk{
 		lbl("g1"), word(0), lbl("g2"), word(0), word(0), lbl("g3"), word(0), lbl("g4"), word(0), lbl("g5"), word(0), lbl("gobj"), word(0),
@@ -51,7 +53,7 @@ func TestLiftJumpAndReturn(t *testing.T) {
 		t.Fatalf("entry %s with %d blocks and inputs %v", lf.Entry, len(lf.blocks), lf.Regs)
 	}
 	a := lf.blocks[key(entry)]
-	if a.term.kind != "jump" || a.term.target != target || !reflect.DeepEqual(a.succs, []string{key(target)}) || a.sp != liftedEntrySP {
+	if a.term.kind != "jump" || a.term.target != target || !reflect.DeepEqual(a.succs, []string{key(target)}) || a.sp != LiftedEntrySP {
 		t.Fatalf("entry block ends with %+v at sp %X", a.term, a.sp)
 	}
 	exprEq(t, "entry EAX", a.regs[0], IConst{5})
@@ -72,7 +74,7 @@ func TestLiftBranchAndSwitch(t *testing.T) {
 	lf := liftRoutine(t, ti, "branchFn")
 	entry := ti.at(t, "branchFn")
 	a := lf.blocks[key(entry)]
-	arg := Load{Base: "stack", Off: liftedEntrySP + 4, Size: 4}
+	arg := Load{Base: "stack", Off: LiftedEntrySP + 4, Size: 4}
 	if a.term.kind != "branch" || a.term.taken != ti.at(t, "branchZero") || a.term.fall != entry+7 {
 		t.Fatalf("branch block ends with %+v", a.term)
 	}
@@ -105,6 +107,16 @@ func TestLiftBranchAndSwitch(t *testing.T) {
 	if sb := lf.Blocks[key(ti.at(t, "switchFn"))]; sb.Term.Kind != "switch" || !reflect.DeepEqual(sb.Term.Targets, cases) || sb.Term.Index != pool.Add(arg) {
 		t.Errorf("serialized switch %+v", sb.Term)
 	}
+	lf = liftRoutine(t, ti, "downFn")
+	s = lf.blocks[key(ti.at(t, "downFn"))]
+	down := []string{key(ti.at(t, "down2")), key(ti.at(t, "down1")), key(ti.at(t, "down0"))}
+	if s.term.kind != "switch" || !reflect.DeepEqual(s.succs, down) {
+		t.Fatalf("negated switch block ends with %+v to %v", s.term, s.succs)
+	}
+	exprEq(t, "negated switch index", s.term.index, Bin{"add", Un{"neg", arg}, IConst{2}})
+	for i, c := range down {
+		exprEq(t, c, lf.blocks[c].term.value, IConst{uint32(102 - i)})
+	}
 }
 
 func TestLiftTrapHaltNoreturn(t *testing.T) {
@@ -116,6 +128,7 @@ func TestLiftTrapHaltNoreturn(t *testing.T) {
 	if b := lf.blocks[key(ti.at(t, "trapOk"))]; b == nil || b.term.kind != "return" {
 		t.Fatalf("return block %+v", b)
 	}
+	ti.d.importNoReturn["KeBugCheck"] = true
 	lf = liftRoutine(t, ti, "haltFn")
 	b := lf.blocks[key(ti.at(t, "haltFn"))]
 	if b.term.kind != "halt" || len(lf.blocks) != 1 {
@@ -126,7 +139,7 @@ func TestLiftTrapHaltNoreturn(t *testing.T) {
 		t.Fatalf("halt effects %v", b.effects)
 	}
 	exprEq(t, "bug check code", calls[0].Args[0], IConst{0})
-	expectStore(t, b.effects[0], "stack", liftedEntrySP-4, 4, IConst{0})
+	expectStore(t, b.effects[0], "stack", LiftedEntrySP-4, 4, IConst{0})
 	lf = liftRoutine(t, ti, "noreturnFn")
 	b = lf.blocks[key(ti.at(t, "noreturnFn"))]
 	if b.term.kind != "noreturn" || len(lf.blocks) != 1 {
@@ -164,8 +177,8 @@ func TestLiftEntryFlagsTerms(t *testing.T) {
 	if a.fcmp == nil || !a.axFSW {
 		t.Fatalf("compare block leaves fcmp %v ax %v", a.fcmp, a.axFSW)
 	}
-	exprEq(t, "compared left", a.fcmp.a, Un{"bits2f", Load{Base: "stack", Off: liftedEntrySP + 4, Size: 4}})
-	exprEq(t, "compared right", a.fcmp.b, Un{"bits2f", Load{Base: "stack", Off: liftedEntrySP + 8, Size: 4}})
+	exprEq(t, "compared left", a.fcmp.a, Un{"bits2f", Load{Base: "stack", Off: LiftedEntrySP + 4, Size: 4}})
+	exprEq(t, "compared right", a.fcmp.b, Un{"bits2f", Load{Base: "stack", Off: LiftedEntrySP + 8, Size: 4}})
 	exprEq(t, "status word register", a.regs[0], Sym{"fsw"})
 	b = lf.blocks[blockKey(next, a)]
 	if b == nil || b.term.kind != "branch" {
@@ -229,7 +242,7 @@ func TestLiftRegisterInvariants(t *testing.T) {
 		t.Fatalf("successor block %+v", b)
 	}
 	expectStore(t, b.effects[0], "", int32(ti.at(t, "g1")), 4, IConst{5})
-	expectStore(t, b.effects[1], "", int32(ti.at(t, "g2")), 4, Ptr{"stack", liftedEntrySP + 8})
+	expectStore(t, b.effects[1], "", int32(ti.at(t, "g2")), 4, Ptr{"stack", LiftedEntrySP + 8})
 	expectStore(t, b.effects[2], "", int32(ti.at(t, "g3")), 4, Ptr{"import:KeGetCurrentThread", 0})
 	expectStore(t, b.effects[3], "", int32(ti.at(t, "g4")), 4, Sym{"reg.EDX"})
 	expectStore(t, b.effects[4], "", int32(ti.at(t, "g5")), 4, Ptr{fmt.Sprintf("g%08X", gobj), 0})
@@ -267,7 +280,7 @@ func TestLiftDumpNamesSharedNodes(t *testing.T) {
 	if got := lf.String(); got != want {
 		t.Errorf("call dump\n%s\nwant\n%s", got, want)
 	}
-	if b.sp != liftedEntrySP {
+	if b.sp != LiftedEntrySP {
 		t.Errorf("stack settles at %X after the stdcall", b.sp)
 	}
 }

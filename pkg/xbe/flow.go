@@ -113,6 +113,31 @@ func isRegArg(a x86asm.Arg) bool {
 	return ok
 }
 
+// Walks a prologue from an entry index, telling each register saving push and each frame allocation
+func (d *Disassembly) walkPrologue(fn *Function, entry int, visit func(in *Instruction, save, alloc bool)) {
+	framed := false
+	for i := entry; i < len(fn.Instructions); i++ {
+		in := &fn.Instructions[i]
+		if in.Inst.Op == x86asm.PUSH {
+			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && (framed || d.prologueLocal(fn.EntryVA, in.VA)))) {
+				visit(in, true, false)
+				continue
+			}
+			return
+		}
+		switch in.Inst.Op {
+		case x86asm.MOV, x86asm.LEA, x86asm.SUB, x86asm.AND, x86asm.XOR, x86asm.FLD, x86asm.FLD1, x86asm.FLDZ, x86asm.FSTP:
+			if dst, src, ok := registerMove(in); ok && dst == x86asm.EBP && src == x86asm.ESP {
+				framed = true
+			}
+			r, isReg := in.Inst.Args[0].(x86asm.Reg)
+			visit(in, false, isReg && r == x86asm.ESP && (in.Inst.Op == x86asm.SUB || in.Inst.Op == x86asm.AND))
+			continue
+		}
+		return
+	}
+}
+
 // Lists the argument registers some path of a function reads before any instruction on it writes them
 func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 	if d.liveIns == nil {
@@ -130,26 +155,11 @@ func (d *Disassembly) liveInRegisters(fn *Function) []x86asm.Reg {
 	}
 	written[entry] = map[x86asm.Reg]bool{}
 	prologue := map[int]bool{}
-	framed := false
-	for i := entry; i < len(fn.Instructions); i++ {
-		in := &fn.Instructions[i]
-		if in.Inst.Op == x86asm.PUSH {
-			// A push of ecx under a fresh frame pointer reserves a local, the compiler's short form of the allocation
-			if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && framed)) {
-				prologue[i] = true
-				continue
-			}
-			break
+	d.walkPrologue(fn, entry, func(in *Instruction, save, _ bool) {
+		if save {
+			prologue[index[in.VA]] = true
 		}
-		if dst, src, ok := registerMove(in); ok && dst == x86asm.EBP && src == x86asm.ESP {
-			framed = true
-		}
-		switch in.Inst.Op {
-		case x86asm.MOV, x86asm.LEA, x86asm.SUB, x86asm.AND, x86asm.XOR:
-			continue
-		}
-		break
-	}
+	})
 	popped := map[x86asm.Reg]bool{}
 	for i := range fn.Instructions {
 		if in := &fn.Instructions[i]; in.Inst.Op == x86asm.POP {
@@ -475,7 +485,7 @@ func (d *Disassembly) callRemoves(fn *Function, i int, pushes int32) int32 {
 	if isStackProbe(callee) {
 		return -probeFrameSize(fn, i)
 	}
-	return int32(calleeCleanupOf(callee))
+	return int32(d.cleanupOf(callee))
 }
 
 // The frame size a caller loads into eax before calling the stack probe

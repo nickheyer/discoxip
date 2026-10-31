@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"golang.org/x/arch/x86/x86asm"
 )
@@ -82,22 +83,31 @@ func (r roleSet) kind() paramKind {
 
 // Returns the stack bytes the non optimized build of a library function takes, from the signature database
 func canonicalArgBytes(name string) (int, bool) {
-	pats, err := loadPatterns()
-	if err != nil {
-		return 0, false
-	}
-	best, found := -1, false
-	for i := range pats {
-		if pats[i].Lib == "d3d8ltcg" {
-			continue
+	canonicalOnce.Do(func() {
+		pats, err := loadPatterns()
+		if err != nil {
+			return
 		}
-		sym := decorateSymbol(pats[i].Symbol)
-		if sym.Name == name && sym.ArgBytes > best {
-			best, found = sym.ArgBytes, true
+		canonicalBytes = map[string]int{}
+		for i := range pats {
+			if pats[i].Lib == "d3d8ltcg" {
+				continue
+			}
+			sym := decorateSymbol(pats[i].Symbol)
+			if best, seen := canonicalBytes[sym.Name]; !seen || sym.ArgBytes > best {
+				canonicalBytes[sym.Name] = sym.ArgBytes
+			}
 		}
-	}
+	})
+	best, found := canonicalBytes[name]
 	return best, found
 }
+
+// The most argument bytes any pattern declares for each symbol name, read off the patterns once
+var (
+	canonicalOnce  sync.Once
+	canonicalBytes map[string]int
+)
 
 // Derives where a library function takes its parameters, matching the registers it reads to its declared uses
 func (d *Disassembly) convention(fn *Function) (callConvention, error) {
@@ -108,7 +118,7 @@ func (d *Disassembly) convention(fn *Function) (callConvention, error) {
 		return c, nil
 	}
 	sym := fn.Symbol
-	stackBytes := calleeCleanupOf(fn)
+	stackBytes := d.cleanupOf(fn)
 	regs := d.liveInRegisters(fn)
 	conv := callConvention{stackBytes: stackBytes}
 	if sym == nil {
@@ -314,8 +324,8 @@ func (l argLocation) String() string {
 // Runs a library function on symbolic inputs and records how each register and stack argument is used
 func (d *Disassembly) inputRoles(fn *Function, regs []x86asm.Reg, stackArgs int) (map[argLocation]roleSet, error) {
 	ex := NewExecutorShared(d.baseExecutor())
-	ex.StepLimit = 20000
-	ex.PathLimit = 64
+	ex.StepLimit = DeriveSteps
+	ex.PathLimit = DerivePaths
 	for _, t := range fn.CallTargets {
 		ex.Opaque[t] = true
 	}
@@ -333,7 +343,7 @@ func (d *Disassembly) inputRoles(fn *Function, regs []x86asm.Reg, stackArgs int)
 			names[name] = argLocation{Stack: i}
 		}
 		s.pushArgs(args...)
-	}, 4)
+	}, libraryRetries)
 	roles := map[argLocation]roleSet{}
 	for name, loc := range names {
 		roles[loc] = roleSet{}

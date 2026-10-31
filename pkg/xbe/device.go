@@ -70,8 +70,8 @@ func (d *Disassembly) deviceState() (*deviceLayout, error) {
 		return nil, err
 	}
 	ex := NewExecutorShared(d.baseExecutor())
-	ex.StepLimit = 20000
-	ex.PathLimit = 64
+	ex.StepLimit = DeriveSteps
+	ex.PathLimit = DerivePaths
 	for _, t := range setter.CallTargets {
 		ex.Opaque[t] = true
 	}
@@ -94,7 +94,7 @@ func (d *Disassembly) deviceState() (*deviceLayout, error) {
 			}
 		}
 		s.pushArgs(args...)
-	}, 4)
+	}, libraryRetries)
 	var effects []Effect
 	for _, p := range paths {
 		effects = append(effects, p.Effects...)
@@ -197,8 +197,8 @@ func (d *Disassembly) textureStateArray() (*stateArray, error) {
 	}
 	stage, value := Sym{"in.stage"}, Sym{"in.value"}
 	ex := NewExecutorShared(d.baseExecutor())
-	ex.StepLimit = 20000
-	ex.PathLimit = 64
+	ex.StepLimit = DeriveSteps
+	ex.PathLimit = DerivePaths
 	for _, t := range setter.CallTargets {
 		ex.Opaque[t] = true
 	}
@@ -220,7 +220,7 @@ func (d *Disassembly) textureStateArray() (*stateArray, error) {
 			}
 		}
 		s.pushArgs(args...)
-	}, 4)
+	}, libraryRetries)
 	var effects []Effect
 	for _, p := range paths {
 		effects = append(effects, p.Effects...)
@@ -401,8 +401,8 @@ func (d *Disassembly) constantBias(fn *Function) (int32, error) {
 		return 0, err
 	}
 	ex := NewExecutorShared(d.baseExecutor())
-	ex.StepLimit = 20000
-	ex.PathLimit = 64
+	ex.StepLimit = DeriveSteps
+	ex.PathLimit = DerivePaths
 	for _, t := range fn.CallTargets {
 		ex.Opaque[t] = true
 	}
@@ -435,7 +435,7 @@ func (d *Disassembly) constantBias(fn *Function) (int32, error) {
 			}
 		}
 		s.pushArgs(args...)
-	}, 4)
+	}, libraryRetries)
 	var effects []Effect
 	for _, p := range paths {
 		effects = append(effects, p.Effects...)

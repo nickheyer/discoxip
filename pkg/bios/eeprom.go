@@ -57,6 +57,8 @@ type Console struct {
 	TimeZoneBias  int32
 	StdName       string
 	DltName       string
+	AVPack        uint32
+	Memory        uint32
 }
 
 // The console the build configures, a North American NTSC unit set to English
@@ -70,6 +72,8 @@ func DefaultConsole() Console {
 		DVDRegion:     1,
 		StdName:       "GMT",
 		DltName:       "BST",
+		AVPack:        6,
+		Memory:        64 << 20,
 	}
 }
 

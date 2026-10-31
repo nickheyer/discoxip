@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nickheyer/discoxip/pkg/bios"
+	"github.com/nickheyer/discoxip/pkg/extract"
 	"github.com/nickheyer/discoxip/pkg/scene"
 	"github.com/nickheyer/discoxip/pkg/xap"
 	"github.com/nickheyer/discoxip/pkg/xbe"
@@ -25,7 +27,7 @@ import (
 var staticFiles embed.FS
 
 // Export generates a self-contained web application from extracted XIP data and the disassembled dashboard executable.
-func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *xbe.KernelInput) error {
+func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *xbe.KernelInput, bank *bios.Bank, mcpx *bios.MCPX) error {
 	for _, dir := range []string{
 		outputDir,
 		filepath.Join(outputDir, "data", "scenes"),
@@ -137,7 +139,12 @@ func Export(inputDir, consoleDir, outputDir string, d *xbe.Disassembly, kernel *
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "  Copied %d font files the dashboard opens itself\n", fileCount)
+	fmt.Fprintf(os.Stderr, "  Copied %d files the dashboard opens itself\n", fileCount)
+
+	fmt.Fprintf(os.Stderr, "Deriving the console and translating the loader, the kernel and the executable into the page's runtime\n")
+	if err := WriteRuntime(outputDir, RuntimeInput{Dash: d, Bank: bank, MCPX: mcpx, Console: bios.DefaultConsole(), ConsoleDir: consoleDir}); err != nil {
+		return err
+	}
 
 	configData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -228,13 +235,10 @@ func fontVersion(dir string) int {
 	return 0
 }
 
-// Copies the font files among the console files, under the paths the dashboard names them by
+// Copies the console files the dashboard opens, under the paths the dashboard names them by
 func copyConsoleFiles(dir, dstDir string, files []string) (int, error) {
 	count := 0
 	for _, rel := range files {
-		if !strings.EqualFold(filepath.Ext(rel), ".xtf") {
-			continue
-		}
 		dst := filepath.Join(dstDir, strings.ToLower(filepath.ToSlash(rel)))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return 0, fmt.Errorf("web: copying console files: %w", err)
@@ -871,7 +875,7 @@ func decodeXboxADPCM(data []byte) ([]byte, error) {
 }
 
 func copyAudio(srcDir, dstDir string) int {
-	audioDir := filepath.Join(srcDir, "Audio")
+	audioDir := filepath.Join(srcDir, extract.AudioDir)
 	if _, err := os.Stat(audioDir); err != nil {
 		return 0
 	}

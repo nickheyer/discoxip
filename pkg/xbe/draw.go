@@ -475,7 +475,7 @@ func (d *Disassembly) ctorInits(ex *Executor, nt *NodeType, allocators []uint32)
 			break
 		}
 		ee, ok := err.(*ExecError)
-		if !ok || len(ee.Frames) == 0 || attempt >= 8 {
+		if !ok || len(ee.Frames) == 0 || attempt >= drawRetries {
 			return nil, nil, err
 		}
 		sub.Opaque[ee.Frames[len(ee.Frames)-1]] = true
@@ -668,7 +668,7 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 		paths, _, _, err := sub.RunWithRetries(va, func(s *execState) {
 			s.regs[1] = Ptr{"this", 0}
 			sub.seedArgs(s, va, "arg", 2)
-		}, 8)
+		}, drawRetries)
 		if err != nil {
 			return fmt.Errorf("draw path %08X: %w", va, err)
 		}
@@ -1388,7 +1388,7 @@ func (d *Disassembly) fieldTableLayout(types map[string]*NodeType, tables map[st
 func (d *Disassembly) walkerLayout(ex *Executor, va uint32, slot int32) (fieldTableLayout, bool) {
 	fn := d.Functions[va]
 	sub := NewExecutorShared(ex)
-	sub.PathLimit, sub.StepLimit = 4096, 20000
+	sub.PathLimit, sub.StepLimit = 4096, DeriveSteps
 	for _, c := range d.plainCallees(va) {
 		sub.Opaque[c] = true
 	}

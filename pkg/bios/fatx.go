@@ -28,6 +28,11 @@ const (
 	fatxPage              = 0x1000
 )
 
+// VolumeGeometry is the sector size, the sectors of a cluster and the file system name of the console's volumes
+func VolumeGeometry() (sectorBytes, sectorsPerCluster int, fileSystem string) {
+	return fatxSectorSize, fatxSectorsPerCluster, fatxMagic
+}
+
 // Run is a span of bytes at an offset into a volume or a disk
 type Run struct {
 	Offset uint64

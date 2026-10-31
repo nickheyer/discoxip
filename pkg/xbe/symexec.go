@@ -35,11 +35,14 @@ type Effect struct {
 // Buffer index of the receiver register, which carries a stack buffer in the optimizer's own convention
 const thisBufferIndex = -1
 
-// ArgBuffer snapshots stack memory a call argument points at, each element with the size it was stored as.
+// ArgBuffer snapshots stack memory a call argument points at, each element with the size it was stored as, the
+// elements running on from the pointer, or lying at the offsets given where the snapshot is an image of a routine
+// a derivation names
 type ArgBuffer struct {
 	Index int
 	Elems []Expr
 	Sizes []int
+	Offs  []int32
 }
 
 // Stored elements a stack buffer snapshot may hold, the path buffers being the longest
@@ -183,6 +186,7 @@ type execState struct {
 	mm         [8][2]Expr
 	mem        map[memKey]memVal
 	fpu        []Expr
+	cw         Expr // the x87 control word, nil while the routine left the default alone
 	fl         flagState
 	fcmp       *fcmpRec
 	axFSW      bool
@@ -205,6 +209,7 @@ type execState struct {
 	boundLoads map[string]Load    // memory reads behind those values, freed when the memory changes
 	loops      map[uint32]int     // backward symbolic branches taken per jump on this path
 	nulled     bool               // a pointer a guard fixed to zero was dereferenced, which the hardware cannot do
+	spMoved    bool               // the block reserved stack it keeps a pointer to, so the pointer leaves the frame
 }
 
 // pendingCall remembers the arguments popped for a call of unknown arity so a later
@@ -236,6 +241,8 @@ type Executor struct {
 	StepLimit    int                     // per path instruction budget, zero means the default
 	FrameLimit   int                     // per inlined frame budget, negative disables the budget
 	PathLimit    int                     // paths one run may enumerate, zero means the default
+	DepthLimit   int                     // forks a path may hold open at once, zero means no limit
+	depth        int                     // forks open on the path being run
 	staticThis   map[uint32]uint32       // functions invoked on a static object, by address
 	thisLoc      map[uint32]argLocation  // where each such function takes its object
 	callTarget   uint32                  // library function the opaque call being recorded resolves to
@@ -243,19 +250,47 @@ type Executor struct {
 	callee       uint32                  // the routine the named call being recorded reaches
 	// ImageCreations models the creations the runtime runs from the image as handing back their object
 	ImageCreations bool
-	arrayIdx       map[uint32]arrayIndex // counted array indexes the optimizer inlined, by their first instruction
-	Stop           map[uint32]bool       // addresses a path ends at, for a routine the runtime enters and leaves mid function
-	block          *blockRun             // the basic block being lifted, nil while paths are summarized
-	loopCut        bool                  // a loop left after its unroll budget, so the paths miss its longer runs
-	pointer        Expr                  // the function pointer the call being recorded goes through
-	tail           bool                  // the call being recorded is a jump leaving the return address under the arguments
-	tailClean      uint32                // stack bytes the callee of a tail jump removes, which its return then applies
-	machine        bool                  // blocks are lifted as the processor runs them, the stack in memory and calls as jumps
-	template       *CodeTemplate         // code lifted as a template whose patched words the copy supplies
+	// OutBuffers is memory routines a derivation names write through a pointer argument, forgotten as the library's are
+	OutBuffers map[string][]OutBuffer
+	arrayIdx   map[uint32]arrayIndex // counted array indexes the optimizer inlined, by their first instruction
+	Stop       map[uint32]bool       // addresses a path ends at, for a routine the runtime enters and leaves mid function
+	block      *blockRun             // the basic block being lifted, nil while paths are summarized
+	loopCut    bool                  // a loop left after its unroll budget, so the paths miss its longer runs
+	pointer    Expr                  // the function pointer the call being recorded goes through
+	tail       bool                  // the call being recorded is a jump leaving the return address under the arguments
+	tailClean  uint32                // stack bytes the callee of a tail jump removes, which its return then applies
+	machine    bool                  // blocks are lifted as the processor runs them, the stack in memory and calls as jumps
+	template   *CodeTemplate         // code lifted as a template whose patched words the copy supplies
 }
 
-// NewExecutor prepares an executor with symbol and vtable knowledge.
+// executorScans is what every executor of one image reads off it, its named routines, the objects its routines run
+// on, the globals its code writes, its prologues, frame sizes and inlined array indexes, scanned once for the image
+type executorScans struct {
+	vtables    map[uint32]uint32
+	symbols    map[uint32]*Symbol
+	nameOf     map[uint32]string
+	ftol       map[uint32]bool
+	probe      map[uint32]bool
+	staticThis map[uint32]uint32
+	thisLoc    map[uint32]argLocation
+	written    map[uint32]bool
+	savePush   map[uint32]bool
+	frameAlloc map[uint32]bool
+	frameSizes map[uint32]map[int]bool
+	arrayIdx   map[uint32]arrayIndex
+}
+
+// NewExecutor prepares an executor with symbol and vtable knowledge, its own copy of the vtables it may learn more of
 func NewExecutor(d *Disassembly) *Executor {
+	s := d.executorScans()
+	return &Executor{d: d, vtables: maps.Clone(s.vtables), symbols: s.symbols, nameOf: s.nameOf, Opaque: map[uint32]bool{}, ftol: s.ftol, probe: s.probe, Results: map[uint32]Expr{}, Allocators: map[uint32]bool{}, staticThis: s.staticThis, thisLoc: s.thisLoc, written: s.written, savePush: s.savePush, frameAlloc: s.frameAlloc, frameSizes: s.frameSizes, arrayIdx: s.arrayIdx}
+}
+
+// The scans of an image, run for its first executor and kept for every one after
+func (d *Disassembly) executorScans() *executorScans {
+	if d.scans != nil {
+		return d.scans
+	}
 	ex := &Executor{d: d, vtables: map[uint32]uint32{}, symbols: map[uint32]*Symbol{}, nameOf: map[uint32]string{}, Opaque: map[uint32]bool{}, ftol: map[uint32]bool{}, probe: map[uint32]bool{}, Results: map[uint32]Expr{}, Allocators: map[uint32]bool{}}
 	for va, fn := range d.Functions {
 		if fn.Symbol != nil {
@@ -279,7 +314,8 @@ func NewExecutor(d *Disassembly) *Executor {
 	ex.scanFrameAllocations()
 	ex.scanArrayIndexes()
 	stage("executor ready")
-	return ex
+	d.scans = &executorScans{vtables: ex.vtables, symbols: ex.symbols, nameOf: ex.nameOf, ftol: ex.ftol, probe: ex.probe, staticThis: ex.staticThis, thisLoc: ex.thisLoc, written: ex.written, savePush: ex.savePush, frameAlloc: ex.frameAlloc, frameSizes: ex.frameSizes, arrayIdx: ex.arrayIdx}
+	return d.scans
 }
 
 // Records every counted array index the optimizer inlined, so each runs as the accessor call it expands
@@ -330,51 +366,28 @@ func (ex *Executor) resourceCount(s *execState, in *Instruction, r resourceRef) 
 	return nil
 }
 
-// Records the register saving pushes and local allocations in every function prologue, reading each only as far
-// as the code it owns
+// Records the register saving pushes and local allocations in every function prologue
 func (ex *Executor) scanPrologues() {
 	ex.savePush = map[uint32]bool{}
 	ex.frameAlloc = map[uint32]bool{}
 	ex.frameSizes = map[uint32]map[int]bool{}
-	owner := map[uint32]uint32{}
 	for _, va := range ex.d.functionVAs() {
-		for i := range ex.d.Functions[va].Instructions {
-			in := &ex.d.Functions[va].Instructions[i]
-			if _, taken := owner[in.VA]; !taken {
-				owner[in.VA] = va
-			}
+		fn := ex.d.Functions[va]
+		entry, ok := fn.instructionIndex()[va]
+		if !ok {
+			continue
 		}
-	}
-	for _, va := range ex.d.functionVAs() {
-		framed := false
-		for cur := va; owner[cur] == va; {
-			in := ex.d.InsnByVA[cur]
-			if in == nil {
-				break
+		ex.d.walkPrologue(fn, entry, func(in *Instruction, save, alloc bool) {
+			if save {
+				ex.savePush[in.VA] = true
 			}
-			switch in.Inst.Op {
-			case x86asm.PUSH:
-				// A push of ecx under a fresh frame pointer reserves a local, the compiler's short form of the allocation
-				if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && (r == x86asm.EBP || r == x86asm.EBX || r == x86asm.ESI || r == x86asm.EDI || (r == x86asm.ECX && (framed || ex.d.prologueLocal(va, cur)))) {
-					ex.savePush[cur] = true
-					cur += uint32(in.Inst.Len)
-					continue
+			if alloc {
+				ex.frameAlloc[in.VA] = true
+				if imm, isImm := in.Inst.Args[1].(x86asm.Imm); isImm && in.Inst.Op == x86asm.SUB {
+					ex.noteFrameSize(va, int(imm))
 				}
-			case x86asm.MOV, x86asm.LEA, x86asm.SUB, x86asm.AND, x86asm.XOR, x86asm.FLD, x86asm.FLD1, x86asm.FLDZ, x86asm.FSTP:
-				if dst, src, ok := registerMove(in); ok && dst == x86asm.EBP && src == x86asm.ESP {
-					framed = true
-				}
-				if r, ok := in.Inst.Args[0].(x86asm.Reg); ok && r == x86asm.ESP && (in.Inst.Op == x86asm.SUB || in.Inst.Op == x86asm.AND) {
-					ex.frameAlloc[cur] = true
-					if imm, isImm := in.Inst.Args[1].(x86asm.Imm); isImm && in.Inst.Op == x86asm.SUB {
-						ex.noteFrameSize(va, int(imm))
-					}
-				}
-				cur += uint32(in.Inst.Len)
-				continue
 			}
-			break
-		}
+		})
 	}
 }
 
@@ -440,6 +453,7 @@ func (ex *Executor) cleanupAfter(fn *Function, callVA uint32) int {
 		return -1
 	}
 	bytes := 0
+	after, since := 0, int32(0)
 	found := func() int {
 		if bytes > 0 {
 			return bytes
@@ -450,16 +464,32 @@ func (ex *Executor) cleanupAfter(fn *Function, callVA uint32) int {
 		in := &fn.Instructions[j]
 		switch {
 		case in.Inst.Op == x86asm.ADD && argCount(in) == 2 && isStackPointer(in.Inst.Args[0]):
-			if imm, isImm := in.Inst.Args[1].(x86asm.Imm); isImm && !ex.frameSizes[fn.EntryVA][int(imm)] {
-				return bytes + int(imm)
+			// A shared add removes what later calls left standing as well, the rest being this call's arguments
+			if imm, isImm := in.Inst.Args[1].(x86asm.Imm); isImm && !ex.frameSizes[fn.EntryVA][int(imm)] && int(imm) > after {
+				return bytes + int(imm) - after
 			}
 			return found()
 		case in.Inst.Op == x86asm.POP:
 			if r, isReg := in.Inst.Args[0].(x86asm.Reg); isReg && (r == x86asm.ECX || r == x86asm.EDX || r == x86asm.EAX) {
-				bytes += 4
+				if after > 0 {
+					after -= 4
+				} else {
+					bytes += 4
+				}
 				continue
 			}
 			return found()
+		case in.Inst.Op == x86asm.PUSH:
+			after += 4
+			since++
+			continue
+		case in.Inst.Op == x86asm.CALL:
+			after -= int(ex.d.callRemoves(fn, j, since))
+			since = 0
+			if after < 0 {
+				return found()
+			}
+			continue
 		case leavesStackPointer(in):
 			continue
 		}
@@ -546,14 +576,18 @@ func (ex *Executor) scanWrittenGlobals() {
 	}
 }
 
-// Reports whether a global range is initialized image data that no instruction stores to
+// Reports whether a global range is initialized image data that no instruction stores to, a machine block folding
+// only what lies in memory the processor cannot write
 func (ex *Executor) isConstantGlobal(va uint32, size int) bool {
 	sec := ex.d.sectionOf(va)
 	if sec == nil || va+uint32(size) > sec.VirtualAddr+sec.RawSize {
 		return false
 	}
-	if sec.Flags&0x1 == 0 {
+	if !sec.Writable() {
 		return true
+	}
+	if ex.machine {
+		return false
 	}
 	for b := uint32(0); b < uint32(size); b++ {
 		if ex.written[va+b] {
@@ -649,7 +683,7 @@ func (ex *Executor) scanStaticThis(code *Section) bool {
 			if i > 0 && calleeCleanupOf(callee) > 0 {
 				prev := &fn.Instructions[i-1]
 				if prev.Inst.Op == x86asm.PUSH {
-					if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok && ex.isDataAddress(uint32(imm)) {
+					if imm, ok := prev.Inst.Args[0].(x86asm.Imm); ok && ex.d.isDataAddress(uint32(imm)) {
 						record(t, uint32(imm), argLocation{Stack: 0})
 					}
 				}
@@ -701,12 +735,6 @@ func (ex *Executor) seedThis(s *execState, fn, addr uint32, stackArgs int) {
 	s.pushArgs(args...)
 }
 
-// Reports whether an address lies in a writable data section
-func (ex *Executor) isDataAddress(va uint32) bool {
-	sec := ex.d.sectionOf(va)
-	return sec != nil && sec.Flags&0x1 != 0
-}
-
 // Maps globals holding heap objects to the vtable their constructor installs
 func (ex *Executor) resolveGlobalObjects() {
 	staticThis := ex.staticThisCallers()
@@ -740,7 +768,7 @@ func (ex *Executor) resolveGlobalObjects() {
 				if vt, ok := ex.d.outObjectVtable(resolveTarget(&in)); ok {
 					idx := outParams[ex.d.Functions[resolveTarget(&in)].Symbol.Name]
 					if idx < len(pushed) {
-						if addr := pushed[len(pushed)-1-idx]; addr != 0 && ex.isDataAddress(addr) {
+						if addr := pushed[len(pushed)-1-idx]; addr != 0 && ex.d.isDataAddress(addr) {
 							ex.vtables[addr] = vt
 						}
 					}
@@ -762,7 +790,7 @@ func (ex *Executor) resolveGlobalObjects() {
 				continue
 			}
 			if dst, ok := in.Inst.Args[0].(x86asm.Reg); ok {
-				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && ex.isDataAddress(uint32(imm)) {
+				if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok && ex.d.isDataAddress(uint32(imm)) {
 					bases[dst] = uint32(imm)
 				} else if src, ok := in.Inst.Args[1].(x86asm.Reg); ok && bases[src] != 0 {
 					bases[dst] = bases[src]
@@ -903,7 +931,7 @@ func (ex *Executor) RunWithRetries(entry uint32, init func(s *execState), retrie
 
 // NewExecutorShared makes an executor reusing another one's precomputed knowledge.
 func NewExecutorShared(base *Executor) *Executor {
-	return &Executor{d: base.d, arrayIdx: base.arrayIdx, Stop: base.Stop, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Opaque: map[uint32]bool{}, ftol: base.ftol, probe: base.probe, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush, frameAlloc: base.frameAlloc, frameSizes: base.frameSizes, staticThis: base.staticThis, thisLoc: base.thisLoc}
+	return &Executor{d: base.d, arrayIdx: base.arrayIdx, Stop: base.Stop, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Opaque: map[uint32]bool{}, ftol: base.ftol, probe: base.probe, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush, frameAlloc: base.frameAlloc, frameSizes: base.frameSizes, staticThis: base.staticThis, thisLoc: base.thisLoc, OutBuffers: base.OutBuffers}
 }
 
 // Reports whether a data pointer starts a table of code addresses
@@ -1280,7 +1308,7 @@ func (ex *Executor) loadBacking(s *execState, p Ptr, size int) Expr {
 	if p.Base == "" && ex.machine {
 		// A machine block folds only what the image holds in memory the processor never writes
 		va := uint32(p.Off)
-		if sec := ex.d.sectionOf(va); sec != nil && sec.Flags&0x1 == 0 && ex.d.sectionOf(va+uint32(size)-1) == sec {
+		if sec := ex.d.sectionOf(va); sec != nil && !sec.Writable() && ex.d.sectionOf(va+uint32(size)-1) == sec {
 			switch size {
 			case 1:
 				v, _ := ex.d.Image.ReadU8(va)
@@ -1402,9 +1430,10 @@ func (ex *Executor) loadFloat(s *execState, a Expr, size int) Expr {
 
 // The value the path last stored through a symbolic address, which a later load of the same address reads back
 func (s *execState) storedThrough(a Expr, size int) (Expr, bool) {
+	da := addressDigest(a)
 	for i := len(s.effects) - 1; i >= 0; i-- {
 		e := &s.effects[i]
-		if e.Kind != "store" || e.Addr == nil || e.Size != size {
+		if e.Kind != "store" || e.Addr == nil || e.Size != size || addressDigest(e.Addr) != da {
 			continue
 		}
 		if sameExpr(e.Addr, a) {
@@ -1414,11 +1443,47 @@ func (s *execState) storedThrough(a Expr, size int) (Expr, bool) {
 	return nil, false
 }
 
+// digestEntry is a node digested before, held so its identity stays its own while its digest is remembered
+type digestEntry struct {
+	src Expr
+	d   uint64
+}
+
+// Nodes whose digests are remembered before the memo is cleared, bounding what the memory holds for them
+const addressDigestNodes = 1 << 20
+
+// The digests of every address digested so far, so a store's address is digested once however many loads compare against it
+var addressDigests = map[exprKey]digestEntry{}
+
+// The structural digest of an address, remembered by the node's identity
+func addressDigest(a Expr) uint64 {
+	k := keyOf(a)
+	if entry, ok := addressDigests[k]; ok {
+		return entry.d
+	}
+	if len(addressDigests) > addressDigestNodes {
+		addressDigests = map[exprKey]digestEntry{}
+	}
+	d := exprDigest(a, digestMemo{})
+	addressDigests[k] = digestEntry{src: a, d: d}
+	return d
+}
+
 func (ex *Executor) storeFloat(s *execState, a Expr, size int, v Expr, va uint32) {
 	if size == 4 {
 		v = mkUn("f32", v)
+	} else if !isFloatExpr(v) {
+		v = Un{"f64", v}
 	}
 	ex.store(s, a, size, v, va)
+}
+
+// The x87 control word as the path holds it, the default where nothing loaded one
+func (s *execState) controlWord() Expr {
+	if s.cw == nil {
+		return IConst{fpuDefaultControlWord}
+	}
+	return s.cw
 }
 
 // Pushes a value, a return address marking the slot as one of the frame
@@ -1503,7 +1568,7 @@ func maskSize(v Expr, size int) Expr {
 // Run executes a function symbolically from entry with prepared registers and memory.
 func (ex *Executor) Run(entry uint32, init func(s *execState)) ([]Path, error) {
 	s := &execState{mem: map[memKey]memVal{}, va: entry, root: entry}
-	s.regs[4] = Ptr{"stack", 0x10000}
+	s.regs[4] = Ptr{"stack", LiftedEntrySP}
 	s.regs[5] = Sym{"reg.EBP"}
 	init(s)
 	s.push(RetAddr{VA: 0, Clean: 0})
@@ -1792,12 +1857,18 @@ func (ex *Executor) branch(s *execState, cond Expr, taken, fall uint32) (bool, e
 			return false, nil
 		}
 	}
+	if ex.DepthLimit > 0 && ex.depth >= ex.DepthLimit {
+		return true, &ExecError{VA: s.va, Frames: s.frames, Limit: true, Err: fmt.Errorf("fork depth exceeded"), Effects: s.effects}
+	}
 	alt := s.clone()
 	alt.guards = append(alt.guards, mkNot(cond))
 	alt.guardPos = append(alt.guardPos, len(alt.effects))
 	alt.bindFrom(mkNot(cond))
 	alt.va = fall
-	if err := ex.run(alt); err != nil {
+	ex.depth++
+	err := ex.run(alt)
+	ex.depth--
+	if err != nil {
 		return true, err
 	}
 	s.guards = append(s.guards, cond)
@@ -1967,11 +2038,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	op := in.Inst.Op
 	s.va = next
 	switch op {
-	case x86asm.NOP, x86asm.FWAIT, x86asm.FLDCW, x86asm.FNSTCW, x86asm.FNCLEX, x86asm.FNINIT:
-		if ex.machine && op != x86asm.NOP && op != x86asm.FWAIT {
-			return ex.machineControlWord(s, in)
-		}
+	case x86asm.NOP:
 		return false, nil
+	case x86asm.FWAIT:
+		ex.noteNotAvailable(s, npxWait)
+		return false, nil
+	case x86asm.FLDCW, x86asm.FNSTCW, x86asm.FNCLEX, x86asm.FNINIT:
+		ex.noteNotAvailable(s, npxUnit)
+		return ex.controlWordStep(s, in)
 	case x86asm.WBINVD, x86asm.INVD:
 		// Writing the caches back leaves memory holding what the stores already put there
 		return false, nil
@@ -2260,6 +2334,9 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			// The ordering flags land in ah exactly where fnstsw puts the condition codes.
 			s.fcmp = &fcmpRec{a: s.fl.a, b: s.fl.b}
 			s.regs[0] = Sym{"fsw"}
+			if ex.machine {
+				s.regs[0] = mkBin("or", mkBin("and", s.getReg(x86asm.EAX), IConst{0xFFFF00FF}), mkBin("or", statusWord(s.fl.a, s.fl.b), IConst{0x200}))
+			}
 			s.axFSW = true
 			return false, nil
 		}
@@ -2356,10 +2433,14 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			return ex.tailCall(s, in)
 		}
 		// A jump through a table of code addresses is a switch, forked over every case the index may select.
-		if m, ok := args[0].(x86asm.Mem); ok && m.Index != 0 && m.Scale == 4 && m.Base == 0 {
+		if m, ok := jumpTableOperand(in); ok {
 			if sec := ex.d.sectionOf(in.VA); sec != nil {
-				if targets := ex.d.jumpTableTargets(in, sec); len(targets) > 0 {
-					return ex.switchJump(s, s.getReg(m.Index), targets)
+				if first, targets := ex.d.jumpTableCases(in, sec); len(targets) > 0 {
+					index := s.getReg(m.Index)
+					if first != 0 {
+						index = mkBin("add", index, IConst{uint32(-first)})
+					}
+					return ex.switchJump(s, index, targets)
 				}
 			}
 		}
@@ -2518,6 +2599,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			return done, err
 		}
 		if isFPU(op) {
+			ex.noteNotAvailable(s, npxUnit)
 			return false, ex.fpuStep(s, in)
 		}
 		if handled, err := ex.sseStep(s, in); handled {
@@ -2526,6 +2608,20 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		return false, fmt.Errorf("unsupported instruction")
 	}
 	return false, nil
+}
+
+// Marks the block as trapping at entry under the task switched bit, nothing before clearing it
+func (ex *Executor) noteNotAvailable(s *execState, kind int) {
+	if ex.block != nil && len(s.frames) == 0 && ex.block.npx == npxNone && !ex.block.tsCleared {
+		ex.block.npx = kind
+	}
+}
+
+// Marks the machine block as clearing the task switched bit, so the float instructions after it never trap
+func (ex *Executor) noteTaskSwitchCleared(s *execState) {
+	if ex.block != nil && len(s.frames) == 0 {
+		ex.block.tsCleared = true
+	}
 }
 
 // The calls a port read and a port write become
@@ -2543,7 +2639,8 @@ func calleeName(fn *Function) string {
 // Reads a matrix copy straight into or out of the device's transform array as the inlined transform setter or
 // getter, reporting whether the copy was one and whether it was taken that way
 func (ex *Executor) transformCopyAt(s *execState, in *Instruction, cnt uint32, known bool, size int) (bool, bool) {
-	if !known {
+	// A machine block copies the bytes themselves, the runtime reading the device's matrices where they land
+	if !known || ex.machine {
 		return false, false
 	}
 	if state, ok := ex.transformCopy(s.getReg(x86asm.EDI), cnt*uint32(size)); ok {
@@ -2689,6 +2786,11 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 		return sign()
 	case x86asm.JNS, x86asm.SETNS:
 		return mkNot(sign())
+	case x86asm.JP, x86asm.SETP:
+		// The parity flag is the even parity of the result's low byte
+		return mkCond("ne", mkUn("parity", f.r), IConst{0})
+	case x86asm.JNP, x86asm.SETNP:
+		return mkCond("eq", mkUn("parity", f.r), IConst{0})
 	case x86asm.JO, x86asm.SETO:
 		of, err := ex.overflow(s)
 		if err != nil {
@@ -2910,12 +3012,16 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 	}
 	if ex.probe[target] {
 		// The probe reserves the frame its caller sized in eax, leaving the return address on top of it
-		size, ok := isConst(s.getReg(x86asm.EAX))
-		if !ok {
-			return fmt.Errorf("stack probe at %08X reserves a frame of no fixed size", in.VA)
-		}
 		s.pushes = 0
-		s.regs[4] = mkBin("add", s.regs[4], IConst{-size})
+		if size, ok := isConst(s.getReg(x86asm.EAX)); ok {
+			s.regs[4] = mkBin("add", s.regs[4], IConst{-size})
+		} else {
+			s.regs[4] = mkBin("sub", s.regs[4], s.getReg(x86asm.EAX))
+		}
+		// A reservation past the entry block is an allocation the routine keeps, which moves the stack pointer for good
+		if ex.block != nil && ex.block.start != s.root {
+			s.spMoved = true
+		}
 		s.va = next
 		return nil
 	}
@@ -3027,6 +3133,9 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 	}
 	if sym := fn.Symbol; sym != nil {
 		if inlineSymbols[sym.Name] {
+			if !onFrame(s) {
+				return fmt.Errorf("inlining %s with the stack pointer outside the frame", sym.Name)
+			}
 			if next != 0 {
 				s.push(RetAddr{VA: next})
 			}
@@ -3078,6 +3187,9 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 	}
 	if len(fn.Instructions) > maxInlineSize {
 		return fmt.Errorf("callee %08X too large to inline", target)
+	}
+	if !onFrame(s) {
+		return fmt.Errorf("inlining %08X with the stack pointer outside the frame", target)
 	}
 	if next != 0 {
 		s.push(RetAddr{VA: next})
@@ -3145,6 +3257,9 @@ func (ex *Executor) pointerCall(s *execState, in *Instruction, next uint32, fp E
 	ex.pointer = fp
 	if fn := ex.d.Functions[s.currentFunction()]; fn != nil {
 		if clean := ex.cleanupAfter(fn, in.VA); clean >= 0 {
+			if s.pushes > 0 && clean > 4*s.pushes {
+				clean = 4 * s.pushes
+			}
 			return ex.opaqueCall(s, in, next, pointerCallName, clean, false, true)
 		}
 	}
@@ -3154,16 +3269,22 @@ func (ex *Executor) pointerCall(s *execState, in *Instruction, next uint32, fp E
 // Kernel exports taking a variable argument list, which their callers clean up after
 var kernelCdecl = map[string]bool{"DbgPrint": true, "RtlSprintf": true, "RtlSnprintf": true, "RtlVsprintf": true, "RtlVsnprintf": true}
 
-// Kernel exports that never return to their caller
-var kernelNoReturn = map[string]bool{"HalReturnToFirmware": true, "KeBugCheck": true, "KeBugCheckEx": true, "RtlRaiseException": true, "RtlRaiseStatus": true}
-
-// Records a kernel export call with everything pushed for it, the caller cleaning up only a variable argument list,
-// a lifted block ending at an export that never comes back
+// Records a kernel export call taking what the kernel's return removes, ending a block at one that never comes back
 func (ex *Executor) importCall(s *execState, in *Instruction, next uint32, name string) error {
-	if err := ex.opaqueCall(s, in, next, name, -1, false, kernelCdecl[name]); err != nil {
+	if ex.d.importBytes == nil {
+		return fmt.Errorf("call to kernel export %s without the kernel it comes from", name)
+	}
+	argBytes, known := ex.d.importBytes[name]
+	if !known {
+		return fmt.Errorf("kernel export %s ends in a jump the kernel image does not resolve", name)
+	}
+	if kernelCdecl[name] {
+		argBytes = -1
+	}
+	if err := ex.opaqueCall(s, in, next, name, argBytes, false, kernelCdecl[name]); err != nil {
 		return err
 	}
-	if kernelNoReturn[name] && ex.block != nil && len(s.frames) == 0 {
+	if ex.d.importNoReturn[name] && ex.block != nil && len(s.frames) == 0 {
 		ex.block.term = &blockTerm{kind: "halt"}
 		s.va = 0
 	}
@@ -3172,7 +3293,7 @@ func (ex *Executor) importCall(s *execState, in *Instruction, next uint32, name 
 
 // The function a chain of single jump thunks lands in, the function itself when it is no thunk
 func (d *Disassembly) thunkTarget(va uint32) uint32 {
-	for hops := 0; hops < 8; hops++ {
+	for hops := 0; hops < thunkHops; hops++ {
 		fn := d.Functions[va]
 		if fn == nil || len(fn.Instructions) != 1 || fn.Instructions[0].Inst.Op != x86asm.JMP {
 			return va
@@ -3199,32 +3320,44 @@ func (d *Disassembly) thunkTarget(va uint32) uint32 {
 	return va
 }
 
-// Stack bytes a function removes on return, read off its return or off the function its last jump lands in
-func (d *Disassembly) cleanupOf(fn *Function) int {
-	for hops := 0; fn != nil && hops < 8; hops++ {
+// Bytes a routine's return removes through tail jumps and pointer jumps, and whether a return settled it
+func (d *Disassembly) returnCleanup(fn *Function) (int, bool) {
+	for hops := 0; fn != nil && hops < thunkHops; hops++ {
 		for i := len(fn.Instructions) - 1; i >= 0; i-- {
 			in := &fn.Instructions[i]
 			if in.Inst.Op != x86asm.RET {
 				continue
 			}
 			if argCount(in) > 0 {
-				return int(in.Inst.Args[0].(x86asm.Imm))
+				return int(in.Inst.Args[0].(x86asm.Imm)), true
 			}
-			return 0
+			return 0, true
 		}
 		if len(fn.Instructions) == 0 {
-			return 0
+			return 0, false
 		}
 		last := &fn.Instructions[len(fn.Instructions)-1]
 		if last.Inst.Op != x86asm.JMP {
-			return 0
+			// A body running on into code another routine owns continues there
+			t := d.bodyLeak(fn)
+			if t == 0 {
+				return 0, false
+			}
+			fn = d.buildFunction(t, map[uint32]bool{})
+			continue
 		}
-		if _, isRel := last.Inst.Args[0].(x86asm.Rel); !isRel {
-			return 0
+		t := uint32(0)
+		switch a := last.Inst.Args[0].(type) {
+		case x86asm.Rel:
+			t = resolveTarget(last)
+		case x86asm.Mem:
+			// A jump through a pointer the image holds goes where the pointer points as the image loads
+			if _, isImport := d.Imports[uint32(a.Disp)]; a.Base == 0 && a.Index == 0 && a.Segment == 0 && !isImport {
+				t, _ = d.Image.ReadU32(uint32(a.Disp))
+			}
 		}
-		t := resolveTarget(last)
 		if t == 0 || t == fn.EntryVA || d.InsnByVA[t] == nil {
-			return 0
+			return 0, false
 		}
 		if d.Functions[t] == nil {
 			if built := d.buildFunction(t, map[uint32]bool{}); built != nil {
@@ -3233,7 +3366,35 @@ func (d *Disassembly) cleanupOf(fn *Function) int {
 		}
 		fn = d.Functions[t]
 	}
+	return 0, false
+}
+
+// The instruction a body runs on into past the code it owns, zero where no way out leaves it
+func (d *Disassembly) bodyLeak(fn *Function) uint32 {
+	index := fn.instructionIndex()
+	for i := range fn.Instructions {
+		in := &fn.Instructions[i]
+		switch in.Inst.Op {
+		case x86asm.RET, x86asm.IRETD, x86asm.LRET, x86asm.INT, x86asm.HLT, x86asm.JMP:
+			continue
+		case x86asm.CALL:
+			if callee := d.Functions[resolveTarget(in)]; callee != nil && d.neverReturns(callee) {
+				continue
+			}
+		}
+		next := in.VA + uint32(in.Inst.Len)
+		if _, inside := index[next]; inside || d.InsnByVA[next] == nil || d.boundaries[next] || d.Functions[next] != nil {
+			continue
+		}
+		return next
+	}
 	return 0
+}
+
+// Bytes a routine's return removes, zero where no return settles it
+func (d *Disassembly) cleanupOf(fn *Function) int {
+	n, _ := d.returnCleanup(fn)
+	return n
 }
 
 // Argument words a direct call target removes from the stack itself, -1 where neither its name nor its return says
@@ -3396,6 +3557,9 @@ func (d *Disassembly) neverReturns(fn *Function) bool {
 			break
 		}
 	}
+	if result && d.bodyLeak(fn) != 0 {
+		result = false
+	}
 	d.noReturn[fn.EntryVA] = result
 	return result
 }
@@ -3403,7 +3567,7 @@ func (d *Disassembly) neverReturns(fn *Function) bool {
 // Reports whether a function traps as soon as it is entered, following only the jumps it takes unconditionally
 func (d *Disassembly) trapsOnEntry(fn *Function) bool {
 	va := fn.EntryVA
-	for hops := 0; hops < 8; hops++ {
+	for hops := 0; hops < thunkHops; hops++ {
 		in := d.InsnByVA[va]
 		if in == nil {
 			return false
@@ -3425,6 +3589,10 @@ func (d *Disassembly) trapsOnEntry(fn *Function) bool {
 
 // Names the import a single jump function forwards to
 func (d *Disassembly) importThunk(fn *Function) (string, bool) {
+	// A jump thunk landing in the forwarding jump forwards to the same import
+	if landing := d.Functions[d.thunkTarget(fn.EntryVA)]; landing != nil {
+		fn = landing
+	}
 	if len(fn.Instructions) != 1 || fn.Instructions[0].Inst.Op != x86asm.JMP {
 		return "", false
 	}
@@ -3541,6 +3709,31 @@ var outBuffers = map[string][]outBuffer{
 	"swprintf": {{0, wideBuffer, -1, 0}}, "_snwprintf": {{0, wideBuffer, 1, 2}}, "_wcslwr": {{0, wideBuffer, -1, 0}}, "_wcsupr": {{0, wideBuffer, -1, 0}},
 	"lstrcpyW": {{0, wideBuffer, -1, 0}}, "lstrcatW": {{0, wideBuffer, -1, 0}}, "_itow": {{1, itowBuffer, -1, 0}}, "_ltow": {{1, itowBuffer, -1, 0}},
 	"memcpy": {{0, 1 << 20, 2, 1}}, "memset": {{0, 1 << 20, 2, 1}}, "XNetRandom": {{0, 1 << 16, 1, 1}},
+}
+
+// OutBuffer is memory a routine a derivation names writes through a pointer argument, a count argument sizing the
+// write in bytes and a flag argument that turns the write off when fixed nonzero
+type OutBuffer struct {
+	Arg    int // the pointer argument
+	Bytes  int // bytes written where the count argument is unknown
+	Count  int // the argument counting the bytes written, -1 where Bytes fixes the size
+	Unless int // the argument whose fixed nonzero value means the routine writes nothing, -1 where none does
+}
+
+// Bytes a named routine writes through its pointer argument on a call, nothing when its flag is fixed on
+func (ob OutBuffer) written(args []Expr) int {
+	if ob.Unless >= 0 && ob.Unless < len(args) {
+		if flag, known := isConst(args[ob.Unless]); known && flag != 0 {
+			return 0
+		}
+	}
+	if ob.Count < 0 || ob.Count >= len(args) {
+		return ob.Bytes
+	}
+	if n, known := isConst(args[ob.Count]); known {
+		return int(n)
+	}
+	return ob.Bytes
 }
 
 // Bytes a routine writes through one pointer argument of a call, its count argument deciding where it is known
@@ -3788,6 +3981,10 @@ func (ex *Executor) opaqueCall(s *execState, in *Instruction, next uint32, name 
 			if clean := ex.cleanupAfter(ex.d.Functions[s.root], in.VA); clean >= 0 {
 				words = clean / 4
 			}
+			// A cleanup shared with earlier calls removes their arguments too, this call taking only what it pushed
+			if s.pushes > 0 && words > s.pushes {
+				words = s.pushes
+			}
 		}
 	}
 	if name == pointerCallName {
@@ -3965,6 +4162,22 @@ func (ex *Executor) recordCall(s *execState, in *Instruction, next uint32, name 
 				}
 			}
 		}
+		for _, ob := range ex.OutBuffers[name] {
+			if ob.Arg >= len(args) {
+				continue
+			}
+			p, ok := asPtr(args[ob.Arg]).(Ptr)
+			if !ok {
+				continue
+			}
+			if p.Base == "stack" {
+				elems, sizes, offs := ex.stackImage(s, p, ob.Bytes)
+				s.effects[len(s.effects)-1].Buffers = append(s.effects[len(s.effects)-1].Buffers, ArgBuffer{Index: ob.Arg, Elems: elems, Sizes: sizes, Offs: offs})
+			}
+			if n := ob.written(args); n > 0 {
+				ex.forget(s, p, n)
+			}
+		}
 		ex.describeSurface(s, name, args, in.VA)
 		for i, a := range args {
 			if p, ok := a.(Ptr); ok && p.Base == "stack" {
@@ -4035,6 +4248,29 @@ func argBufferSize(name string, i int, result int) int {
 }
 
 // Reads consecutive stack entries starting at a pointer, blocks included, for call argument snapshots
+// Every element a stack buffer holds within a length, at its offset from the pointer, in offset order
+func (ex *Executor) stackImage(s *execState, p Ptr, bytes int) ([]Expr, []int, []int32) {
+	var offs []int32
+	for k, mv := range s.mem {
+		if k.base != p.Base || k.off < p.Off || int64(k.off)-int64(p.Off) >= int64(bytes) {
+			continue
+		}
+		if _, isRet := mv.v.(RetAddr); isRet {
+			continue
+		}
+		offs = append(offs, k.off-p.Off)
+	}
+	sort.Slice(offs, func(i, j int) bool { return offs[i] < offs[j] })
+	var elems []Expr
+	var sizes []int
+	for _, off := range offs {
+		mv := s.mem[memKey{p.Base, p.Off + off}]
+		elems = append(elems, mv.v)
+		sizes = append(sizes, mv.size)
+	}
+	return elems, sizes, offs
+}
+
 func (ex *Executor) stackElems(s *execState, p Ptr, max int) ([]Expr, []int) {
 	var out []Expr
 	var sizes []int
@@ -4116,6 +4352,11 @@ func (ex *Executor) fpuStep(s *execState, in *Instruction) error {
 	}
 	loadI := func() Expr {
 		a, size, _ := memOperand()
+		if size == 8 {
+			lo := ex.load(s, a, 4)
+			hi := ex.load(s, mkBin("add", a, IConst{4}), 4)
+			return mkUn("i2f", Bin{"hilo", hi, lo})
+		}
 		v := ex.load(s, a, size)
 		if size == 2 {
 			v = mkUn("sx16", v)
@@ -4179,7 +4420,13 @@ func (ex *Executor) fpuStep(s *execState, in *Instruction) error {
 		}
 	case x86asm.FIST, x86asm.FISTP:
 		a, size, _ := memOperand()
-		ex.store(s, a, size, mkUn("f2i_rn", s.st(0)), in.VA)
+		v := mkF2I(s.st(0), s.controlWord())
+		if size == 8 {
+			ex.store(s, a, 4, v, in.VA)
+			ex.store(s, mkBin("add", a, IConst{4}), 4, mkBin("sar", v, IConst{31}), in.VA)
+		} else {
+			ex.store(s, a, size, v, in.VA)
+		}
 		if op == x86asm.FISTP {
 			s.fpuPop()
 		}

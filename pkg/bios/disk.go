@@ -2,6 +2,8 @@ package bios
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -43,6 +45,7 @@ type Disk struct {
 	File       string      `json:"file"`
 	Identify   []uint16    `json:"identify"`
 	DVD        []uint16    `json:"dvd_identify"`
+	Password   []int       `json:"password"`
 }
 
 // The names the disk is written under
@@ -133,14 +136,12 @@ func partitionCreator(mm *xbe.MachineModel, img *xbe.Image, ioCreateDevice uint3
 // Runs the creator for one partition number and reads the offset, length and start the routine stores in the
 // device extension it fills, the start identified as the sector whose byte offset is the offset stored
 func runPartitionCreator(mm *xbe.MachineModel, img *xbe.Image, creator, ioCreateDevice, n uint32) (Partition, error) {
-	const scratchStack = 0x7FFF0000
 	const deviceObject = 0x7FFE0000
 	const deviceExtension = 0x7FFE1000
-	const returnTo = 0x7FFD0000
-	run := xbe.NewMachineRun(mm, img, map[string]uint32{"ESP": scratchStack})
+	run := xbe.NewMachineRun(mm, img, map[string]uint32{"ESP": xbe.ReplayStack})
 	run.Push(n)
-	run.Push(returnTo)
-	run.Stop[returnTo] = true
+	run.Push(xbe.ReplayReturn)
+	run.Stop[xbe.ReplayReturn] = true
 	extensionAt := uint32(0)
 	run.Hooks[ioCreateDevice] = func(r *xbe.MachineRun) uint32 {
 		// The kernel's device creation hands back an object whose extension pointer the caller fills through
@@ -155,7 +156,7 @@ func runPartitionCreator(mm *xbe.MachineModel, img *xbe.Image, creator, ioCreate
 		r.Regs["EAX"] = 0
 		return ret
 	}
-	if _, err := run.Run(creator, 100000); err != nil {
+	if _, err := run.Run(creator); err != nil {
 		return Partition{}, err
 	}
 	if extensionAt == 0 {
@@ -213,8 +214,8 @@ func findBytes(img *xbe.Image, needle []byte) uint32 {
 }
 
 // BuildDisk lays the partitions out as volumes, the launch partition holding the directory given and the others
-// empty, and sizes the disk to hold them
-func BuildDisk(partitions []Partition, launch uint32, dir string, hdd, dvd Identity) (*Disk, []byte, error) {
+// empty, sizes the disk to hold them and locks it with the password the kernel derives from the console's key
+func BuildDisk(partitions []Partition, launch uint32, dir string, hdd, dvd Identity, key [16]byte) (*Disk, []byte, error) {
 	var sectors uint64
 	for _, p := range partitions {
 		if end := p.Start + p.Length; end > sectors {
@@ -250,18 +251,37 @@ func BuildDisk(partitions []Partition, launch uint32, dir string, hdd, dvd Ident
 	sort.Slice(disk.Runs, func(i, j int) bool { return disk.Runs[i].Sector < disk.Runs[j].Sector })
 	disk.Identify = ataIdentify(hdd, sectors)
 	disk.DVD = atapiIdentify(dvd)
+	for _, b := range diskPassword(key, disk.Identify) {
+		disk.Password = append(disk.Password, int(b))
+	}
 	return disk, data, nil
 }
 
+// HMAC SHA1 of the console's disk key over the identify model and serial, zero padded to the password size
+func diskPassword(key [16]byte, identify []uint16) []byte {
+	mac := hmac.New(sha1.New, key[:])
+	mac.Write([]byte(identifyString(identify[27:47])))
+	mac.Write([]byte(identifyString(identify[10:20])))
+	password := make([]byte, ataPasswordBytes)
+	copy(password, mac.Sum(nil)[:ataDigestBytes])
+	return password
+}
+
+// Reads identify words back as a string, each character pair swapped and trailing spaces dropped
+func identifyString(words []uint16) string {
+	b := make([]byte, 0, len(words)*2)
+	for _, w := range words {
+		b = append(b, byte(w>>8), byte(w))
+	}
+	return string(bytes.TrimRight(b, " "))
+}
+
 // The identify words of a hard disk of the size given, addressed by logical block, moving data by direct memory
-// access, with no security feature set so the kernel neither unlocks nor locks it
+// access, with the security feature enabled and the disk locked as it powers on
 func ataIdentify(id Identity, sectors uint64) []uint16 {
 	w := make([]uint16, 256)
 	w[0] = 0x0040
-	cylinders := sectors / (16 * 63)
-	if cylinders > 16383 {
-		cylinders = 16383
-	}
+	cylinders := min(sectors/(16*63), 16383)
 	w[1], w[3], w[6] = uint16(cylinders), 16, 63
 	ataString(w[10:20], id.Serial)
 	ataString(w[23:27], id.Firmware)
@@ -285,15 +305,15 @@ func ataIdentify(id Identity, sectors uint64) []uint16 {
 	w[65], w[66], w[67], w[68] = 120, 120, 120, 120
 	w[80] = 0x001E
 	w[81] = 0x0017
-	w[82] = 0x4020
+	w[ataFeatureWord] = 0x4020 | ataSecurityFeature
 	w[83] = 0x4000
 	w[84] = 0x4000
-	w[85] = 0x0020
+	w[ataFeatureEnabledWord] = 0x0020 | ataSecurityFeature
 	w[86] = 0
 	w[87] = 0x4000
 	w[88] = 0x0407
 	w[93] = 0x6001
-	w[128] = 0
+	w[ataSecurityWord] = ataSecuritySupported | ataSecurityEnabled | ataSecurityLocked
 	w[255] = 0xA5A5
 	return w
 }

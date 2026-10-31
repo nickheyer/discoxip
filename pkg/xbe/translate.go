@@ -9,36 +9,41 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// Scratch addresses a replay of one routine runs with and the blocks it may take
+// Scratch addresses a replay of one routine runs with
 const (
-	replayStack     = 0x7FFF0000
-	replayReturn    = 0x7FFD0000
-	replayBuffer    = 0x7FFC0000
+	ReplayStack     = 0x7FFF0000
+	ReplayReturn    = 0x7FFD0000
+	ReplayBuffer    = 0x7FFC0000
 	replayProcessor = 0x7FFA0000
-	replayBlocks    = 1 << 24
 )
 
 // Bytes of the processor block a replay answers segment relative reads from
 const replayProcessorSize = 0x1000
 
-// The kernel routines serializing threads, which a single threaded replay answers at once
-var synchronization = []string{"RtlEnterCriticalSection", "RtlEnterCriticalSectionAndRegion", "RtlLeaveCriticalSection", "RtlLeaveCriticalSectionAndRegion", "KeEnterCriticalRegion", "KeLeaveCriticalRegion"}
+// ReplayArea reports whether an address lies in the scratch a replay runs with, its stack, buffers and processor block
+func ReplayArea(addr uint32) bool {
+	return addr >= replayProcessor && addr <= ReplayStack
+}
 
-// Answers each synchronization export by popping the arguments the kernel's routine pops
-func (d *Disassembly) skipSynchronization(run *MachineRun, kd *Disassembly) error {
+// Kernel exports a single threaded replay answers at once, thread serialization and interrupt level moves
+var answeredAtOnce = []string{"RtlEnterCriticalSection", "RtlEnterCriticalSectionAndRegion", "RtlLeaveCriticalSection", "RtlLeaveCriticalSectionAndRegion", "KeEnterCriticalRegion", "KeLeaveCriticalRegion", "KeRaiseIrqlToDpcLevel", "KeRaiseIrqlToSynchLevel", "KfRaiseIrql", "KfLowerIrql"}
+
+// AtOnceHooks answers each export a replay answers at once by popping the arguments the kernel's routine pops
+func AtOnceHooks(kd *Disassembly) (map[uint32]func(*MachineRun) uint32, error) {
 	byName := map[string]*Function{}
 	for _, fn := range kd.Functions {
 		if fn.Symbol != nil {
 			byName[fn.Symbol.Name] = fn
 		}
 	}
-	for _, name := range synchronization {
+	hooks := map[uint32]func(*MachineRun) uint32{}
+	for _, name := range answeredAtOnce {
 		fn, ok := byName[name]
 		if !ok {
-			return fmt.Errorf("xbe: the kernel exports no %s", name)
+			return nil, fmt.Errorf("xbe: the kernel exports no %s", name)
 		}
 		words := kd.cleanupOf(fn) / 4
-		run.Hooks[fn.EntryVA] = func(r *MachineRun) uint32 {
+		hooks[fn.EntryVA] = func(r *MachineRun) uint32 {
 			ret := r.Pop()
 			for range words {
 				r.Pop()
@@ -46,6 +51,18 @@ func (d *Disassembly) skipSynchronization(run *MachineRun, kd *Disassembly) erro
 			r.Regs["EAX"] = 0
 			return ret
 		}
+	}
+	return hooks, nil
+}
+
+// AnswerAtOnce installs the hooks answering the kernel exports a replay answers at once
+func (run *MachineRun) AnswerAtOnce(kd *Disassembly) error {
+	hooks, err := AtOnceHooks(kd)
+	if err != nil {
+		return err
+	}
+	for va, hook := range hooks {
+		run.Hooks[va] = hook
 	}
 	return nil
 }
@@ -149,7 +166,7 @@ func (d *Disassembly) sectionLoader(va, table uint32) (uint32, int, int, error) 
 // Runs a routine of the image concretely with the inputs given, kernel exports answering zero after popping the
 // arguments the kernel's own routines pop
 func (d *Disassembly) replay(mm *MachineModel, kd *Disassembly, entry uint32, args []uint32) (*MachineRun, error) {
-	return d.replayInto(NewMachineRun(mm, d.Image, map[string]uint32{"ESP": replayStack}), kd, entry, args)
+	return d.replayInto(NewMachineRun(mm, d.Image, map[string]uint32{"ESP": ReplayStack}), kd, entry, args)
 }
 
 // A copy of the disassembly over an image whose import thunks hold the kernel export addresses, as the loader fills
@@ -182,6 +199,8 @@ func (d *Disassembly) resolvedImports(exports map[uint32]uint32) (*Disassembly, 
 	}
 	rd := *d
 	rd.Image = &img
+	rd.librarySections = nil
+	rd.scans = nil
 	return &rd, nil
 }
 
@@ -267,7 +286,7 @@ func (d *Disassembly) translationPairs(kd *Disassembly, run *MachineRun, sec *Se
 	inSection := func(v uint32) bool { return v >= lo && v < hi }
 	written := map[uint32]bool{}
 	for addr := range run.Written() {
-		if addr%4 == 0 && !inSection(addr) && (addr < replayBuffer || addr >= replayStack) && inSection(run.ReadU32(addr)) {
+		if addr%4 == 0 && !inSection(addr) && (addr < ReplayBuffer || addr >= ReplayStack) && inSection(run.ReadU32(addr)) {
 			written[addr] = true
 		}
 	}
@@ -334,8 +353,8 @@ func (d *Disassembly) readTable(kd *Disassembly, run *MachineRun, reader tableRe
 			consistent := true
 			for _, e := range entries {
 				args := make([]uint32, inputs)
-				args[keySlot], args[outSlot] = e.key, replayBuffer
-				sub := NewMachineRun(mm, d.Image, map[string]uint32{"ESP": replayStack})
+				args[keySlot], args[outSlot] = e.key, ReplayBuffer
+				sub := NewMachineRun(mm, d.Image, map[string]uint32{"ESP": ReplayStack})
 				sub.Adopt(run)
 				r, err := d.replayInto(sub, kd, reader.va, args)
 				if err != nil {
@@ -343,7 +362,7 @@ func (d *Disassembly) readTable(kd *Disassembly, run *MachineRun, reader tableRe
 					break
 				}
 				key, value := run.WideString(e.key), run.WideString(e.value)
-				if r.WideString(replayBuffer) != value {
+				if r.WideString(ReplayBuffer) != value {
 					consistent = false
 					break
 				}
@@ -381,7 +400,7 @@ func (d *Disassembly) replayInto(run *MachineRun, kd *Disassembly, entry uint32,
 	run.Segments["FS"] = replayProcessor
 	run.inertRegion(replayProcessor, replayProcessorSize)
 	d.lendCode(run, kd)
-	if err := d.skipSynchronization(run, kd); err != nil {
+	if err := run.AnswerAtOnce(kd); err != nil {
 		return nil, err
 	}
 	for i, r := range regs {
@@ -394,9 +413,9 @@ func (d *Disassembly) replayInto(run *MachineRun, kd *Disassembly, entry uint32,
 	for i := len(args) - 1; i >= len(regs); i-- {
 		run.Push(args[i])
 	}
-	run.Push(replayReturn)
-	run.Stop[replayReturn] = true
-	if _, err := run.Run(entry, replayBlocks); err != nil {
+	run.Push(ReplayReturn)
+	run.Stop[ReplayReturn] = true
+	if _, err := run.Run(entry); err != nil {
 		return nil, err
 	}
 	if run.Failed != nil {

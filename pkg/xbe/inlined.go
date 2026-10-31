@@ -26,6 +26,12 @@ func mapExprWithin(e Expr, f func(Expr) (Expr, bool), done map[exprKey]Expr) Exp
 	if e == nil {
 		return nil
 	}
+	if !hasChildren(e) {
+		if m, ok := f(e); ok {
+			return m
+		}
+		return e
+	}
 	k := keyOf(e)
 	if r, ok := done[k]; ok {
 		return r
@@ -34,63 +40,119 @@ func mapExprWithin(e Expr, f func(Expr) (Expr, bool), done map[exprKey]Expr) Exp
 	if m, ok := f(e); ok {
 		r = m
 	} else {
-		sub := func(x Expr) Expr { return mapExprWithin(x, f, done) }
-		switch v := e.(type) {
-		case Load:
-			if a := sub(v.Addr); keyOf(a) != keyOf(v.Addr) {
-				v.Addr = a
-				r = v
-			}
-		case Bin:
-			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
-				r = Bin{v.Op, a, b}
-			}
-		case Un:
-			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
-				r = Un{v.Op, a}
-			}
-		case Cond:
-			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
-				r = Cond{v.Op, a, b}
-			}
-		case FCmpSet:
-			if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
-				r = FCmpSet{a, b, v.Set}
-			}
-		case Not:
-			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
-				r = Not{a}
-			}
-		case Elem:
-			if a := sub(v.A); keyOf(a) != keyOf(v.A) {
-				r = Elem{a, v.Index}
-			}
-		case Sel:
-			if c, a, b := sub(v.C), sub(v.A), sub(v.B); keyOf(c) != keyOf(v.C) || keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
-				r = Sel{c, a, b}
-			}
-		case Block:
-			elems, changed := make([]Expr, len(v.Elems)), false
-			for i, x := range v.Elems {
-				elems[i] = sub(x)
-				changed = changed || keyOf(elems[i]) != keyOf(x)
-			}
-			if changed {
-				r = Block{elems}
-			}
-		case CallResult:
-			args, this := make([]Expr, len(v.Args)), sub(v.This)
-			changed := keyOf(this) != keyOf(v.This)
-			for i, a := range v.Args {
-				args[i] = sub(a)
-				changed = changed || keyOf(args[i]) != keyOf(a)
-			}
-			if changed {
-				r = CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: this, Target: v.Target}
-			}
-		}
+		r = rebuilt(e, func(x Expr) Expr { return mapExprWithin(x, f, done) })
 	}
 	done[k] = r
+	return r
+}
+
+// FoldMemo rebuilds expressions bottom up with the result of every node kept across calls, so a chain of nodes
+// folded one longer at a time costs each node once, the nodes kept alive while their identities are remembered
+type FoldMemo struct {
+	done map[exprKey]foldEntry
+}
+
+// foldEntry is a node folded before and what it folded to
+type foldEntry struct {
+	src, out Expr
+}
+
+// NewFoldMemo starts remembering folded nodes
+func NewFoldMemo() *FoldMemo {
+	return &FoldMemo{done: map[exprKey]foldEntry{}}
+}
+
+// Len reports the nodes remembered
+func (m *FoldMemo) Len() int {
+	return len(m.done)
+}
+
+// Reset forgets every node remembered
+func (m *FoldMemo) Reset() {
+	m.done = map[exprKey]foldEntry{}
+}
+
+// Fold rebuilds an expression bottom up, f applied to each node once its children are rebuilt, a leaf without the
+// memo and every other node once however often it is shared or folded again
+func (m *FoldMemo) Fold(e Expr, f func(Expr) (Expr, bool)) Expr {
+	if e == nil {
+		return nil
+	}
+	if !hasChildren(e) {
+		if r, ok := f(e); ok {
+			return r
+		}
+		return e
+	}
+	k := keyOf(e)
+	if entry, ok := m.done[k]; ok {
+		return entry.out
+	}
+	r := rebuilt(e, func(x Expr) Expr { return m.Fold(x, f) })
+	if folded, ok := f(r); ok {
+		r = folded
+	}
+	m.done[k] = foldEntry{src: e, out: r}
+	return r
+}
+
+// A node with its children replaced through sub, the node itself where none changed
+func rebuilt(e Expr, sub func(Expr) Expr) Expr {
+	r := e
+	switch v := e.(type) {
+	case Load:
+		if a := sub(v.Addr); keyOf(a) != keyOf(v.Addr) {
+			v.Addr = a
+			r = v
+		}
+	case Bin:
+		if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+			r = Bin{v.Op, a, b}
+		}
+	case Un:
+		if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+			r = Un{v.Op, a}
+		}
+	case Cond:
+		if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+			r = Cond{v.Op, a, b}
+		}
+	case FCmpSet:
+		if a, b := sub(v.A), sub(v.B); keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+			r = FCmpSet{a, b, v.Set}
+		}
+	case Not:
+		if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+			r = Not{a}
+		}
+	case Elem:
+		if a := sub(v.A); keyOf(a) != keyOf(v.A) {
+			r = Elem{a, v.Index}
+		}
+	case Sel:
+		if c, a, b := sub(v.C), sub(v.A), sub(v.B); keyOf(c) != keyOf(v.C) || keyOf(a) != keyOf(v.A) || keyOf(b) != keyOf(v.B) {
+			r = Sel{c, a, b}
+		}
+	case Block:
+		elems, changed := make([]Expr, len(v.Elems)), false
+		for i, x := range v.Elems {
+			elems[i] = sub(x)
+			changed = changed || keyOf(elems[i]) != keyOf(x)
+		}
+		if changed {
+			r = Block{elems}
+		}
+	case CallResult:
+		args, this := make([]Expr, len(v.Args)), sub(v.This)
+		changed := keyOf(this) != keyOf(v.This)
+		for i, a := range v.Args {
+			args[i] = sub(a)
+			changed = changed || keyOf(args[i]) != keyOf(a)
+		}
+		if changed {
+			r = CallResult{Fn: v.Fn, Args: args, Seq: v.Seq, This: this, Target: v.Target}
+		}
+	}
 	return r
 }
 

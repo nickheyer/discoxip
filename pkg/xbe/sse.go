@@ -135,7 +135,10 @@ func (ex *Executor) sseStep(s *execState, in *Instruction) (bool, error) {
 		}
 	}
 	switch op {
-	case x86asm.LDMXCSR, x86asm.STMXCSR, x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.SFENCE, x86asm.EMMS:
+	case x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.SFENCE:
+		return true, nil
+	case x86asm.LDMXCSR, x86asm.STMXCSR, x86asm.EMMS:
+		ex.noteNotAvailable(s, npxUnit)
 		return true, nil
 	case x86asm.MOVAPS, x86asm.MOVUPS, x86asm.MOVNTPS, x86asm.MOVDQA, x86asm.MOVDQU:
 		if dstIsMem {

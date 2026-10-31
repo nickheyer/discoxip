@@ -41,7 +41,7 @@ func wideRegister(r x86asm.Reg) x86asm.Reg {
 func writtenRegisters(in *Instruction) []x86asm.Reg {
 	var out []x86asm.Reg
 	switch in.Inst.Op {
-	case x86asm.PUSH, x86asm.CMP, x86asm.TEST, x86asm.RET, x86asm.JMP, x86asm.NOP, x86asm.OUT, x86asm.FLD, x86asm.FILD, x86asm.FST, x86asm.FSTP, x86asm.FIST, x86asm.FISTP,
+	case x86asm.PUSH, x86asm.PUSHAD, x86asm.CMP, x86asm.TEST, x86asm.RET, x86asm.JMP, x86asm.NOP, x86asm.OUT, x86asm.FLD, x86asm.FILD, x86asm.FST, x86asm.FSTP, x86asm.FIST, x86asm.FISTP,
 		x86asm.FCOM, x86asm.FCOMP, x86asm.FCOMPP, x86asm.FUCOM, x86asm.FUCOMP, x86asm.FUCOMPP, x86asm.FICOM, x86asm.FICOMP,
 		x86asm.FADD, x86asm.FSUB, x86asm.FSUBR, x86asm.FMUL, x86asm.FDIV, x86asm.FDIVR, x86asm.FIADD, x86asm.FISUB, x86asm.FISUBR, x86asm.FIMUL, x86asm.FIDIV, x86asm.FIDIVR,
 		x86asm.FADDP, x86asm.FSUBP, x86asm.FSUBRP, x86asm.FMULP, x86asm.FDIVP, x86asm.FDIVRP, x86asm.FXCH, x86asm.FCHS, x86asm.FABS, x86asm.FLD1, x86asm.FLDZ, x86asm.FLDCW, x86asm.FNSTCW:
@@ -50,23 +50,39 @@ func writtenRegisters(in *Instruction) []x86asm.Reg {
 		return callerSaved
 	case x86asm.CDQ, x86asm.CWD:
 		return []x86asm.Reg{x86asm.EDX}
-	case x86asm.DIV, x86asm.IDIV, x86asm.MUL:
+	case x86asm.CBW, x86asm.CWDE, x86asm.LAHF, x86asm.FNSTSW:
+		return []x86asm.Reg{x86asm.EAX}
+	case x86asm.DIV, x86asm.IDIV, x86asm.MUL, x86asm.RDTSC, x86asm.RDMSR, x86asm.RDPMC:
 		return []x86asm.Reg{x86asm.EAX, x86asm.EDX}
-	case x86asm.MOVSB, x86asm.MOVSW, x86asm.MOVSD, x86asm.STOSB, x86asm.STOSW, x86asm.STOSD, x86asm.LODSB, x86asm.LODSW, x86asm.LODSD:
-		return []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.ESI, x86asm.EDI}
-	case x86asm.XCHG:
+	case x86asm.CPUID:
+		return []x86asm.Reg{x86asm.EAX, x86asm.EBX, x86asm.ECX, x86asm.EDX}
+	case x86asm.MOVSB, x86asm.MOVSW, x86asm.MOVSD, x86asm.CMPSB, x86asm.CMPSW, x86asm.CMPSD:
+		return stringRegisters(in, x86asm.ESI, x86asm.EDI)
+	case x86asm.STOSB, x86asm.STOSW, x86asm.STOSD, x86asm.SCASB, x86asm.SCASW, x86asm.SCASD, x86asm.INSB, x86asm.INSW, x86asm.INSD:
+		return stringRegisters(in, x86asm.EDI)
+	case x86asm.LODSB, x86asm.LODSW, x86asm.LODSD:
+		return stringRegisters(in, x86asm.EAX, x86asm.ESI)
+	case x86asm.OUTSB, x86asm.OUTSW, x86asm.OUTSD:
+		return stringRegisters(in, x86asm.ESI)
+	case x86asm.LOOP, x86asm.LOOPE, x86asm.LOOPNE:
+		return []x86asm.Reg{x86asm.ECX}
+	case x86asm.POPAD:
+		return []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX, x86asm.EBX, x86asm.EBP, x86asm.ESI, x86asm.EDI}
+	case x86asm.ENTER, x86asm.LEAVE:
+		return []x86asm.Reg{x86asm.EBP}
+	case x86asm.XCHG, x86asm.XADD:
 		for _, a := range in.Inst.Args {
 			if r, ok := a.(x86asm.Reg); ok {
 				out = append(out, wideRegister(r))
 			}
 		}
 		return out
+	case x86asm.CMPXCHG:
+		out = append(out, x86asm.EAX)
 	case x86asm.IMUL:
 		if argCount(in) == 1 {
 			return []x86asm.Reg{x86asm.EAX, x86asm.EDX}
 		}
-	case x86asm.FNSTSW:
-		return []x86asm.Reg{x86asm.EAX}
 	}
 	if len(in.Inst.Args) > 0 {
 		if r, ok := in.Inst.Args[0].(x86asm.Reg); ok {
@@ -74,6 +90,14 @@ func writtenRegisters(in *Instruction) []x86asm.Reg {
 		}
 	}
 	return out
+}
+
+// The pointer and data registers of a string instruction, with the count under a repeat prefix
+func stringRegisters(in *Instruction, regs ...x86asm.Reg) []x86asm.Reg {
+	if hasRep(in) {
+		return append(regs, x86asm.ECX)
+	}
+	return regs
 }
 
 // Reports whether an instruction copies one register to another
@@ -384,7 +408,7 @@ func (d *Disassembly) namesObject(va uint32) bool {
 // Reports whether an address lies in a writable data section
 func (d *Disassembly) isDataAddress(va uint32) bool {
 	sec := d.sectionOf(va)
-	return sec != nil && sec.Flags&0x1 != 0
+	return sec != nil && sec.Writable()
 }
 
 // Lists the registers an instruction reads, a prologue save of a callee owned register reading nothing
@@ -406,16 +430,36 @@ func registersRead(in *Instruction, prologueSave bool) []x86asm.Reg {
 		return nil
 	}
 	switch in.Inst.Op {
-	case x86asm.CDQ, x86asm.CWD:
+	case x86asm.CDQ, x86asm.CWD, x86asm.CBW, x86asm.CWDE:
 		return []x86asm.Reg{x86asm.EAX}
-	case x86asm.DIV, x86asm.IDIV, x86asm.MUL:
+	case x86asm.DIV, x86asm.IDIV:
 		out = append(out, x86asm.EAX, x86asm.EDX)
-	case x86asm.MOVSB, x86asm.MOVSW, x86asm.MOVSD:
-		return []x86asm.Reg{x86asm.ECX, x86asm.ESI, x86asm.EDI}
-	case x86asm.STOSB, x86asm.STOSW, x86asm.STOSD:
-		return []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDI}
+	case x86asm.MUL:
+		out = append(out, x86asm.EAX)
+	case x86asm.MOVSB, x86asm.MOVSW, x86asm.MOVSD, x86asm.CMPSB, x86asm.CMPSW, x86asm.CMPSD:
+		return stringRegisters(in, x86asm.ESI, x86asm.EDI)
+	case x86asm.STOSB, x86asm.STOSW, x86asm.STOSD, x86asm.SCASB, x86asm.SCASW, x86asm.SCASD:
+		return stringRegisters(in, x86asm.EAX, x86asm.EDI)
 	case x86asm.LODSB, x86asm.LODSW, x86asm.LODSD:
-		return []x86asm.Reg{x86asm.ESI}
+		return stringRegisters(in, x86asm.ESI)
+	case x86asm.INSB, x86asm.INSW, x86asm.INSD:
+		return stringRegisters(in, x86asm.EDX, x86asm.EDI)
+	case x86asm.OUTSB, x86asm.OUTSW, x86asm.OUTSD:
+		return stringRegisters(in, x86asm.EDX, x86asm.ESI)
+	case x86asm.CPUID:
+		return []x86asm.Reg{x86asm.EAX, x86asm.ECX}
+	case x86asm.RDMSR, x86asm.RDPMC, x86asm.LOOP, x86asm.LOOPE, x86asm.LOOPNE:
+		return []x86asm.Reg{x86asm.ECX}
+	case x86asm.RDTSC, x86asm.POPAD:
+		return nil
+	case x86asm.PUSHAD:
+		return []x86asm.Reg{x86asm.EAX, x86asm.ECX, x86asm.EDX, x86asm.EBX, x86asm.EBP, x86asm.ESI, x86asm.EDI}
+	case x86asm.XLATB:
+		return []x86asm.Reg{x86asm.EAX, x86asm.EBX}
+	case x86asm.LEAVE:
+		return []x86asm.Reg{x86asm.EBP}
+	case x86asm.CMPXCHG:
+		out = append(out, x86asm.EAX)
 	case x86asm.PUSH:
 		if prologueSave {
 			return nil

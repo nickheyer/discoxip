@@ -83,12 +83,16 @@ func DisassembleKernel(img *Image, exports map[uint32]uint32) (*Disassembly, err
 			continue
 		}
 		fn := d.Functions[va]
+		if d.pointsIntoImage(va) {
+			delete(d.Functions, va)
+			continue
+		}
 		if fn == nil {
 			if d.InsnByVA[va] == nil {
 				continue
 			}
 			fn = d.buildFunction(va, known)
-			if fn == nil || !plausibleStart(fn) {
+			if fn == nil || !d.plausibleStart(fn) {
 				continue
 			}
 			d.Functions[va] = fn
@@ -98,7 +102,7 @@ func DisassembleKernel(img *Image, exports map[uint32]uint32) (*Disassembly, err
 					callee.CalledBy = append(callee.CalledBy, va)
 				}
 			}
-		} else if !plausibleStart(fn) {
+		} else if !d.plausibleStart(fn) {
 			delete(d.Functions, va)
 			continue
 		}
@@ -108,10 +112,47 @@ func DisassembleKernel(img *Image, exports map[uint32]uint32) (*Disassembly, err
 			continue
 		}
 		// The export's own return names the bytes it removes, the variable argument ones leaving that to the caller
-		sym := Symbol{VA: va, Raw: name, Name: name, Lib: "kernel", ArgBytes: d.cleanupOf(fn), Cdecl: kernelCdecl[name]}
+		argBytes := -1
+		if n, settled := d.returnCleanup(fn); settled {
+			argBytes = n
+		}
+		sym := Symbol{VA: va, Raw: name, Name: name, Lib: "kernel", ArgBytes: argBytes, Cdecl: kernelCdecl[name]}
 		fn.Name, fn.Symbol = name, &sym
 	}
+	// An export that never comes back takes the stack words its body reads, no return settling them
+	for _, fn := range d.Functions {
+		if fn.Symbol != nil && fn.Symbol.Lib == "kernel" && fn.Symbol.ArgBytes < 0 && d.neverReturns(fn) {
+			fn.Symbol.ArgBytes = 4 * d.stackInputs(fn)
+		}
+	}
 	return d, nil
+}
+
+// Takes the stack bytes each kernel export removes and which exports never come back, for the calls the image makes
+func (d *Disassembly) LearnImports(kd *Disassembly) {
+	d.importBytes, d.importNoReturn = map[string]int{}, map[string]bool{}
+	for _, fn := range kd.Functions {
+		if fn.Symbol == nil || fn.Symbol.Lib != "kernel" || fn.Symbol.ArgBytes < 0 {
+			continue
+		}
+		for _, name := range append([]string{fn.Symbol.Name}, fn.Symbol.Alternates...) {
+			d.importBytes[name] = fn.Symbol.ArgBytes
+			if kd.neverReturns(fn) {
+				d.importNoReturn[name] = true
+			}
+		}
+	}
+}
+
+// Reports whether an address opens with two aligned words pointing into the image, as a table of pointers does
+func (d *Disassembly) pointsIntoImage(va uint32) bool {
+	for i := uint32(0); i < 2; i++ {
+		w, ok := d.Image.ReadU32(va + 4*i)
+		if !ok || d.sectionOf(w) == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // DeriveKernel lifts every export that is a routine and every routine those reach, block by block
@@ -198,6 +239,7 @@ func DeriveKernel(d *Disassembly, exports map[uint32]uint32) (*KernelModel, erro
 type KernelInput struct {
 	Image   *Image
 	Exports map[uint32]uint32
+	EEPROM  []byte
 }
 
 // Lifts the kernel and joins its routines, names, exports and memory to the model beside the dashboard's

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nickheyer/discoxip/pkg/bios"
+	"github.com/nickheyer/discoxip/pkg/web"
 	"github.com/nickheyer/discoxip/pkg/xbe"
 	"github.com/spf13/cobra"
 )
@@ -16,7 +18,7 @@ import (
 var xbeDisasmOutput string
 
 func init() {
-	xbeCmd := &cobra.Command{
+	xbeCmd = &cobra.Command{
 		Use:   "xbe",
 		Short: "Xbox executable analysis",
 	}
@@ -43,6 +45,7 @@ func init() {
 	}
 	disasmCmd.Flags().StringVarP(&xbeDisasmOutput, "output", "o", "", "output file (default: input with .c extension)")
 	matsCmd.Flags().BoolVarP(&xbeMaterialsVerbose, "verbose", "v", false, "print every apply path")
+	addKernelFlags(matsCmd)
 
 	symbolsCmd := &cobra.Command{
 		Use:   "symbols <file.xbe>",
@@ -66,10 +69,22 @@ func init() {
 		Args:  cobra.MinimumNArgs(2),
 		RunE:  runXBELift,
 	}
+	addKernelFlags(liftCmd)
 
-	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, symbolsCmd, renderCmd, liftCmd)
+	programCmd := &cobra.Command{
+		Use:   "program <file.xbe>",
+		Short: "Replay a standalone executable to its first frame and list what it loads",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runXBEProgram,
+	}
+	programCmd.Flags().StringVarP(&xbeProgramOutput, "output", "o", "", "model file (default: none)")
+	addKernelFlags(programCmd)
+
+	xbeCmd.AddCommand(infoCmd, matsCmd, disasmCmd, symbolsCmd, renderCmd, liftCmd, programCmd)
 	rootCmd.AddCommand(xbeCmd)
 }
+
+var xbeCmd *cobra.Command
 
 func runXBEInfo(cmd *cobra.Command, args []string) error {
 	img, err := xbe.Open(args[0])
@@ -100,6 +115,15 @@ func runXBEMaterials(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	kernel, _, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	kd, err := xbe.DisassembleKernel(kernel.Image, kernel.Exports)
+	if err != nil {
+		return err
+	}
+	d.LearnImports(kd)
 	ms, err := xbe.DeriveMaterials(d)
 	if err != nil {
 		return err
@@ -232,7 +256,7 @@ func runXBERender(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	kernel, err := loadKernel()
+	kernel, _, err := loadKernel()
 	if err != nil {
 		return err
 	}
@@ -269,6 +293,15 @@ func runXBELift(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	kernel, _, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	kd, err := xbe.DisassembleKernel(kernel.Image, kernel.Exports)
+	if err != nil {
+		return err
+	}
+	d.LearnImports(kd)
 	ex := xbe.NewExecutor(d)
 	for _, a := range args[1:] {
 		var va uint32
@@ -286,4 +319,93 @@ func runXBELift(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+var xbeProgramOutput string
+
+// Replays an executable's startup and prints every section, texture, buffer, table, shader and draw it found
+func runXBEProgram(cmd *cobra.Command, args []string) error {
+	img, err := xbe.Open(args[0])
+	if err != nil {
+		return err
+	}
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return err
+	}
+	kernel, _, err := loadKernel()
+	if err != nil {
+		return err
+	}
+	pm, err := xbe.DeriveProgram(d, kernel)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("main %08X, launchers %X run from frames %v, %dx%d back buffer format %02X, sections %v\n", pm.Main, pm.Launchers, pm.RunFrames, pm.Width, pm.Height, pm.BackBuffer, pm.Sections)
+	for _, t := range pm.Textures {
+		fmt.Printf("texture %08X %-16s %4dx%-4d levels %2d format %02X cube %v usage %X\n", t.Object, t.Section, t.Width, t.Height, t.Levels, t.Format, t.Cube, t.Usage)
+	}
+	for _, b := range pm.Buffers {
+		fmt.Printf("%-6s buffer %08X %-16s %d bytes\n", b.Kind, b.Object, b.Section, b.Size)
+	}
+	for _, t := range pm.Tables {
+		fmt.Printf("table %08X %-16s offset %d, %d bytes\n", t.Address, t.Section, t.Offset, t.Size)
+	}
+	for _, s := range pm.Shaders {
+		elements := 0
+		if s.Declaration != nil {
+			elements = len(s.Declaration.Elements)
+		}
+		fmt.Printf("shader %X declaration elements %d program %v\n", s.Handle, elements, s.Program != nil)
+	}
+	for _, s := range pm.Pixel {
+		fmt.Printf("pixel shader %X definition %d words\n", s.Handle, len(s.Def))
+	}
+	for _, dr := range pm.Draws {
+		if dr.Kind == "clear" {
+			fmt.Printf("clear frame %d target %08X flags %X color %08X z %08X stencil %X rects %d\n", dr.Frame, dr.Target, dr.Flags, dr.Color, dr.Z, dr.Stencil, len(dr.Rects))
+			continue
+		}
+		fmt.Printf("draw frame %d target %08X shader %X pixel %X stream %08X stride %d primitive %d start %d count %d indices %d textures %X constants %d states %d\n", dr.Frame, dr.Target, dr.Shader, dr.PixelShader, dr.Stream, dr.Stride, dr.Primitive, dr.Start, dr.Count, len(dr.Indices), dr.Textures, len(dr.Constants), len(dr.States))
+	}
+	if xbeProgramOutput != "" {
+		data, err := json.MarshalIndent(pm, "", " ")
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(xbeProgramOutput), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(xbeProgramOutput, data, 0o644)
+	}
+	return nil
+}
+
+var xbeRuntimeBuild string
+
+func init() {
+	runtimeCmd := &cobra.Command{
+		Use:   "runtime <file.xbe>",
+		Short: "Translate the executable into the page's runtime inside a build's web directory",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runXBERuntime,
+	}
+	runtimeCmd.Flags().StringVar(&xbeRuntimeBuild, "build", "", "build output directory holding .extracted and web (required)")
+	runtimeCmd.MarkFlagRequired("build")
+	addKernelFlags(runtimeCmd)
+	xbeCmd.AddCommand(runtimeCmd)
+}
+
+// Rewrites a build's runtime, the console derived and the loader, the kernel and the executable lifted again
+func runXBERuntime(cmd *cobra.Command, args []string) error {
+	d, err := disassemble(args[0])
+	if err != nil {
+		return err
+	}
+	bank, mcpx, err := loadBoot()
+	if err != nil {
+		return err
+	}
+	webDir := filepath.Join(xbeRuntimeBuild, "web")
+	return web.WriteRuntime(webDir, web.RuntimeInput{Dash: d, Bank: bank, MCPX: mcpx, Console: bios.DefaultConsole(), ConsoleDir: filepath.Dir(args[0])})
 }

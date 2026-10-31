@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/nickheyer/discoxip/pkg/web"
 )
 
 type sampleBuild struct {
@@ -37,8 +40,8 @@ var sampleBuilds = []sampleBuild{
 			`settings_language.xip`, `settings_list.xip`, `settings_panel.xip`, `settings_parental.xip`, `settings_timezone.xip`,
 			`settings_video.xip`, `xbox book.xtf`, `xbox.xtf`, `xboxdash.xbe`,
 		},
-		sceneErrors:  []string{"00052B0C", "000B0350"},
-		kernelErrors: []string{"IoFileObjectType"},
+		sceneErrors:  []string{},
+		kernelErrors: []string{},
 	},
 	{
 		source: "sample/5659", bios: "kernels/5713_orig.bin", mcpx: "kernels/mcpx-1.1.bin",
@@ -58,7 +61,7 @@ var sampleBuilds = []sampleBuild{
 			`xodash\media\content\savedgame\saveimage.xbx`, `xodash\media\content\savedgame\titleimage.xbx`,
 			`xodash\media\content\savedgame\titlemeta.xbx`, `xodash\update.xbe`, `xodash\xonlinedash.xbe`,
 		},
-		sceneErrors:  []string{"0006D774", "0006FA2C", "000728D2", "00073658", "000777A8", "000C5F25", "0011A2EC", "0011CA15", "0011D068", "00129BDD", "0013ECAC"},
+		sceneErrors:  []string{},
 		kernelErrors: []string{},
 	},
 }
@@ -79,7 +82,21 @@ func TestSamplesBuild(t *testing.T) {
 			checkSampleConfig(t, sb, filepath.Join(out, "web", "data"))
 			checkSampleRender(t, sb, filepath.Join(out, "web", "data"))
 			checkSampleFiles(t, sb, filepath.Join(out, "web"))
+			checkSampleBoot(t, filepath.Join(out, "web"))
 		})
+	}
+}
+
+// The page must boot the console and run the executable without stopping
+func checkSampleBoot(t *testing.T, webDir string) {
+	t.Helper()
+	outcome, err := web.RunHeadless(webDir, 20*time.Minute)
+	if err != nil {
+		t.Fatalf("headless run: %v\n%s", err, outcome)
+	}
+	last := outcome[strings.LastIndex(outcome, "\n")+1:]
+	if !strings.HasPrefix(last, "still running after") || !strings.Contains(last, "running the executable") {
+		t.Errorf("the page did not run the executable: %s", last)
 	}
 }
 

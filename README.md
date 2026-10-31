@@ -24,9 +24,10 @@ discoxip bios boot <flash.bin> --mcpx <mcpx.bin> --launch <dir> -o <dir>
 
 discoxip xbe info <file.xbe>
 discoxip xbe symbols <file.xbe>
-discoxip xbe materials <file.xbe> [-v]
+discoxip xbe materials <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-v]
 discoxip xbe render <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-o <file.json>]
-discoxip xbe lift <file.xbe> <va>...
+discoxip xbe lift <file.xbe> <va>... --bios <flash.bin> --mcpx <mcpx.bin>
+discoxip xbe program <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-o <file.json>]
 discoxip xbe disasm <file.xbe> [-o <file.c>]
 
 discoxip scene info <file.xap> --xbe <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin>
@@ -41,6 +42,15 @@ discoxip buffer export <file.vb> <file.ib> --xbe <file.xbe> --bios <flash.bin> -
 discoxip texture info|export <file.xbx>
 discoxip texture export-all <directory>
 discoxip font info|export <file.xtf>
+```
+
+## Controls
+```
+Arrows             D-pad          Enter or A    A         Backspace or B   B
+X, Y               X, Y           Space         Start     Escape           Back
+Q, E               White, Black   Z, C          triggers  V, N             thumb clicks
+I J K L            left stick     Numpad 8 4 5 6  right stick
+Gamepads use the browser's standard mapping
 ```
 
 ## Development

@@ -947,7 +947,7 @@ func (d *Disassembly) symbolicPaths(va uint32) ([]Path, bool) {
 		return nil, false
 	}
 	ex := NewExecutorShared(d.baseExecutor())
-	ex.PathLimit, ex.StepLimit = 64, 20000
+	ex.PathLimit, ex.StepLimit = DerivePaths, DeriveSteps
 	for _, c := range d.plainCallees(va) {
 		ex.Opaque[c] = true
 	}

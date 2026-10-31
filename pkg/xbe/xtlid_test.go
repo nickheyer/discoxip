@@ -60,7 +60,7 @@ func TestNameXTLID(t *testing.T) {
 	if other := mustFunction(t, d, at["other"]); other.Symbol != nil || other.Name != "" {
 		t.Fatalf("other %q %+v", other.Name, other.Symbol)
 	}
-	if !d.libraries()[d.sectionOf(at["probe"])] {
+	if !d.libraries()[d.sectionOf(at["probe"]).VirtualAddr] {
 		t.Fatal("identity named function does not mark its section as a library")
 	}
 }

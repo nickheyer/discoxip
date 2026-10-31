@@ -393,12 +393,16 @@ func TestDecodeVertexDeclarationEveryType(t *testing.T) {
 			t.Errorf("type %02X decodes to %+v stride %d", c.code, decl.Elements, decl.Stride)
 		}
 	}
+	img := declImage(t, vsdStream(0), vsdData(0x12, 5), 2<<29|1<<28|3<<16, vsdData(0x22, 6), 0xFFFFFFFF)
+	decl, err := img.DecodeVertexDeclaration(0x14000)
+	if err != nil || len(decl.Elements) != 2 || decl.Elements[1].Offset != 16 || decl.Stride != 24 {
+		t.Errorf("skipping three words decodes to %+v: %v", decl, err)
+	}
 }
 
 func TestDecodeVertexDeclarationErrors(t *testing.T) {
 	cases := map[string][]uint32{
 		"uses stream 1":    {vsdStream(1), vsdData(0x12, 0), 0xFFFFFFFF},
-		"skips data":       {vsdStream(0), vsdData(0x12, 0) | 1<<28, 0xFFFFFFFF},
 		"has data type 99": {vsdStream(0), vsdData(0x99, 0), 0xFFFFFFFF},
 		"has token type 3": {vsdStream(0), 3 << 29, 0xFFFFFFFF},
 		"has no end token": make([]uint32, 70),

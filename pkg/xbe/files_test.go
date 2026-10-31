@@ -81,7 +81,7 @@ func TestWideStrings(t *testing.T) {
 
 func TestNamedFiles(t *testing.T) {
 	img, _ := fileStringsImage(t)
-	if got := img.NamedFiles(".xip"); !equalStrings(got, []string{"menu.xip", "x.xip", "ken.xip"}) {
+	if got := img.NamedFiles(".xip"); !equalStrings(got, []string{"menu.xip", "logo.xip", "x.xip", "ken.xip", "extra.xip", "deep.xip"}) {
 		t.Fatalf("xip files %v", got)
 	}
 	if got := img.NamedFiles(".XTF"); !equalStrings(got, []string{"font.xtf"}) {

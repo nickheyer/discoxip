@@ -587,16 +587,13 @@ func TestCopyConsoleFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Fatalf("count %d, want 3", count)
+	if count != 4 {
+		t.Fatalf("count %d, want 4", count)
 	}
-	for rel, body := range map[string]string{"fonts/xbox.xtf": "one", "fonts/big.xtf": "two", "xarial.xtf": "four"} {
+	for rel, body := range map[string]string{"fonts/xbox.xtf": "one", "fonts/big.xtf": "two", "xarial.xtf": "four", "sounds/beep.wav": "three"} {
 		if got := string(readFile(t, filepath.Join(dst, rel))); got != body {
 			t.Errorf("%s holds %q, want %q", rel, got, body)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(dst, "sounds", "beep.wav")); !os.IsNotExist(err) {
-		t.Errorf("a wav file was copied, stat err %v", err)
 	}
 	if _, err := copyConsoleFiles(src, dst, []string{"gone.xtf"}); err == nil || !strings.HasPrefix(err.Error(), "web: copying console files: ") {
 		t.Errorf("missing file error = %v", err)
@@ -1028,8 +1025,8 @@ func TestStaticFiles(t *testing.T) {
 	}
 	for _, want := range []string{
 		"<title>Xbox Dashboard</title>",
-		`<script type="module" src="runtime.js"></script>`,
-		`"three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"`,
+		`<script src="runtime.js"></script>`,
+		`load: (name) => new Promise(`,
 		`<div id="loading">Loading Xbox Dashboard...</div>`,
 	} {
 		if !strings.Contains(page, want) {

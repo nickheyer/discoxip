@@ -209,8 +209,10 @@ func buildImage(t *testing.T, text, rdata, data []chunk, imports []string) *test
 		}
 	}
 	ti := &testImage{img: img, d: d, labels: labels, thunk: map[string]uint32{}}
+	d.importBytes, d.importNoReturn = map[string]int{}, map[string]bool{}
 	for _, name := range imports {
 		ti.thunk[name] = labels["thunk."+name]
+		d.importBytes[name] = -1
 	}
 	return ti
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/buffer"
+	"github.com/nickheyer/discoxip/pkg/extract"
 	"github.com/nickheyer/discoxip/pkg/texture"
 	"github.com/nickheyer/discoxip/pkg/xap"
 )
@@ -246,7 +247,7 @@ func (md *MeshData) Vertices(layouts map[uint32]Layout) ([]buffer.Vertex, error)
 
 // loadManifest reads _meshes.json from the scene directory.
 func loadManifest(dir string) (map[string]meshManifestEntry, error) {
-	path := filepath.Join(dir, "_meshes.json")
+	path := filepath.Join(dir, extract.MeshManifest)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("scene: reading mesh manifest: %w", err)

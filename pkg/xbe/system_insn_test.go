@@ -11,7 +11,7 @@ import (
 
 func systemKernelText() []chunk {
 	return []chunk{
-		lbl("kSys"), by(0xFA), by(0x0F, 0x06), by(0x0F, 0x01, 0x38), by(0xFD), by(0xFC), by(0x6C), by(0x6E), by(0xF2, 0xAE), by(0xF3, 0xA6),
+		lbl("kSys"), by(0xFA), by(0x0F, 0x06), by(0x0F, 0x01, 0x38), by(0xFD), lbl("kSysCld"), by(0xFC), lbl("kSysStrings"), by(0x6C), by(0x6E), by(0xF2, 0xAE), by(0xF3, 0xA6),
 		by(0x0F, 0x01, 0x10), by(0x0F, 0x01, 0x18), by(0x0F, 0x00, 0xD8), by(0x0F, 0x22, 0xC0), by(0x0F, 0xAE, 0x00), by(0x0F, 0xAE, 0x08), by(0xDD, 0x30), by(0xDD, 0x20),
 		by(0xD9, 0x38), by(0xD9, 0x28), by(0xDB, 0xE3), by(0xDB, 0xE2), by(0x0F, 0x30), by(0x0F, 0x20, 0xC0), by(0x0F, 0x32), by(0x0F, 0x31), by(0x0F, 0xA2),
 		by(0x9C), by(0x9D), lbl("kSysSti"), by(0xFB), lbl("kSysRet"), ret(), pad(),
@@ -54,7 +54,8 @@ func systemImage(t *testing.T) *testImage {
 	return buildImage(t, systemText(), nil, []chunk{lbl("gsys"), word(0)}, nil)
 }
 
-// Checks every processor instruction the kernel uses records the call named for it
+// Checks every processor instruction the kernel uses records the call named for it, each direction change and the
+// interrupt enable ending a block
 func TestSystemInstructionCallNames(t *testing.T) {
 	ti := buildKernelImage(t, systemKernelText(), []chunk{lbl("ksdata"), rep(16, 0)}, map[uint32]string{104: "kSys"})
 	mm := machineModel(t, ti, "kSys")
@@ -62,8 +63,13 @@ func TestSystemInstructionCallNames(t *testing.T) {
 		t.Fatalf("errors %v", mm.Errors)
 	}
 	blocks, _ := mm.RoutineBlocks(ti.at(t, "kSys"))
-	if len(blocks) != 3 || blocks[1].va != ti.at(t, "kSysSti") || blocks[2].va != ti.at(t, "kSysRet") {
-		t.Fatalf("%d blocks over the routine", len(blocks))
+	starts := []uint32{}
+	for _, b := range blocks {
+		starts = append(starts, b.va)
+	}
+	wantStarts := []uint32{ti.at(t, "kSys"), ti.at(t, "kSysCld"), ti.at(t, "kSysStrings"), ti.at(t, "kSysSti"), ti.at(t, "kSysRet")}
+	if !reflect.DeepEqual(starts, wantStarts) {
+		t.Fatalf("blocks start at %X, want %X", starts, wantStarts)
 	}
 	names := map[string]int{}
 	for _, b := range blocks {
@@ -77,14 +83,14 @@ func TestSystemInstructionCallNames(t *testing.T) {
 		cpuCLI: 1, cpuCLTS: 1, cpuInvlpg: 1, cpuCLD: 1, cpuSTD: 1, cpuINS: 1, cpuOUTS: 1, cpuSCAS: 1, cpuCMPS: 1,
 		cpuWRMSR: 1, cpuRDMSRLo: 1, cpuRDMSRHi: 1, cpuRDTSCLo: 1, cpuRDTSCHi: 1,
 		cpuCPUID + "EAX": 1, cpuCPUID + "EBX": 1, cpuCPUID + "ECX": 1, cpuCPUID + "EDX": 1,
-		cpuFXSave: 1, cpuFXRstor: 1, cpuFNSave: 1, cpuFRstor: 1, cpuFRstorST: 24,
+		cpuFXSave: 1, cpuFXRstor: 1, cpuFXRstorST: 8, cpuFNSave: 1, cpuFRstor: 1, cpuFRstorST: 16,
 		cpuLGDT: 1, cpuLIDT: 1, cpuLTR: 1, cpuWriteCR: 1, cpuReadCR: 1,
-		cpuFNSTCW: 1, cpuFLDCW: 1, cpuFNINIT: 1, cpuFNCLEX: 1, cpuPushFD: 1, cpuPopFD: 1, cpuSTI: 1,
+		cpuFLDCW: 1, cpuFNINIT: 1, cpuFNCLEX: 1, cpuPushFD: 1, cpuPopFD: 1, cpuSTI: 1,
 	}
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("recorded calls %v\nwant %v", names, want)
 	}
-	constants := []string{cpuCLI, cpuSTI, cpuPushFD, cpuPopFD, cpuIRETD, cpuINS, cpuOUTS, cpuSCAS, cpuCMPS, cpuWRMSR, cpuRDMSRLo, cpuRDMSRHi, cpuRDTSCLo, cpuRDTSCHi, cpuCPUID, cpuFXSave, cpuFXRstor, cpuFNSave, cpuFRstor, cpuFRstorST, cpuLGDT, cpuLIDT, cpuLTR, cpuWriteCR, cpuReadCR, cpuInvlpg, cpuCLD, cpuSTD, cpuCLTS, cpuFNSTCW, cpuFLDCW, cpuFNINIT, cpuFNCLEX}
+	constants := []string{cpuCLI, cpuSTI, cpuPushFD, cpuPopFD, cpuIRETD, cpuINS, cpuOUTS, cpuSCAS, cpuCMPS, cpuWRMSR, cpuRDMSRLo, cpuRDMSRHi, cpuRDTSCLo, cpuRDTSCHi, cpuCPUID, cpuFXSave, cpuFXRstor, cpuFXRstorST, cpuFNSave, cpuFRstor, cpuFRstorST, cpuLGDT, cpuLIDT, cpuSGDT, cpuSIDT, cpuLTR, cpuWriteCR, cpuReadCR, cpuInvlpg, cpuCLD, cpuSTD, cpuCLTS, cpuFNSTCW, cpuFLDCW, cpuFNINIT, cpuFNCLEX}
 	seen := map[string]bool{}
 	for _, c := range constants {
 		if !strings.HasPrefix(c, "cpu_") || seen[c] {
@@ -92,11 +98,11 @@ func TestSystemInstructionCallNames(t *testing.T) {
 		}
 		seen[c] = true
 	}
-	if len(seen) != 33 {
-		t.Errorf("%d processor call names, want 33", len(seen))
+	if len(seen) != 36 {
+		t.Errorf("%d processor call names, want 36", len(seen))
 	}
-	first := blocks[0]
-	for _, e := range first.effects {
+	body := blocks[2]
+	for _, e := range body.effects {
 		switch e.Fn {
 		case cpuWriteCR:
 			exprEq(t, "control register number", e.Args[0], IConst{0})
@@ -108,7 +114,7 @@ func TestSystemInstructionCallNames(t *testing.T) {
 			exprEq(t, "buffer", e.Args[1], Sym{"reg.EDI"})
 			exprEq(t, "count", e.Args[2], IConst{1})
 			exprEq(t, "size", e.Args[3], IConst{1})
-			exprEq(t, "step", e.Args[4], IConst{1})
+			exprEq(t, "step", e.Args[4], Sym{"dfstep1"})
 		case cpuSCAS:
 			exprEq(t, "repne", e.Args[5], IConst{1})
 		case cpuCMPS:
@@ -119,10 +125,10 @@ func TestSystemInstructionCallNames(t *testing.T) {
 			exprEq(t, "read control register number", e.Args[0], IConst{0})
 		}
 	}
-	if len(first.fpu) != 8 {
-		t.Fatalf("x87 stack holds %d values", len(first.fpu))
+	if len(body.fpu) != 8 {
+		t.Fatalf("x87 stack holds %d values", len(body.fpu))
 	}
-	for i, v := range first.fpu {
+	for i, v := range body.fpu {
 		cr, ok := v.(CallResult)
 		if !ok || cr.Fn != cpuFRstorST || !equalExprs(cr.Args[1], IConst{uint32(i)}) {
 			t.Errorf("st%d restored as %s", i, ExprString(v))

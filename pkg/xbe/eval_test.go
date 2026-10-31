@@ -105,6 +105,16 @@ func TestMachineRunEvalNodes(t *testing.T) {
 		{Not{IConst{7}}, 0},
 		{Sel{IConst{1}, IConst{10}, IConst{20}}, 10},
 		{Sel{IConst{0}, IConst{10}, IConst{20}}, 20},
+		{Bin{"fadd", FConst{1}, FConst{0.5}}, 0x3FC00000},
+		{Un{"i2f", IConst{1}}, 0x3F800000},
+		{FConst{1}, 0x3F800000},
+		{Un{"f2i", FConst{-2.75}}, 0xFFFFFFFE},
+		{Un{"f2i_rn", FConst{2.5}}, 2},
+		{Bin{"f2icw", FConst{2.75}, IConst{fpuDefaultControlWord | fpuRoundTruncate<<fpuRoundingShift}}, 2},
+		{Bin{"f2icw", FConst{2.25}, IConst{fpuDefaultControlWord | fpuRoundUp<<fpuRoundingShift}}, 3},
+		{Bin{"f2icw", FConst{2.75}, IConst{fpuDefaultControlWord}}, 3},
+		{FCmpSet{FConst{1}, FConst{2}, 1}, 1},
+		{FCmpSet{FConst{1}, FConst{2}, 6}, 0},
 	}
 	for _, tc := range cases {
 		if got := evalOf(t, r, tc.e); got != tc.want {
@@ -123,10 +133,9 @@ func TestMachineRunEvalNodes(t *testing.T) {
 		{Bin{"udiv", IConst{1}, IConst{0}}, "division by zero"},
 		{Bin{"idiv_rem", IConst{1}, IConst{0}}, "division by zero"},
 		{Bin{"hilo", IConst{1}, IConst{0}}, "64 bit dividend outside a division"},
-		{Bin{"fadd", IConst{1}, IConst{0}}, "operation fadd"},
-		{Un{"i2f", IConst{1}}, "operation i2f"},
+		{Bin{"fxyz", FConst{1}, FConst{0}}, "operation fxyz"},
+		{Un{"bits2d", IConst{1}}, "a double built from 1"},
 		{Cond{"odd", IConst{1}, IConst{0}}, "comparison odd"},
-		{FConst{1}, "xbe.FConst value"},
 		{Sym{"reg.XYZ"}, "register XYZ"},
 		{Sym{"self"}, "own address outside a copy"},
 		{Sym{"segbase.FS"}, "segment FS has no base"},
@@ -354,21 +363,76 @@ func TestMachineRunRoutine(t *testing.T) {
 	r := NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
 	r.Push(0xDEAD0000)
 	r.Stop[0xDEAD0000] = true
-	next, err := r.Run(kWrite, 10)
+	next, err := r.Run(kWrite)
 	if err != nil || next != 0xDEAD0000 {
 		t.Fatalf("run stopped at %X: %v", next, err)
 	}
 	if r.ReadU32(kvar2) != 0x1234 || r.Regs["ESP"] != 0x80030000 || !reflect.DeepEqual(r.Trail, []uint32{kWrite}) {
 		t.Errorf("after the routine kvar2=%#x esp=%X trail %X", r.ReadU32(kvar2), r.Regs["ESP"], r.Trail)
 	}
-	if _, err := r.Run(ti.at(t, "kLoop"), 5); err == nil || !strings.Contains(err.Error(), "5 blocks without reaching a stop") {
+	if _, err := r.Run(ti.at(t, "kLoop")); err == nil || !strings.Contains(err.Error(), "a loop the run never leaves") {
 		t.Errorf("loop: %v", err)
 	}
-	if _, err := r.Run(ti.at(t, "kBad"), 5); err == nil || !strings.Contains(err.Error(), "was not lifted") {
+	if _, err := r.Run(ti.at(t, "kBad")); err == nil || !strings.Contains(err.Error(), "was not lifted") {
 		t.Errorf("failed block: %v", err)
 	}
-	if _, err := r.Run(0x12345, 5); err == nil || !strings.Contains(err.Error(), "no block 00012345") {
+	if _, err := r.Run(0x12345); err == nil || !strings.Contains(err.Error(), "no block 00012345") {
 		t.Errorf("unknown block: %v", err)
+	}
+}
+
+// Checks written bytes are told apart from the image's own
+func TestMachineRunTouched(t *testing.T) {
+	ti := kernelImage(t)
+	r := newRun(t, ti, machineModel(t, ti), nil)
+	r.WriteU32(0x80021000, 1)
+	if !r.Touched(0x80021002, 4) || r.Touched(0x80021004, 4) || r.Touched(0x80020FFC, 4) || !r.Touched(0x80020FFD, 4) {
+		t.Errorf("touched bytes misread")
+	}
+}
+
+// Checks a run ends at a loop that changes nothing, through a hook or over memory it rewrites, and runs on through
+// a loop that counts and one whose hook advances
+func TestMachineRunSpin(t *testing.T) {
+	ti := kernelImage(t)
+	mm := machineModel(t, ti, "kSpinCall", "kSpinStore", "kCount")
+	kConst := ti.at(t, "kConst")
+	start := func(hook func(r *MachineRun) uint32) *MachineRun {
+		r := NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
+		r.Push(0xDEAD0000)
+		r.Stop[0xDEAD0000] = true
+		if hook != nil {
+			r.Hooks[kConst] = hook
+		}
+		return r
+	}
+	r := start(nil)
+	if _, err := r.Run(ti.at(t, "kSpinStore")); err == nil || !strings.Contains(err.Error(), "a loop the run never leaves") {
+		t.Errorf("rewriting memory: %v", err)
+	}
+	r = start(func(r *MachineRun) uint32 {
+		r.Regs["EAX"] = 0
+		return r.Pop()
+	})
+	if _, err := r.Run(ti.at(t, "kSpinCall")); err == nil || !strings.Contains(err.Error(), "a loop the run never leaves") {
+		t.Errorf("hook answering the same: %v", err)
+	}
+	calls := 0
+	r = start(func(r *MachineRun) uint32 {
+		calls++
+		r.Advance()
+		r.Regs["EAX"] = 0
+		if calls == 4 {
+			r.Regs["EAX"] = 1
+		}
+		return r.Pop()
+	})
+	if next, err := r.Run(ti.at(t, "kSpinCall")); err != nil || next != 0xDEAD0000 || calls != 4 {
+		t.Errorf("hook advancing stopped at %X after %d calls: %v", next, calls, err)
+	}
+	r = start(nil)
+	if next, err := r.Run(ti.at(t, "kCount")); err != nil || next != 0xDEAD0000 || r.Regs["ECX"] != 0 {
+		t.Errorf("counting stopped at %X with ecx %d: %v", next, r.Regs["ECX"], err)
 	}
 }
 
@@ -380,7 +444,7 @@ func TestMachineRunMissingAndHooks(t *testing.T) {
 	r := NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
 	r.Push(0xDEAD0000)
 	r.Stop[0xDEAD0000] = true
-	if _, err := r.Run(kCallRet, 10); err == nil || !strings.Contains(err.Error(), "no block") {
+	if _, err := r.Run(kCallRet); err == nil || !strings.Contains(err.Error(), "no block") {
 		t.Fatalf("without a lifter: %v", err)
 	}
 	r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
@@ -395,7 +459,7 @@ func TestMachineRunMissingAndHooks(t *testing.T) {
 		}
 		return mm.Absorb(other)
 	}
-	next, err := r.Run(kCallRet, 10)
+	next, err := r.Run(kCallRet)
 	if err != nil || next != 0xDEAD0000 || lifted != 1 {
 		t.Fatalf("with a lifter stopped at %X after %d lifts: %v", next, lifted, err)
 	}
@@ -409,13 +473,13 @@ func TestMachineRunMissingAndHooks(t *testing.T) {
 	r.Push(0xDEAD0000)
 	r.Stop[0xDEAD0000] = true
 	r.Hooks[kWrite] = func(r *MachineRun) uint32 { return r.Pop() }
-	next, err = r.Run(kCallRet, 10)
+	next, err = r.Run(kCallRet)
 	if err != nil || next != 0xDEAD0000 || r.ReadU32(kvar2) != 0 || !reflect.DeepEqual(r.Trail, []uint32{kCallRet, kAfter}) {
 		t.Errorf("hooked run stopped at %X with kvar2 %#x trail %X: %v", next, r.ReadU32(kvar2), r.Trail, err)
 	}
 	r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
 	r.Stop[kWrite] = true
-	if next, err := r.Run(kCallRet, 10); err != nil || next != kWrite || !reflect.DeepEqual(r.Trail, []uint32{kCallRet}) {
+	if next, err := r.Run(kCallRet); err != nil || next != kWrite || !reflect.DeepEqual(r.Trail, []uint32{kCallRet}) {
 		t.Errorf("stopping at the callee: %X %v", next, err)
 	}
 }
@@ -428,7 +492,7 @@ func TestMachineRunConditionSymbols(t *testing.T) {
 		r.Push(0xDEAD0000)
 		r.Push(ti.at(t, "kCondRoot"))
 		r.Stop[0xDEAD0000] = true
-		if next, err := r.Run(ti.at(t, "kCmp"), 10); err != nil || next != 0xDEAD0000 {
+		if next, err := r.Run(ti.at(t, "kCmp")); err != nil || next != 0xDEAD0000 {
 			t.Fatalf("ecx %d: stopped at %X: %v", ecx, next, err)
 		}
 		if r.Regs["EAX"] != want || r.fl.kind != "cmp" || r.fl.a != ecx || r.fl.b != 7 {
@@ -437,7 +501,7 @@ func TestMachineRunConditionSymbols(t *testing.T) {
 		r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000, "ECX": ecx})
 		r.Push(0xDEAD0000)
 		r.Stop[0xDEAD0000] = true
-		if next, err := r.Run(ti.at(t, "kFlagsJump"), 10); err != nil || next != 0xDEAD0000 {
+		if next, err := r.Run(ti.at(t, "kFlagsJump")); err != nil || next != 0xDEAD0000 {
 			t.Fatalf("ecx %d through flags: stopped at %X: %v", ecx, next, err)
 		}
 		if r.Regs["EAX"] != want {
@@ -458,7 +522,7 @@ func runRoutine(t *testing.T, ti *testImage, mm *MachineModel, label string, reg
 	}
 	r.Push(0xDEAD0000)
 	r.Stop[0xDEAD0000] = true
-	if next, err := r.Run(ti.at(t, label), 10); err != nil || next != 0xDEAD0000 {
+	if next, err := r.Run(ti.at(t, label)); err != nil || next != 0xDEAD0000 {
 		t.Fatalf("%s stopped at %X: %v", label, next, err)
 	}
 	return r
@@ -479,7 +543,15 @@ func TestMachineRunStringEffects(t *testing.T) {
 	}
 	b := blockOf(t, mm, ti.at(t, "kMovsd"))
 	exprEq(t, "step before any direction", b.regs[6], Bin{"add", Sym{"reg.ESI"}, Sym{"dfstep4"}})
-	exprEq(t, "fixed step after cld", blockOf(t, mm, ti.at(t, "kMovsdCld")).regs[6], Bin{"add", Sym{"reg.ESI"}, IConst{4}})
+	cld := blockOf(t, mm, ti.at(t, "kMovsdCld"))
+	if cld.term == nil || cld.term.kind != "jump" || cld.term.target != ti.at(t, "kMovsdCld")+1 || len(cld.effects) != 1 || cld.effects[0].Fn != cpuCLD {
+		t.Fatalf("the direction change does not end its block: %+v", cld.term)
+	}
+	exprEq(t, "live step after cld", blockOf(t, mm, ti.at(t, "kMovsdCld")+1).regs[6], Bin{"add", Sym{"reg.ESI"}, Sym{"dfstep4"}})
+	r = runRoutine(t, ti, mm, "kMovsdCld", map[string]uint32{"ESI": src, "EDI": dst}, func(r *MachineRun) { r.DF = true })
+	if r.Regs["ESI"] != src+4 || r.Regs["EDI"] != dst+4 || r.DF {
+		t.Errorf("move after cld left esi %X edi %X df %v", r.Regs["ESI"], r.Regs["EDI"], r.DF)
+	}
 	r = runRoutine(t, ti, mm, "kMovsd", map[string]uint32{"ESI": src, "EDI": dst}, func(r *MachineRun) { r.DF = true })
 	if r.Regs["ESI"] != src-4 || r.Regs["EDI"] != dst-4 {
 		t.Errorf("backward move left esi %X edi %X", r.Regs["ESI"], r.Regs["EDI"])
@@ -516,7 +588,7 @@ func TestMachineRunProcessorEffects(t *testing.T) {
 		t.Errorf("division gave %d remainder %d", r.Regs["EAX"], r.Regs["EDX"])
 	}
 	r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000, "EAX": 10, "EDX": 5, "ECX": 1})
-	if _, err := r.Run(ti.at(t, "kDiv"), 10); err == nil || !strings.Contains(err.Error(), "division overflow") {
+	if _, err := r.Run(ti.at(t, "kDiv")); err == nil || !strings.Contains(err.Error(), "division overflow") {
 		t.Errorf("overflowing division: %v", err)
 	}
 	r = runRoutine(t, ti, mm, "kSeg", nil, func(r *MachineRun) {
@@ -527,11 +599,11 @@ func TestMachineRunProcessorEffects(t *testing.T) {
 		t.Errorf("segment relative read %#x", r.Regs["EAX"])
 	}
 	r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
-	if _, err := r.Run(ti.at(t, "kSeg"), 10); err == nil || !strings.Contains(err.Error(), "segment FS has no base") {
+	if _, err := r.Run(ti.at(t, "kSeg")); err == nil || !strings.Contains(err.Error(), "segment FS has no base") {
 		t.Errorf("segment without a base: %v", err)
 	}
 	r = NewMachineRun(mm, ti.img, map[string]uint32{"ESP": 0x80030000})
-	if _, err := r.Run(ti.at(t, "kPort"), 10); err == nil || !strings.Contains(err.Error(), "processor operation port_out") {
+	if _, err := r.Run(ti.at(t, "kPort")); err == nil || !strings.Contains(err.Error(), "processor operation port_out") {
 		t.Errorf("port write: %v", err)
 	}
 	r = runRoutine(t, ti, mm, "kCli", nil, func(r *MachineRun) { r.IF = true })
@@ -555,8 +627,11 @@ func TestMachineRunEffectKinds(t *testing.T) {
 	if err := r.effect(Effect{Kind: "store", Base: "this", Off: 4, Size: 4, Value: IConst{1}}); err == nil || !strings.Contains(err.Error(), "store to this") {
 		t.Errorf("based store: %v", err)
 	}
-	if err := r.effect(Effect{Kind: "store", Off: int32(kvar), Size: 8, Value: IConst{1}}); err == nil || !strings.Contains(err.Error(), "store of 8 bytes") {
-		t.Errorf("wide store: %v", err)
+	if err := r.effect(Effect{Kind: "store", Off: int32(kvar), Size: 8, Value: FConst{1.5}}); err != nil || r.ReadU32(kvar) != 0 || r.ReadU32(kvar+4) != 0x3FF80000 {
+		t.Errorf("wide store: %v %#x %#x", err, r.ReadU32(kvar), r.ReadU32(kvar+4))
+	}
+	if err := r.effect(Effect{Kind: "store", Off: int32(kvar), Size: 6, Value: IConst{1}}); err == nil || !strings.Contains(err.Error(), "store of 6 bytes") {
+		t.Errorf("odd store: %v", err)
 	}
 	if err := r.effect(Effect{Kind: "store", Addr: Sym{"reg.EAX"}, Size: 2, Value: IConst{0x1234}}); err != nil || r.ReadU32(0x80021000) != 0x1234 {
 		t.Errorf("store through a register: %v %#x", err, r.ReadU32(0x80021000))

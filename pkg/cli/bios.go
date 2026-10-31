@@ -211,24 +211,37 @@ func addKernelFlags(c *cobra.Command) {
 	c.MarkFlagRequired("mcpx")
 }
 
-// Decrypts the flash image the flags name and lays its kernel out for the derivation
-func loadKernel() (*xbe.KernelInput, error) {
+// Decrypts the flash image the flags name and lays its kernel out for the derivation, with the bank it came from
+// Opens the flash and the ROM the kernel flags name, the 2BL decrypted
+func loadBoot() (*bios.Bank, *bios.MCPX, error) {
 	b, err := bios.Open(kernelBIOS)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mcpx, err := bios.LoadMCPX(kernelMCPX)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := b.Decrypt(mcpx); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	return b, mcpx, nil
+}
+
+func loadKernel() (*xbe.KernelInput, *bios.Bank, error) {
+	b, _, err := loadBoot()
+	if err != nil {
+		return nil, nil, err
 	}
 	img, exports, err := b.Image()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &xbe.KernelInput{Image: img, Exports: exports}, nil
+	eeprom, err := b.EEPROM(bios.DefaultConsole())
+	if err != nil {
+		return nil, nil, err
+	}
+	return &xbe.KernelInput{Image: img, Exports: exports, EEPROM: eeprom}, b, nil
 }
 
 func runBIOSMachine(cmd *cobra.Command, args []string) error {

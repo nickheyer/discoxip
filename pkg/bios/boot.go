@@ -91,14 +91,19 @@ func (b *Bank) XCodes() ([]XCode, error) {
 	return nil, fmt.Errorf("bios: the init table has no exit x-code")
 }
 
-// BldrImage lays the decrypted 2BL out at the address the preldr loads it and at the one it moves itself to
+// BldrImage lays the decrypted 2BL out at the address the preldr loads it and at the one it moves itself to, the
+// preldr block at the flash address the 2BL calls its routines at
 func (b *Bank) BldrImage() *xbe.Image {
-	section := func(name string, base uint32) xbe.Section {
-		data := make([]byte, len(b.Bldr))
-		copy(data, b.Bldr)
+	section := func(name string, base uint32, bytes []byte) xbe.Section {
+		data := make([]byte, len(bytes))
+		copy(data, bytes)
 		return xbe.Section{Name: name, VirtualAddr: base, VirtualSize: uint32(len(data)), RawSize: uint32(len(data)), Flags: 0x5, Data: data}
 	}
-	return xbe.NewImage(bldrLoadBase, b.Entry, nil, []xbe.Section{section("bldr0", bldrLoadBase), section("bldr1", bldrRunBase)})
+	sections := []xbe.Section{section("bldr0", bldrLoadBase, b.Bldr), section("bldr1", bldrRunBase, b.Bldr)}
+	if b.Preldr {
+		sections = append(sections, section("preldr", preldrBase, b.Bldr[bldrSize-preldrBlockSize:]))
+	}
+	return xbe.NewImage(bldrLoadBase, b.Entry, nil, sections)
 }
 
 // BldrRoots are the addresses the 2BL is entered at, its entry where the preldr leaves it and the same code where it
@@ -193,14 +198,15 @@ func WriteBoot(b *Bank, dir, launchDir string) error {
 		return err
 	}
 	hdd, dvd := DefaultDrives()
-	disk, diskData, err := BuildDisk(partitions, launch, launchDir, hdd, dvd)
+	console := DefaultConsole()
+	disk, diskData, err := BuildDisk(partitions, launch, launchDir, hdd, dvd, console.HDDKey)
 	if err != nil {
 		return err
 	}
 	if err := WriteDisk(disk, diskData, dir); err != nil {
 		return err
 	}
-	eeprom, err := b.EEPROM(DefaultConsole())
+	eeprom, err := b.EEPROM(console)
 	if err != nil {
 		return err
 	}
@@ -210,7 +216,11 @@ func WriteBoot(b *Bank, dir, launchDir string) error {
 			return err
 		}
 	}
-	for name, v := range map[string]any{"machine.json": mm, "boot.json": boot, "hardware.json": b.Hardware()} {
+	hardware, err := DeriveHardware(b, lifted)
+	if err != nil {
+		return err
+	}
+	for name, v := range map[string]any{"machine.json": mm, "boot.json": boot, "hardware.json": hardware} {
 		data, err := json.Marshal(v)
 		if err != nil {
 			return err
@@ -306,4 +316,30 @@ func kernelStrings(img *xbe.Image) []string {
 		}
 	}
 	return out
+}
+
+// KernelStrings lists every terminated run of printable bytes in the kernel image
+func KernelStrings(img *xbe.Image) []string {
+	return kernelStrings(img)
+}
+
+// LaunchPath is the kernel's path to the executable the launch directory holds, the path the kernel starts the console at
+func LaunchPath(kernel *xbe.Image, launchDir string) (string, error) {
+	names, err := executableNames(launchDir)
+	if err != nil {
+		return "", err
+	}
+	var paths []string
+	for _, s := range kernelStrings(kernel) {
+		lower := strings.ToLower(s)
+		for _, name := range names {
+			if strings.HasSuffix(lower, `\`+name) {
+				paths = append(paths, s)
+			}
+		}
+	}
+	if len(paths) != 1 {
+		return "", fmt.Errorf("bios: %d kernel paths name an executable of %s (%v of %v)", len(paths), launchDir, paths, names)
+	}
+	return paths[0], nil
 }

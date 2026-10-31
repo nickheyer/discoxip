@@ -424,8 +424,11 @@ func TestJumpTableTargets(t *testing.T) {
 	if got := d.jumpTableTargets(variant(x86asm.Mem{Index: mem.Index, Scale: 4, Disp: int64(at["tableEnd"])}), sec); got != nil {
 		t.Fatalf("table starting outside the section %x", got)
 	}
-	if got := d.jumpTableTargets(variant(x86asm.Mem{Index: mem.Index, Scale: 4, Disp: int64(at["table"] + 4)}), sec); !equalU32(got, []uint32{at["case1"], at["case2"]}) {
-		t.Fatalf("table from its second entry %x", got)
+	if first, got := d.jumpTableCases(variant(x86asm.Mem{Index: mem.Index, Scale: 4, Disp: int64(at["table"] + 4)}), sec); first != -1 || !equalU32(got, []uint32{at["case0"], at["case1"], at["case2"]}) {
+		t.Fatalf("table based at its second entry %d %x", first, got)
+	}
+	if first, got := d.jumpTableCases(jump, sec); first != 0 || len(got) != 3 {
+		t.Fatalf("table based at its first entry %d %x", first, got)
 	}
 	if got := d.jumpTableTargets(jump, d.sectionOf(0x14000)); got != nil {
 		t.Fatalf("targets outside the jump's section %x", got)
@@ -437,32 +440,32 @@ func TestJumpTableTargets(t *testing.T) {
 
 func TestPlausibleStart(t *testing.T) {
 	d, at := analysis(t)
-	if fn := d.buildFunction(at["zeros"], map[uint32]bool{}); fn == nil || plausibleStart(fn) {
+	if fn := d.buildFunction(at["zeros"], map[uint32]bool{}); fn == nil || d.plausibleStart(fn) {
 		t.Fatal("zero bytes plausible")
 	}
-	if fn := d.buildFunction(at["stray"], map[uint32]bool{}); fn == nil || plausibleStart(fn) {
+	if fn := d.buildFunction(at["stray"], map[uint32]bool{}); fn == nil || d.plausibleStart(fn) {
 		t.Fatal("segment register load plausible")
 	}
-	if !plausibleStart(mustFunction(t, d, at["gap"])) || !plausibleStart(mustFunction(t, d, at["args"])) {
+	if !d.plausibleStart(mustFunction(t, d, at["gap"])) || !d.plausibleStart(mustFunction(t, d, at["args"])) {
 		t.Fatal("real code implausible")
 	}
 	for _, seq := range [][]byte{{0x3F}, {0x37}, {0xD5, 0x0A}, {0x27}, {0xEC}, {0xF4}, {0xCF}, {0xC8, 0x00, 0x00, 0x00}, {0x1F}, {0xCE}, {0xD7}, {0x8E, 0xC0}, {0x07}} {
-		if plausibleStart(functionOf(t, 0x11000, seq)) {
+		if d.plausibleStart(functionOf(t, 0x11000, seq)) {
 			t.Errorf("%x plausible", seq)
 		}
 	}
-	if !plausibleStart(functionOf(t, 0x11000, []byte{0x8B, 0xC1}, []byte{0x58}, []byte{0x00, 0xC0})) {
+	if !d.plausibleStart(functionOf(t, 0x11000, []byte{0x8B, 0xC1}, []byte{0x58}, []byte{0x00, 0xC0})) {
 		t.Fatal("add al to al implausible")
 	}
 	late := functionOf(t, 0x11000, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x90}, []byte{0x3F})
-	if !plausibleStart(late) {
+	if !d.plausibleStart(late) {
 		t.Fatal("ninth instruction judged")
 	}
 }
 
 func TestSectionRoles(t *testing.T) {
 	d, at := analysis(t)
-	if len(d.libraries()) != 1 || !d.libraries()[d.sectionOf(at["entry"])] || d.inLibrary(at["libFn"]) || d.inLibrary(at["entry"]) || d.inLibrary(at["memcpy"]) {
+	if len(d.libraries()) != 1 || !d.libraries()[d.sectionOf(at["entry"]).VirtualAddr] || d.inLibrary(at["libFn"]) || d.inLibrary(at["entry"]) || d.inLibrary(at["memcpy"]) {
 		t.Fatalf("libraries before naming %v", d.libraries())
 	}
 	if !d.inPureData(0x12100) || d.inPureData(at["entry"]) || d.inPureData(0x13000) || d.inPureData(at["libFn"]) || d.inPureData(0x15000) {
@@ -471,7 +474,7 @@ func TestSectionRoles(t *testing.T) {
 	lib := mustFunction(t, d, at["libFn"])
 	lib.Symbol = &Symbol{VA: lib.EntryVA, Name: "LibRoutine"}
 	d.librarySections = nil
-	if !d.libraries()[d.sectionOf(at["libFn"])] || len(d.libraries()) != 2 {
+	if !d.libraries()[d.sectionOf(at["libFn"]).VirtualAddr] || len(d.libraries()) != 2 {
 		t.Fatalf("libraries after naming %v", d.libraries())
 	}
 	if !d.inLibrary(at["libFn"]) || !d.inLibrary(0x140F0) || d.inLibrary(at["entry"]) || d.inLibrary(0x12100) || d.inLibrary(0x15000) {

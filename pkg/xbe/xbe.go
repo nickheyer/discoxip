@@ -91,6 +91,22 @@ type Section struct {
 	Data        []byte // loaded into virtual size (zero-padded)
 }
 
+// Section header flags, the section mapped writable and the section the processor executes
+const (
+	sectionWritable   = 0x1
+	sectionExecutable = 0x4
+)
+
+// Writable reports whether the loader maps the section writable
+func (s *Section) Writable() bool {
+	return s.Flags&sectionWritable != 0
+}
+
+// Executable reports whether the processor executes the section
+func (s *Section) Executable() bool {
+	return s.Flags&sectionExecutable != 0
+}
+
 // LibVersion is one entry of the XBE library version table.
 type LibVersion struct {
 	Name  string
@@ -105,6 +121,7 @@ type Image struct {
 	EntryPoint  uint32 // unscrambled
 	KernThunk   uint32 // unscrambled
 	HeadersSize uint32
+	StackCommit uint32 // bytes of stack the loader commits for the first thread
 	Sections    []Section
 	Libs        []LibVersion
 	TLS         *TLSDirectory // the thread local storage the loader gives each thread, nil where the header names none
@@ -196,6 +213,7 @@ func Parse(data []byte) (*Image, error) {
 	img := &Image{
 		BaseAddr:    h.BaseAddr,
 		HeadersSize: h.HeadersSize,
+		StackCommit: h.PEStackCommit,
 		raw:         data,
 	}
 
@@ -402,7 +420,7 @@ func (img *Image) Memory() (ImageMemory, []byte, error) {
 	mem.Sections = append(mem.Sections, ImageSection{Name: "header", VA: img.BaseAddr, Size: img.HeadersSize, Off: 0, Writable: false})
 	bytes = append(bytes, img.raw[:img.HeadersSize]...)
 	for _, s := range order {
-		mem.Sections = append(mem.Sections, ImageSection{Name: s.Name, VA: s.VirtualAddr, Size: s.VirtualSize, Off: uint32(len(bytes)), Writable: s.Flags&0x1 != 0})
+		mem.Sections = append(mem.Sections, ImageSection{Name: s.Name, VA: s.VirtualAddr, Size: s.VirtualSize, Off: uint32(len(bytes)), Writable: s.Writable()})
 		bytes = append(bytes, s.Data...)
 	}
 	return mem, bytes, nil
