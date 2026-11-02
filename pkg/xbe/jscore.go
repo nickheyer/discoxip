@@ -12,6 +12,29 @@ const (
 	jsTLBEntries = 1 << (32 - pageShift)
 )
 
+// Samples of the processor's state the spin check keeps, enough for a loop of up to that many blocks to be seen
+// at the same block twice, and the fields of one sample, the block address, the registers and the other state
+const (
+	spinSamples = 8
+	spinRegs    = len(registerNames)
+	spinFields  = spinRegs + 19
+)
+
+// Blocks between the hardware's advances and between the spin check's samples, each a power of two
+const (
+	advanceInterval = 1024
+	spinInterval    = 256
+)
+
+// The general registers as the spin sample stores them after the block address
+func spinRegisterSamples() string {
+	parts := make([]string, len(registerNames))
+	for i, name := range registerNames {
+		parts[i] = fmt.Sprintf("s[%d] = %s", i+1, name)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // WriteCore writes the processor the translated blocks run on, its memory, descriptor tables, interrupt delivery,
 // dispatcher and the operations the blocks call, the conditions and flags word built from the executor's rules
 func WriteCore(w io.Writer) error {
@@ -63,18 +86,24 @@ func jsDeclare(names []string, value string) string {
 // virtual address walked through the page tables once paging is on, the walk cached per page for RAM
 func (g *jsGen) writeMemory() {
 	fmt.Fprintf(g.w, "// ---- memory ----\n")
-	fmt.Fprintf(g.w, "let RAM_BYTES = 0, ram = null, ramView = null, PAGE_WRITES = null;\n")
-	fmt.Fprintf(g.w, "const TLB_R = new Int32Array(%d), TLB_W = new Int32Array(%d);\n", jsTLBEntries, jsTLBEntries)
-	fmt.Fprintf(g.w, "function initMemory(bytes) { RAM_BYTES = bytes; ram = new Uint8Array(bytes); ramView = new DataView(ram.buffer); PAGE_WRITES = new Uint32Array(bytes >>> %d); }\n", pageShift)
-	fmt.Fprintf(g.w, "function flushTLB() { TLB_R.fill(0); TLB_W.fill(0); }\n")
-	fmt.Fprintf(g.w, "function physRead(pa, size) {\n")
-	fmt.Fprintf(g.w, "if (pa + size <= RAM_BYTES) { switch (size) { case 1: return ram[pa]; case 2: return ramView.getUint16(pa, true); case 4: return ramView.getUint32(pa, true); } }\n")
-	fmt.Fprintf(g.w, "return hwRead(pa >>> 0, size) >>> 0;\n}\n")
-	fmt.Fprintf(g.w, "function physWrite(pa, size, v) {\n")
-	fmt.Fprintf(g.w, "if (pa + size <= RAM_BYTES) { PAGE_WRITES[pa >>> %d]++; switch (size) { case 1: ram[pa] = v; return; case 2: ramView.setUint16(pa, v, true); return; case 4: ramView.setUint32(pa, v, true); return; } }\n", pageShift)
-	fmt.Fprintf(g.w, "hwWrite(pa >>> 0, size, v >>> 0);\n}\n")
 	pageMask := uint32(1<<pageShift - 1)
 	largeMask := uint32(1<<largePageShift - 1)
+	fmt.Fprintf(g.w, "let RAM_BYTES = 0, ram = null, ramView = null, PAGE_WRITES = null, SURFACE_PAGES = null, surfaceFlush = null, WRITES = 0, DEVICE = 0;\n")
+	fmt.Fprintf(g.w, "const TLB_R = new Int32Array(%d), TLB_W = new Int32Array(%d), TLB_PAGES = new Map();\n", jsTLBEntries, jsTLBEntries)
+	fmt.Fprintf(g.w, "function initMemory(bytes) { RAM_BYTES = bytes; ram = new Uint8Array(bytes); ramView = new DataView(ram.buffer); PAGE_WRITES = new Uint32Array(bytes >>> %d); SURFACE_PAGES = new Uint8Array(bytes >>> %d); }\n", pageShift, pageShift)
+	fmt.Fprintf(g.w, "function flushTLB() { TLB_R.fill(0); TLB_W.fill(0); TLB_PAGES.clear(); }\n")
+	fmt.Fprintf(g.w, "// A cached translation kept by the physical page it reaches, so the page can be dropped from every virtual page that reaches it\n")
+	fmt.Fprintf(g.w, "function cacheTranslation(table, vpage, base) { table[vpage] = base + 1; const ppage = base >>> %d; const pages = TLB_PAGES.get(ppage); if (pages === undefined) TLB_PAGES.set(ppage, [vpage]); else if (!pages.includes(vpage)) pages.push(vpage); }\n", pageShift)
+	fmt.Fprintf(g.w, "// Pages a drawn surface holds newer contents of than memory, their translations dropped so the next access of them writes the surface back first\n")
+	fmt.Fprintf(g.w, "function surfaceHolds(at, n) { for (let p = at >>> %d, last = (at + n - 1) >>> %d; p <= last; p++) { SURFACE_PAGES[p] = 1; const pages = TLB_PAGES.get(p); if (pages === undefined) continue; for (const v of pages) { TLB_R[v] = 0; TLB_W[v] = 0; } TLB_PAGES.delete(p); } }\n", pageShift, pageShift)
+	fmt.Fprintf(g.w, "function surfaceReleases(at, n) { for (let p = at >>> %d, last = (at + n - 1) >>> %d; p <= last; p++) SURFACE_PAGES[p] = 0; }\n", pageShift, pageShift)
+	fmt.Fprintf(g.w, "function surfaceFlushRange(at, n) { for (let p = at >>> %d, last = (at + n - 1) >>> %d; p <= last; p++) if (SURFACE_PAGES[p] !== 0) surfaceFlush(p << %d, 0x%X); }\n", pageShift, pageShift, pageShift, pageMask+1)
+	fmt.Fprintf(g.w, "function physRead(pa, size) {\n")
+	fmt.Fprintf(g.w, "if (pa + size <= RAM_BYTES) { if (SURFACE_PAGES[pa >>> %d] !== 0) surfaceFlush((pa & ~0x%X) >>> 0, 0x%X); switch (size) { case 1: return ram[pa]; case 2: return ramView.getUint16(pa, true); case 4: return ramView.getUint32(pa, true); } }\n", pageShift, pageMask, pageMask+1)
+	fmt.Fprintf(g.w, "DEVICE++;\nreturn hwRead(pa >>> 0, size) >>> 0;\n}\n")
+	fmt.Fprintf(g.w, "function physWrite(pa, size, v) {\n")
+	fmt.Fprintf(g.w, "if (pa + size <= RAM_BYTES) { if (SURFACE_PAGES[pa >>> %d] !== 0) surfaceFlush((pa & ~0x%X) >>> 0, 0x%X); PAGE_WRITES[pa >>> %d]++; WRITES++; switch (size) { case 1: ram[pa] = v; return; case 2: ramView.setUint16(pa, v, true); return; case 4: ramView.setUint32(pa, v, true); return; } }\n", pageShift, pageMask, pageMask+1, pageShift)
+	fmt.Fprintf(g.w, "DEVICE++;\nhwWrite(pa >>> 0, size, v >>> 0);\n}\n")
 	fmt.Fprintf(g.w, "// A virtual address through the tables the processor walks, the accessed and dirty bits set as it would\n")
 	fmt.Fprintf(g.w, "function translate(va, write, quiet) {\n")
 	fmt.Fprintf(g.w, "if ((CR[0] & 0x%X) === 0) return va >>> 0;\n", uint32(cr0Paging))
@@ -97,13 +126,13 @@ func (g *jsGen) writeMemory() {
 	fmt.Fprintf(g.w, "if ((a & 0x%X) + size > 0x%X) { let v = 0; for (let i = size - 1; i >= 0; i--) v = v * 256 + ld8((a + i) >>> 0); return v >>> 0; }\n", pageMask, pageMask+1)
 	fmt.Fprintf(g.w, "const pa = translate(a, false, false);\n")
 	fmt.Fprintf(g.w, "const base = (pa & ~0x%X) >>> 0;\n", pageMask)
-	fmt.Fprintf(g.w, "if (base + 0x%X <= RAM_BYTES) { TLB_R[a >>> %d] = base + 1; return physRead(pa, size); }\n", pageMask+1, pageShift)
+	fmt.Fprintf(g.w, "if (base + 0x%X <= RAM_BYTES) { cacheTranslation(TLB_R, a >>> %d, base); return physRead(pa, size); }\n", pageMask+1, pageShift)
 	fmt.Fprintf(g.w, "return physRead(pa, size);\n}\n")
 	fmt.Fprintf(g.w, "function stSlow(a, size, v) {\n")
 	fmt.Fprintf(g.w, "if ((a & 0x%X) + size > 0x%X) { for (let i = 0; i < size; i++) st8((a + i) >>> 0, (v >>> (8 * i)) & 0xFF); return; }\n", pageMask, pageMask+1)
 	fmt.Fprintf(g.w, "const pa = translate(a, true, false);\n")
 	fmt.Fprintf(g.w, "const base = (pa & ~0x%X) >>> 0;\n", pageMask)
-	fmt.Fprintf(g.w, "if (base + 0x%X <= RAM_BYTES) { TLB_W[a >>> %d] = base + 1; TLB_R[a >>> %d] = base + 1; }\n", pageMask+1, pageShift, pageShift)
+	fmt.Fprintf(g.w, "if (base + 0x%X <= RAM_BYTES) { cacheTranslation(TLB_W, a >>> %d, base); cacheTranslation(TLB_R, a >>> %d, base); }\n", pageMask+1, pageShift, pageShift)
 	fmt.Fprintf(g.w, "physWrite(pa, size, v);\n}\n")
 	for _, size := range []int{1, 2, 4} {
 		get, set := map[int]string{1: "", 2: "getUint16", 4: "getUint32"}[size], map[int]string{1: "", 2: "setUint16", 4: "setUint32"}[size]
@@ -125,6 +154,7 @@ func (g *jsGen) writeMemory() {
 	fmt.Fprintf(g.w, "function readBytes(a, n) { const out = new Uint8Array(n); for (let i = 0; i < n; i++) out[i] = ld8((a + i) >>> 0); return out; }\n")
 	fmt.Fprintf(g.w, "function writeBytes(a, bytes) { for (let i = 0; i < bytes.length; i++) st8((a + i) >>> 0, bytes[i]); }\n")
 	fmt.Fprintf(g.w, "function physWriteBytes(pa, bytes) { for (let i = 0; i < bytes.length; i++) physWrite((pa + i) >>> 0, 1, bytes[i]); }\n")
+	fmt.Fprintf(g.w, "function ramWriteBytes(pa, bytes) { if (pa + bytes.length > RAM_BYTES) fault(\"write of \" + bytes.length + \" bytes at \" + hex(pa) + \" past memory\"); surfaceFlushRange(pa, bytes.length); ram.set(bytes, pa); WRITES++; for (let p = pa >>> %d, last = (pa + bytes.length - 1) >>> %d; p <= last; p++) PAGE_WRITES[p]++; }\n", pageShift, pageShift)
 	fmt.Fprintf(g.w, "function arg(n) { return ld32((ESP + 4 + 4 * n) >>> 0); }\n")
 	fmt.Fprintf(g.w, "function pop() { const v = ld32(ESP); ESP = (ESP + 4) >>> 0; return v; }\n")
 	fmt.Fprintf(g.w, "function push(v) { ESP = (ESP - 4) >>> 0; st32(ESP, v >>> 0); }\n")
@@ -150,7 +180,7 @@ func (g *jsGen) writeSegments() {
 func (g *jsGen) writeInterrupts() {
 	arithmetic := uint32(eflagsCarry | eflagsParity | eflagsZero | eflagsSign | eflagsOverflow)
 	fmt.Fprintf(g.w, "// ---- interrupts ----\n")
-	fmt.Fprintf(g.w, "let IRQ = -1, haltedAt = -1;\n")
+	fmt.Fprintf(g.w, "let IRQ = -1, haltedAt = -1, idle = false;\n")
 	fmt.Fprintf(g.w, "const FRAMES = new Map();\n")
 	fmt.Fprintf(g.w, "function flagsWord() { return flagsWordOf(FK, FA, FB, FR, FC, FFA, FFB); }\n")
 	fmt.Fprintf(g.w, "function gate(vector, resume, fn) {\n")
@@ -190,12 +220,24 @@ func (g *jsGen) writeDispatcher() {
 	fmt.Fprintf(g.w, "function switchTo(index, targets, va) { if (index >= targets.length) fault(\"switch index \" + index + \" outside \" + targets.length + \" cases\", va); return go(targets[index]); }\n")
 	fmt.Fprintf(g.w, "function templateMatches(t, self) {\n")
 	fmt.Fprintf(g.w, "for (let i = 0; i < t.length; i++) { if (t.patched[i]) continue; if (!mapped((self + i) >>> 0) || ld8((self + i) >>> 0) !== t.bytes[i]) return false; }\nreturn true;\n}\n")
+	fmt.Fprintf(g.w, "// The processor's state sampled between blocks, a sample matching an earlier one with no memory or device access\n")
+	fmt.Fprintf(g.w, "// between proving the code runs a loop nothing but a hardware event can leave, which sleeps until the next one\n")
+	fmt.Fprintf(g.w, "const SPIN_SAMPLES = %d, SPIN_FIELDS = %d, spinRing = new Float64Array(SPIN_SAMPLES * SPIN_FIELDS), spinNow = new Float64Array(SPIN_FIELDS);\n", spinSamples, spinFields)
+	fmt.Fprintf(g.w, "let spinNext = 0, spinCount = 0, spinWrites = -1, spinDevice = -1;\n")
+	fmt.Fprintf(g.w, "function spinning(va) {\n")
+	fmt.Fprintf(g.w, "const s = spinNow; let xmm = 0; for (let i = 0; i < XMM.length; i++) xmm += XMM[i];\n")
+	fmt.Fprintf(g.w, "s[0] = va; %s; s[%d] = FK; s[%d] = FA; s[%d] = FB; s[%d] = FR; s[%d] = FC; s[%d] = IF ? 1 : 0; s[%d] = DF ? 1 : 0; s[%d] = WRITES; s[%d] = DEVICE; s[%d] = ST.length; s[%d] = ST.length > 0 ? ST[0] : 0; s[%d] = xmm; s[%d] = CR[0]; s[%d] = CR[3]; s[%d] = SEG_CS; s[%d] = SEG_DS; s[%d] = FFA; s[%d] = FFB;\n", spinRegisterSamples(), spinRegs+1, spinRegs+2, spinRegs+3, spinRegs+4, spinRegs+5, spinRegs+6, spinRegs+7, spinRegs+8, spinRegs+9, spinRegs+10, spinRegs+11, spinRegs+12, spinRegs+13, spinRegs+14, spinRegs+15, spinRegs+16, spinRegs+17, spinRegs+18)
+	fmt.Fprintf(g.w, "let stuck = false;\n")
+	fmt.Fprintf(g.w, "for (let n = 0; n < spinCount && !stuck; n++) { const at = n * SPIN_FIELDS; let same = true; for (let i = 0; i < SPIN_FIELDS; i++) if (spinRing[at + i] !== s[i]) { same = false; break; } stuck = same; }\n")
+	fmt.Fprintf(g.w, "spinRing.set(s, spinNext * SPIN_FIELDS); spinNext = (spinNext + 1) %% SPIN_SAMPLES; if (spinCount < SPIN_SAMPLES) spinCount++;\n")
+	fmt.Fprintf(g.w, "return stuck;\n}\n")
+	fmt.Fprintf(g.w, "function sleep(va) { haltedAt = va; idle = true; spinWrites = WRITES; spinDevice = DEVICE; spinCount = 0; return YIELD; }\n")
 	fmt.Fprintf(g.w, "function templateAt(va) {\n")
 	fmt.Fprintf(g.w, "for (const t of TEMPLATES) for (const [off, fn] of t.blocks) { const self = (va - off) >>> 0; if (templateMatches(t, self)) { SELF = self; return fn; } }\nreturn undefined;\n}\n")
 	fmt.Fprintf(g.w, "function go(va) {\n")
 	fmt.Fprintf(g.w, "AT = va;\n")
 	fmt.Fprintf(g.w, "if (IF && IRQ >= 0) return deliverInterrupt(va);\n")
-	fmt.Fprintf(g.w, "if ((++ticks & 0x3FF) === 0) hwAdvance();\n")
+	fmt.Fprintf(g.w, "if ((++ticks & 0x%X) === 0) { if ((ticks & 0x%X) === 0) hwAdvance(); if (spinning(va)) return sleep(va); }\n", spinInterval-1, advanceInterval-1)
 	fmt.Fprintf(g.w, "if (traceCalls) noteCall(va);\n")
 	fmt.Fprintf(g.w, "const h = HOOKS.get(va); if (h !== undefined) return h;\n")
 	fmt.Fprintf(g.w, "let f;\n")
@@ -203,8 +245,8 @@ func (g *jsGen) writeDispatcher() {
 	fmt.Fprintf(g.w, "f = PLAIN_BOOT.get(va); if (f !== undefined) return f;\n")
 	fmt.Fprintf(g.w, "f = templateAt(va); if (f !== undefined) return f;\n")
 	fmt.Fprintf(g.w, "return missing(va);\n}\n")
-	fmt.Fprintf(g.w, "function enter(va, fn) { AT = va; if (IF && IRQ >= 0) return deliverInterrupt(va); if ((++ticks & 0x3FF) === 0) hwAdvance(); if (traceCalls) noteCall(va); const h = HOOKS.get(va); return h === undefined ? fn : h; }\n")
-	fmt.Fprintf(g.w, "function step(va, fn) { AT = va; if (IF && IRQ >= 0) return deliverInterrupt(va, fn); if ((++ticks & 0x3FF) === 0) hwAdvance(); return fn; }\n")
+	fmt.Fprintf(g.w, "function enter(va, fn) { AT = va; if (IF && IRQ >= 0) return deliverInterrupt(va); if ((++ticks & 0x%X) === 0) { if ((ticks & 0x%X) === 0) hwAdvance(); if (spinning(va)) return sleep(va); } if (traceCalls) noteCall(va); const h = HOOKS.get(va); return h === undefined ? fn : h; }\n", spinInterval-1, advanceInterval-1)
+	fmt.Fprintf(g.w, "function step(va, fn) { AT = va; if (IF && IRQ >= 0) return deliverInterrupt(va, fn); if ((++ticks & 0x%X) === 0) { if ((ticks & 0x%X) === 0) hwAdvance(); if (spinning(va)) return sleep(va); } return fn; }\n", spinInterval-1, advanceInterval-1)
 	fmt.Fprintf(g.w, "function templateSelf(va) { return SELF; }\n")
 	fmt.Fprintf(g.w, "function libcall(name, args, va) { fault(\"call of \" + name + \" inside a block\", va); }\n")
 }
@@ -218,7 +260,10 @@ func (g *jsGen) writeRunLoop() {
 	fmt.Fprintf(g.w, "if (fatal !== null) return \"fatal\";\n")
 	fmt.Fprintf(g.w, "let f = next;\nlet i = 0;\n")
 	fmt.Fprintf(g.w, "try {\n")
-	fmt.Fprintf(g.w, "if (f === null) { if (!(IF && IRQ >= 0)) return \"halted\"; f = deliverInterrupt(haltedAt); haltedAt = -1; }\n")
+	fmt.Fprintf(g.w, "if (f === null) {\n")
+	fmt.Fprintf(g.w, "if (idle) { if (!(IF && IRQ >= 0) && WRITES === spinWrites && DEVICE === spinDevice) return \"halted\"; idle = false; const at = haltedAt; haltedAt = -1; f = go(at); }\n")
+	fmt.Fprintf(g.w, "else { if (!(IF && IRQ >= 0)) return \"halted\"; f = deliverInterrupt(haltedAt); haltedAt = -1; }\n")
+	fmt.Fprintf(g.w, "}\n")
 	fmt.Fprintf(g.w, "for (; i < budget; i++) {\nf = f();\n")
 	fmt.Fprintf(g.w, "if (f === YIELD) { next = null; stepsRun += i; return \"halted\"; }\n")
 	fmt.Fprintf(g.w, "}\n")

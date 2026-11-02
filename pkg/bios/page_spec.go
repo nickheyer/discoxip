@@ -310,6 +310,7 @@ const (
 	apuFrontControl        = 0x1100
 	apuMethodModeMask      = 0xE0
 	apuMethodModeTrapped   = 0xE0
+	apuMethodModeHalted    = 0x80
 	apuTrapReasonMask      = 0xF00
 	apuTrapReasonRequested = 0xF00
 	apuCurrentVoice        = 0x1110
@@ -374,6 +375,306 @@ const (
 	apuReleaseFramesPer   = 16
 )
 
+// The audio processor's global registers beyond the front end, the notifier address, the front end memory address
+// and data, the sound engine control with its counter mode field, the voice, scatter gather, stream segment list,
+// scratch and FIFO table addresses, the table sizes and the FIFO rings of the two signal processors, the interrupt
+// status bits a notifier raises and the mixbins, voices, samples and frame rate of the engine
+const (
+	apuFENotifyAddress   = 0x115C
+	apuFEMemoryAddress   = 0x1324
+	apuFEMemoryData      = 0x1334
+	apuSoundEngine       = 0x2000
+	apuCounterModeMask   = 0x18
+	apuVPSGEAddress      = 0x2030
+	apuVPSSLAddress      = 0x2034
+	apuGPScratchAddress  = 0x2040
+	apuGPFIFOAddress     = 0x2044
+	apuEPScratchAddress  = 0x2048
+	apuEPFIFOAddress     = 0x204C
+	apuGPScratchMaxSGE   = 0x20D4
+	apuGPFIFOMaxSGE      = 0x20D8
+	apuEPScratchMaxSGE   = 0x20DC
+	apuEPFIFOMaxSGE      = 0x20E0
+	apuGPOutputFIFOBase  = 0x3024
+	apuGPInputFIFOBase   = 0x3064
+	apuEPOutputFIFOBase  = 0x4024
+	apuEPInputFIFOBase   = 0x4064
+	apuFIFOStride        = 0x10
+	apuFIFOValueMask     = 0xFFFFFF
+	apuOutputFIFOs       = 4
+	apuInputFIFOs        = 2
+	apuNotifyIntBit      = 0x20
+	apuVoiceIntBit       = 0x40
+	apuMixbins           = 32
+	apuMultipassBin      = 31
+	apu3DVoices          = 64
+	apuEPFrameDivider    = 8
+	apuSGEBytes          = 8
+	apuPageBytes         = 4096
+	apuNotifierBase      = 2
+	apuNotifiersPerVoice = 4
+	apuNotifierBytes     = 16
+	apuNotifierStatusAt  = 15
+	apuNotifierDone      = 0x01
+	apuHRTFEntries       = 128
+	apuHRTFTaps          = 31
+	apuHRTFMaxDelay      = 42
+	apuMixbufBase        = 0x1400
+)
+
+// The windows of the global and encode processors in the audio processor's register space, their X, mixbuf, Y and
+// program memories, their reset registers with the run and DSP bits, and the steps a processor may take in one
+// frame before the page treats its program as never halting
+const (
+	apuGPBase          = 0x30000
+	apuEPBase          = 0x50000
+	apuProcessorBytes  = 0x10000
+	procXMemory        = 0x0000
+	procMixbufMemory   = 0x5000
+	procYMemory        = 0x6000
+	procPMemory        = 0xA000
+	procReset          = 0xFFFC
+	procResetRun       = 0x1
+	procResetDSP       = 0x2
+	gpXWords           = 0x1000
+	gpYWords           = 0x800
+	epXWords           = 0xC00
+	epYWords           = 0x100
+	procPWords         = 0x1000
+	procMixbufWords    = 0x400
+	procBootstrapWords = 0x800
+	procFrameSteps     = 1 << 21
+)
+
+// The front end's remaining methods, the free slots, the HRTF entry, the stream segment list context, the submix
+// and HRTF headrooms and submixes, the stream segment lists, the buffer base, loop, current and end offsets, the
+// head related impulse responses, the stream segments, the input and output buffer scatter gather entries and the
+// output buffer bases and lengths
+const (
+	pioFree               = 0x010
+	pioNotify             = 0x104
+	pioNotifyMode         = 0x10C
+	pioVoicePosition      = 0x130
+	pioHRTFEntry          = 0x160
+	pioContextDMANotify   = 0x180
+	pioSSLContextDMA      = 0x18C
+	pioCurrentSSL         = 0x190
+	pioSubmixHeadroom     = 0x200
+	pioHRTFHeadroom       = 0x280
+	pioHRTFSubmixes       = 0x2C0
+	pioVoiceSSLA          = 0x320
+	pioVoiceSSLB          = 0x35C
+	pioBufferBase         = 0x3A0
+	pioBufferLoop         = 0x3A4
+	pioBufferCurrent      = 0x3D8
+	pioBufferEnd          = 0x3DC
+	pioHRIR               = 0x400
+	pioHRIRLast           = 0x43C
+	pioSSLSegmentOffset   = 0x600
+	pioSSLSegmentLength   = 0x604
+	pioSSLSegments        = 64
+	pioInputSGE           = 0x804
+	pioInputSGEOffset     = 0x808
+	pioOutputBufferBase   = 0x1000
+	pioOutputBufferLength = 0x1004
+	pioOutputBuffers      = 4
+	pioOutputSGE          = 0x1800
+	pioOutputSGEOffset    = 0x1808
+	pioSGEOffsetMask      = 0xFFFFF000
+	pioSSLBaseMask        = 0x3FFFC0
+	pioSSLCountMask       = 0xFF
+	pioSSLBaseShift       = 8
+	pioHeadroomMask       = 0x7
+	pioBufferOffsetMask   = 0xFFFFFF
+	pioEnvelopeFilter     = 0x0F000000
+	pioEnvelopeAmplitude  = 0xF0000000
+)
+
+// The voice structure's remaining words, the bins, format, envelopes, filter mode, HRTF target, buffer base and
+// loop offsets, the current and end offsets with the envelope levels, the volumes, the LFO and envelope word, the
+// filter cutoffs and the pitch, with the fields the engine reads from each
+const (
+	voiceBins             = 0x00
+	voiceFormat           = 0x04
+	voiceEnvelope0        = 0x08
+	voiceEnvelopeA        = 0x0C
+	voiceEnvelope1        = 0x10
+	voiceEnvelopeF        = 0x14
+	voiceHRTFTarget       = 0x1C
+	voiceBufferBase       = 0x20
+	voiceBufferLoop       = 0x24
+	voiceOffset           = 0x58
+	voiceNext             = 0x5C
+	voiceVolumeA          = 0x60
+	voiceVolumeB          = 0x64
+	voiceVolumeC          = 0x68
+	voiceFilterA          = 0x74
+	voiceFilterB          = 0x78
+	voicePitchShift       = 16
+	voiceBinBits          = 5
+	voiceBinMask          = 0x1F
+	voiceHeadroomShift    = 13
+	voiceSamplesShift     = 16
+	voiceSamplesMask      = 0x1F
+	voiceMultipassBit     = 1 << 21
+	voiceLinkedBit        = 1 << 22
+	voicePersistBit       = 1 << 23
+	voiceStreamBit        = 1 << 24
+	voiceLoopBit          = 1 << 25
+	voiceClearMixBit      = 1 << 26
+	voiceStereoBit        = 1 << 27
+	voiceSampleSizeShift  = 28
+	voiceContainerShift   = 30
+	voiceContainerADPCM   = 2
+	voiceRateMask         = 0xFFF
+	voiceTimeShift        = 12
+	voiceLevelShift       = 24
+	voicePitchScaleShift  = 24
+	voiceFilterModeShift  = 16
+	voiceNewVoiceBit      = 1 << 20
+	voiceOffsetMask       = 0xFFFFFF
+	voiceLevelMask        = 0xFF
+	voiceFilterCutoffMask = 0xFFFF
+	voiceADPCMBlockBytes  = 36
+	voiceADPCMSamples     = 64
+	voiceEnvelopeRange    = 255
+	voiceVolumeUnit       = 64
+	voiceDecibelsPerUnit  = 20
+	voicePitchUnit        = 4096
+	voicePitchScaleUnit   = 32
+	voiceFilterUnit       = 4096
+	voiceFilterQUnit      = 0x8000
+	voiceFilterMinCutoff  = 0.003906
+	voiceFilterMinQ       = 0.079407
+	voiceDecayBase        = 0.99988799
+	voiceDecayScale       = 4096
+	voiceReleaseDecay     = 6.91
+	voiceHRTFSmoothing    = 0.01
+)
+
+// The audio codec interface, its function on the bus and the register its memory window is assigned through, the
+// mixer registers below the bus master registers, the channels' register blocks, the status, control, global
+// control and status and semaphore registers and bits, and the buffer descriptors' flags
+const (
+	aciBus                        = 0
+	aciDevice                     = 6
+	aciFunction                   = 0
+	aciWindow                     = 0x18
+	aciBusMasterBase              = 0x100
+	aciChannelBytes               = 0x10
+	aciPCMInChannel               = 0
+	aciPCMOutChannel              = 1
+	aciMicChannel                 = 2
+	aciSPDIFOutChannel            = 7
+	aciChannelsEnd                = 8
+	aciBufferList                 = 0x0
+	aciCurrentIndex               = 0x4
+	aciLastValidIndex             = 0x5
+	aciStatus                     = 0x6
+	aciPositionInBuffer           = 0x8
+	aciPrefetchedIndex            = 0xA
+	aciControl                    = 0xB
+	aciGlobalControl              = 0x2C
+	aciGlobalStatus               = 0x30
+	aciSemaphore                  = 0x34
+	aciDescriptors                = 32
+	aciDescriptorBytes            = 8
+	aciSampleBytes                = 2
+	aciChannels                   = 2
+	aciSampleHz                   = 48000
+	aciStatusFIFOError            = 0x10
+	aciStatusComplete             = 0x08
+	aciStatusLastValid            = 0x04
+	aciStatusLastValidCurrent     = 0x02
+	aciStatusHalted               = 0x01
+	aciStatusWriteClear           = 0x1C
+	aciControlInterruptOnComplete = 0x10
+	aciControlFIFOErrorInterrupt  = 0x08
+	aciControlLastValidInterrupt  = 0x04
+	aciControlReset               = 0x02
+	aciControlRun                 = 0x01
+	aciControlValidMask           = 0x1F
+	aciControlKeptMask            = 0x1C
+	aciGlobalWarmReset            = 0x4
+	aciGlobalColdReset            = 0x2
+	aciGlobalControlMask          = 0x3F
+	aciGlobalCodecReady           = 0x100
+	aciGlobalPCMInInt             = 0x20
+	aciGlobalPCMOutInt            = 0x40
+	aciGlobalMicInt               = 0x80
+	aciGlobalSPDIFInt             = 0x10
+	aciGlobalWriteClear           = 0x8C01
+	aciGlobalReadOnly             = 0x7FFE
+	aciGlobalValidMask            = 0x3FFFF
+	aciDescriptorInterrupt        = 1 << 31
+	aciDescriptorUnderrun         = 1 << 30
+	aciDescriptorCountMask        = 0xFFFF
+)
+
+// The codec's mixer registers the controller answers, with the values a Sigmatel 9700 holds after reset
+const (
+	codecReset             = 0x00
+	codecMasterVolume      = 0x02
+	codecHeadphoneVolume   = 0x04
+	codecMonoVolume        = 0x06
+	codecTone              = 0x08
+	codecBeepVolume        = 0x0A
+	codecPhoneVolume       = 0x0C
+	codecMicVolume         = 0x0E
+	codecLineInVolume      = 0x10
+	codecCDVolume          = 0x12
+	codecVideoVolume       = 0x14
+	codecAuxVolume         = 0x16
+	codecPCMOutVolume      = 0x18
+	codecRecordSelect      = 0x1A
+	codecRecordGain        = 0x1C
+	codecRecordGainMic     = 0x1E
+	codecGeneralPurpose    = 0x20
+	codec3DControl         = 0x22
+	codecPowerdown         = 0x26
+	codecExtendedID        = 0x28
+	codecExtendedControl   = 0x2A
+	codecFrontDACRate      = 0x2C
+	codecSurroundDACRate   = 0x2E
+	codecLFEDACRate        = 0x30
+	codecLRADCRate         = 0x32
+	codecMicADCRate        = 0x34
+	codecSigmatelAnalog    = 0x6C
+	codecSigmatelDAC2      = 0x6E
+	codecVendorID1         = 0x7C
+	codecVendorID2         = 0x7E
+	codecPowerdownReset    = 0x000F
+	codecVendorID1Value    = 0x8384
+	codecVendorID2Value    = 0x7600
+	codecExtendedIDValue   = 0x0809
+	codecExtendedCtlValue  = 0x0009
+	codecRate48000         = 0xBB80
+	codecMasterVolumeReset = 0x8000
+	codecPCMOutVolumeReset = 0x8808
+	codecRecordGainReset   = 0x8808
+	codecMasterVolumeMask  = 0xBF3F
+	codecPCMOutVolumeMask  = 0x9F1F
+	codecRecordGainMask    = 0x8F0F
+	codecRecordSelectMask  = 0x0707
+	codecPowerdownKeep     = 0x800F
+	codecVariableRateBit   = 0x1
+	codecVariableMicBit    = 0x8
+	codecMuteBit           = 0x8000
+	codecMasterVolumeSteps = 0x3F
+	codecPCMVolumeSteps    = 0x1F
+)
+
+// The codec's registers with their values after reset, in the order the reset writes them, and the registers whose
+// features the controller has no model of, kept as they stand
+var codecMixerResets = [][2]int{{codecReset, 0}, {codecHeadphoneVolume, 0}, {codecMonoVolume, 0}, {codecTone, 0}, {codecBeepVolume, 0}, {codecPhoneVolume, 0}, {codecMicVolume, 0}, {codecLineInVolume, 0}, {codecCDVolume, 0}, {codecVideoVolume, 0}, {codecAuxVolume, 0}, {codecRecordGainMic, 0}, {codecGeneralPurpose, 0}, {codec3DControl, 0}, {codecPowerdown, codecPowerdownReset}, {codecVendorID1, codecVendorID1Value}, {codecVendorID2, codecVendorID2Value}, {codecExtendedID, codecExtendedIDValue}, {codecExtendedControl, codecExtendedCtlValue}, {codecFrontDACRate, codecRate48000}, {codecSurroundDACRate, codecRate48000}, {codecLFEDACRate, codecRate48000}, {codecLRADCRate, codecRate48000}, {codecMicADCRate, codecRate48000}, {codecRecordSelect, 0}}
+var codecReadOnlyRegisters = []int{codecHeadphoneVolume, codecMonoVolume, codecTone, codecBeepVolume, codecPhoneVolume, codecMicVolume, codecLineInVolume, codecCDVolume, codecVideoVolume, codecAuxVolume, codecRecordGainMic, codecGeneralPurpose, codec3DControl, codecSigmatelAnalog, codecSigmatelDAC2}
+
+// Milliseconds between the codec interface's looks at the clock to stream the samples that fell due
+const aciAdvanceMs = 10
+
+// Frames the audio processor catches up per look at the clock, the rest dropped
+const apuFramesPerAdvance = 32
+
 // The graphics engine's interrupt status, notify source, trapped address and trapped data registers, the error
 // interrupt and notification source bits, the trapped address fields and the no operation method the kernel sends
 // with a parameter as a software method
@@ -408,8 +709,47 @@ const (
 	stalledOnFlip       = "flip"
 )
 
-// The display controller's start address register, which names the surface the display scans out
+// The display controller's start address register, which names the memory the display scans out
 const pcrtcStart = 0x600800
+
+// The CRTC index and data registers of the display controller, the sequencer index and data registers, the
+// register holding the clock mode with its screen off bit, the CRTC registers holding the horizontal display end,
+// the overflow bits, the vertical display end, the offset and its high bits, the pixel format with its depth
+// field, and the RAMDAC general control register with the bit selecting R5G6B5 at 16 bits
+const (
+	crtcIndexRegister     = 0x6013D4
+	crtcDataRegister      = 0x6013D5
+	seqIndexRegister      = 0xC03C4
+	seqDataRegister       = 0xC03C5
+	seqClockMode          = 0x01
+	seqScreenOffBit       = 0x20
+	crtcHorizontalEnd     = 0x01
+	crtcOverflow          = 0x07
+	crtcVerticalEnd       = 0x12
+	crtcOffset            = 0x13
+	crtcRepaint0          = 0x19
+	crtcExtra             = 0x25
+	crtcPixel             = 0x28
+	crtcPixelDepthMask    = 0x3
+	crtcPixelDepth8       = 1
+	crtcPixelDepth16      = 2
+	crtcPixelDepth32      = 3
+	crtcCharacterPixels   = 8
+	pramdacGeneralControl = 0x680600
+	pramdac565Bit         = 0x1000
+)
+
+// The 2D classes the FIFO binds beside the 3D class, the 2D surfaces, the image blit with its source copy
+// operation, the memory copy, and the 2D surfaces' colour formats by bytes per pixel
+const (
+	surfaces2DClass = 0x62
+	imageBlitClass  = 0x9F
+	memoryCopyClass = 0x39
+	blitSourceCopy  = 3
+)
+
+var surfaces2DFormats = []uint32{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB}
+var surfaces2DBytes = map[uint32]int{0x1: 1, 0x2: 2, 0x3: 2, 0x4: 2, 0x5: 2, 0x6: 4, 0x7: 4, 0x8: 4, 0x9: 4, 0xA: 4, 0xB: 4}
 
 // The 3D class's methods the graphics engine executes, by the names the nouveau and xemu register definitions give them
 var kelvinMethods = []struct {

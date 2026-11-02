@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DiscoX</title>
+<title>Xbox Dashboard</title>
+<link rel="icon" href="data:,">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
@@ -17,8 +18,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
 </style>
 </head>
 <body>
-<canvas id="screen" width="640" height="480"></canvas>
-<div id="loading">Loading DiscoX...</div>
+<canvas id="screen"></canvas>
+<div id="loading">Loading Xbox Dashboard...</div>
 <div id="status"></div>
 <script src="runtime.js"></script>
 <script>
@@ -29,12 +30,33 @@ channel.port1.onmessage = () => { const fn = queued; queued = null; fn(); };
 addEventListener("keydown", (e) => { held.add(e.code); if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.code.startsWith("F")) e.preventDefault(); });
 addEventListener("keyup", (e) => held.delete(e.code));
 addEventListener("blur", () => held.clear());
+let audio = null;
+const audioSink = (rate) => {
+  if (audio !== null) return audio;
+  const context = new AudioContext({ sampleRate: rate });
+  const sink = `class Sink extends AudioWorkletProcessor {
+    constructor() { super(); this.ring = new Float32Array(sampleRate * 2); this.head = 0; this.tail = 0; this.playing = false; this.port.onmessage = (e) => { if (e.data === null) { this.tail = this.head; this.playing = false; return; } const s = e.data; for (let i = 0; i < s.length; i++) { const next = (this.head + 1) % this.ring.length; if (next === this.tail) return; this.ring[this.head] = s[i] / 32768; this.head = next; } }; }
+    process(inputs, outputs) {
+      const left = outputs[0][0], right = outputs[0][1], held = (this.head - this.tail + this.ring.length) % this.ring.length;
+      if (!this.playing) { if (held < sampleRate / 5) return true; this.playing = true; }
+      for (let i = 0; i < left.length; i++) { if (this.tail === this.head) { left[i] = 0; right[i] = 0; this.playing = false; continue; } left[i] = this.ring[this.tail]; right[i] = this.ring[this.tail + 1]; this.tail = (this.tail + 2) % this.ring.length; }
+      return true;
+    }
+  }
+  registerProcessor("sink", Sink);`;
+  let node = null;
+  context.audioWorklet.addModule(URL.createObjectURL(new Blob([sink], { type: "text/javascript" }))).then(() => { node = new AudioWorkletNode(context, "sink", { numberOfInputs: 0, outputChannelCount: [2] }); node.connect(context.destination); });
+  const resume = () => { if (context.state !== "running") { if (node !== null) node.port.postMessage(null); context.resume(); } };
+  for (const type of ["keydown", "pointerdown", "touchstart"]) addEventListener(type, resume);
+  audio = { rate: context.sampleRate, push: (samples) => { if (node === null) return; const copy = Int16Array.from(samples); node.port.postMessage(copy, [copy.buffer]); } };
+  return audio;
+};
 const bytesOf = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
 const textOf = (bytes) => btoa(String.fromCharCode(...bytes));
 start({
   now: () => performance.now(),
   clock: () => Date.now(),
-  later: (ms, fn) => { if (ms <= 0) { queued = fn; channel.port2.postMessage(null); } else setTimeout(fn, ms); },
+  later: (ms, fn) => { queued = ms <= 0 ? fn : () => setTimeout(fn, ms); channel.port2.postMessage(null); },
   load: (name) => new Promise((resolve, reject) => {
     const script = document.createElement("script");
     script.src = name;
@@ -55,6 +77,8 @@ start({
     return out;
   },
   screen: () => screen,
+  pixels: () => ({ width: screen.clientWidth * devicePixelRatio, height: screen.clientHeight * devicePixelRatio }),
+  audio: audioSink,
   keys: () => held,
   gamepads: () => navigator.getGamepads ? Array.from(navigator.getGamepads()).filter((g) => g !== null) : [],
   shown: () => loading.classList.add("hidden"),

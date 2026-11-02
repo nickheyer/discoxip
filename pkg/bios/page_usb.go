@@ -278,7 +278,7 @@ function usbModel(w) {
     while (now >= u.nextAt && n < USB_FRAMES_PER_ADVANCE) { u.nextAt += USB_FRAME_MS; frame(now); n++; }
     if (now >= u.nextAt) u.nextAt = now + USB_FRAME_MS;
   }
-  if (u.advance === null) { u.advance = frames; TIMED.push(u); }
+  if (u.advance === null) { u.advance = frames; u.slack = USB_FRAME_MS * (USB_FRAMES_PER_ADVANCE / 2); TIMED.push(u); }
   function reset() {
     u.control = (u.control & ~HC_STATE_MASK) >>> 0; u.status = 0; u.enable = 0; u.hcca = 0; u.periodCurrent = 0; u.controlHead = 0; u.controlCurrent = 0; u.bulkHead = 0; u.bulkCurrent = 0; u.done = 0; u.interval = HC_FRAME_INTERVAL_RESET; u.number = 0; u.periodicStart = 0;
   }

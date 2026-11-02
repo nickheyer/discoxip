@@ -12,7 +12,7 @@ const vsIlu = ["NOP", "MOV", "RCP", "RCC", "RSQ", "EXP", "LOG", "LIT"];
 const vsOut = ["oPos", "o1", "o2", "oD0", "oD1", "oFog", "oPts", "oB0", "oB1", "oT0", "oT1", "oT2", "oT3", "o13", "o14", "A0"];
 `
 
-// A vertex program's instructions as a GLSL vertex shader body, each operation as the xemu translator writes it, screen space brought back to clip space
+// A vertex program's instructions as a GLSL vertex shader body, each operation as the xemu translator writes it, screen space brought back to clip space with the varyings scaled by 1/w for perspective correct interpolation
 const vertexProgramTranslator = `
 function vsGet(t, name) { const f = vsFields[name]; return (t[f[0]] >>> f[1]) & ((1 << f[2]) - 1); }
 function vsMaskOf(m) { let s = ""; for (let i = 0; i < 4; i++) if ((m & (8 >> i)) !== 0) s += "xyzw"[i]; return s; }
@@ -87,6 +87,7 @@ function translateVertexProgram(words, start) {
   }
   fault("the vertex program starting at slot " + start + " has no final instruction");
 }
+const programPerspective = "invW = (oPos.w == 0.0 || isinf(oPos.w)) ? 1.0 : 1.0 / oPos.w;\n";
 const programEpilogue = "oPos.x = 2.0 * (oPos.x - surfaceSize.x * 0.5) / surfaceSize.x;\noPos.y = -2.0 * (oPos.y - surfaceSize.y * 0.5) / surfaceSize.y;\n" +
   "if (clipRange.y != clipRange.x) oPos.z = 2.0 * (oPos.z - clipRange.x) / (clipRange.y - clipRange.x) - 1.0; else oPos.z = 2.0 * oPos.z - 1.0;\n" +
   "if (oPos.w < 0.0) { oPos.xyz *= oPos.w; } else { oPos.w = 1.0; }\n";
@@ -99,15 +100,15 @@ function programTail(cfg) {
 function vertexShaderSource(body, flat, fixed) {
   let s = "#version 300 es\nprecision highp float;\n";
   for (let i = 0; i < KELVIN_ATTRIBUTES; i++) s += "in vec4 v" + i + ";\n";
-  s += "uniform vec4 c[" + KELVIN_CONSTANTS + "];\nuniform vec2 surfaceSize;\nuniform vec2 clipRange;\nuniform float pointSize;\nuniform vec3 fogParams;\n";
+  s += "uniform vec4 c[" + KELVIN_CONSTANTS + "];\nuniform vec2 surfaceSize;\nuniform vec2 clipRange;\nuniform float pointSize;\nuniform float pixelScale;\nuniform vec3 fogParams;\n";
   if (fixed) s += "uniform vec4 lightCtx[" + (KELVIN_LIGHTS * KELVIN_LIGHT_STRIDE / 16) + "];\nuniform vec3 sceneAmbient;\nuniform vec3 materialEmission;\nuniform float materialAlpha;\nuniform vec3 specularParams;\nuniform float pointParams[" + KELVIN_POINT_PARAMS + "];\n";
-  s += (flat ? "flat " : "") + "out vec4 vD0;\n" + (flat ? "flat " : "") + "out vec4 vD1;\nout vec4 vFog;\nout vec4 vT0;\nout vec4 vT1;\nout vec4 vT2;\nout vec4 vT3;\n";
+  s += (flat ? "flat " : "") + "out vec4 vD0;\n" + (flat ? "flat " : "") + "out vec4 vD1;\nout vec4 vFog;\nout vec4 vT0;\nout vec4 vT1;\nout vec4 vT2;\nout vec4 vT3;\nout float vInvW;\nflat out float vInvWFlat;\n";
   s += "const float FLOAT_MAX = 3.402823466e38;\n";
   s += "int clampIndex(int i) { return clamp(i, 0, " + (KELVIN_CONSTANTS - 1) + "); }\n";
   s += "void main() {\nvec4 R0 = vec4(0.0), R1 = vec4(0.0), R2 = vec4(0.0), R3 = vec4(0.0), R4 = vec4(0.0), R5 = vec4(0.0), R6 = vec4(0.0), R7 = vec4(0.0), R8 = vec4(0.0), R9 = vec4(0.0), R10 = vec4(0.0), R11 = vec4(0.0);\n";
   s += "vec4 oPos = vec4(0.0, 0.0, 0.0, 1.0), o1 = vec4(0.0), o2 = vec4(0.0), oD0 = vec4(0.0, 0.0, 0.0, 1.0), oD1 = vec4(0.0, 0.0, 0.0, 1.0), oFog = vec4(0.0), oPts = vec4(0.0), oB0 = vec4(0.0), oB1 = vec4(0.0), oT0 = vec4(0.0, 0.0, 0.0, 1.0), oT1 = vec4(0.0, 0.0, 0.0, 1.0), oT2 = vec4(0.0, 0.0, 0.0, 1.0), oT3 = vec4(0.0, 0.0, 0.0, 1.0), o13 = vec4(0.0), o14 = vec4(0.0);\n";
-  s += "vec4 tmp = vec4(0.0), ilu = vec4(0.0);\nint A0 = 0;\n" + body;
-  s += "gl_Position = oPos;\nvD0 = clamp(oD0, 0.0, 1.0);\nvD1 = clamp(oD1, 0.0, 1.0);\nvFog = oFog;\nvT0 = oT0;\nvT1 = oT1;\nvT2 = oT2;\nvT3 = oT3;\ngl_PointSize = oPts.x;\n}\n";
+  s += "vec4 tmp = vec4(0.0), ilu = vec4(0.0);\nint A0 = 0;\nfloat invW = 1.0;\n" + body;
+  s += "gl_Position = oPos;\nvInvW = invW;\nvInvWFlat = invW;\nvD0 = clamp(oD0, 0.0, 1.0) * invW;\nvD1 = clamp(oD1, 0.0, 1.0) * invW;\nvFog = oFog * invW;\nvT0 = oT0 * invW;\nvT1 = oT1 * invW;\nvT2 = oT2 * invW;\nvT3 = oT3 * invW;\ngl_PointSize = oPts.x * pixelScale;\n}\n";
   return s;
 }
 `
@@ -161,7 +162,8 @@ function xfMat(slot) { return "mat4(c[" + slot + "], c[" + (slot + 1) + "], c[" 
 function xfMats(slot) { const parts = []; for (let k = 0; k < KELVIN_SKIN_MATRICES; k++) parts.push(xfMat(slot + k * KELVIN_XF_MATRIX_STRIDE)); return "mat4[" + KELVIN_SKIN_MATRICES + "](" + parts.join(", ") + ")"; }
 const fixedPosition = "vec4 viewportOffset = c[" + KELVIN_XF_VIEWPORT_OFFSET + "];\nfloat m11 = 0.5 * surfaceSize.x, m22 = -0.5 * surfaceSize.y;\n" +
   "oPos.x = p.x / m11 + p.w * (viewportOffset.x / m11 - 1.0);\noPos.y = p.y / m22 + p.w * (1.0 - viewportOffset.y / m22);\n" +
-  "oPos.z = clipRange.y != clipRange.x ? 2.0 * (p.z - p.w * clipRange.x) / (clipRange.y - clipRange.x) - p.w : 2.0 * p.z - p.w;\noPos.w = p.w;\n";
+  "oPos.z = clipRange.y != clipRange.x ? 2.0 * (p.z - p.w * clipRange.x) / (clipRange.y - clipRange.x) - p.w : 2.0 * p.z - p.w;\noPos.w = p.w;\n" +
+  "invW = (oPos.w == 0.0 || isinf(oPos.w)) ? 1.0 : 1.0 / oPos.w;\nif (oPos.w >= 0.0) { oPos.xyz *= invW; oPos.w = 1.0; }\n";
 function fixedFunctionSource(cfg) {
   const skin = skinningOf(cfg.skinning);
   let s = "mat4 compositeMat = " + xfMat(KELVIN_XF_COMPOSITE) + ";\nmat4 modelViewMat[" + KELVIN_SKIN_MATRICES + "] = " + xfMats(KELVIN_XF_MODEL_VIEW) + ";\nmat4 invModelViewMat[" + KELVIN_SKIN_MATRICES + "] = " + xfMats(KELVIN_XF_INVERSE_MODEL_VIEW) + ";\nvec4 eyePosition = c[" + KELVIN_XF_EYE + "];\n";
@@ -299,11 +301,11 @@ function combinerScaled(expr, op, lanes) {
   const half = lanes === 1 ? "0.5" : "vec3(0.5)";
   switch (op) {
   case 0: return expr;
-  case 1: return "(2.0 * " + expr + ")";
-  case 2: return "(4.0 * " + expr + ")";
-  case 3: return "(0.5 * " + expr + ")";
-  case 4: return "(" + expr + " - " + half + ")";
-  case 5: return "(2.0 * (" + expr + " - " + half + "))";
+  case 1: return "(" + expr + " - " + half + ")";
+  case 2: return "(2.0 * " + expr + ")";
+  case 3: return "(2.0 * (" + expr + " - " + half + "))";
+  case 4: return "(4.0 * " + expr + ")";
+  case 6: return "(0.5 * " + expr + ")";
   }
   fault("combiner output operation " + op);
 }
@@ -349,23 +351,35 @@ const fragmentHelpers = "vec2 texXY(vec2 c, vec4 scale) { c *= scale.xy; return 
   "vec2 remapCubeTo2D(vec3 t) { vec3 a = abs(t); if (a.x > a.y && a.x > a.z) return (t.x > 0.0 ? vec2(-t.z, t.y) : vec2(t.z, t.y)) / a.x; if (a.y > a.x && a.y > a.z) return (t.y > 0.0 ? vec2(t.x, -t.z) : vec2(t.x, t.z)) / a.y; return (t.z > 0.0 ? vec2(t.x, t.y) : vec2(-t.x, t.y)) / a.z; }\n" +
   "vec3 remap2DToCube(vec3 t) { vec2 st = t.xy / t.z; return normalize(vec3(1.0, st.y, -st.x)); }\n" +
   "bool checkColorKey(vec4 texel, uint key, uint mask) { uvec4 c = uvec4(texel * 255.0 + 0.5); uint color = (c.a << 24) | (c.r << 16) | (c.g << 8) | c.b; return (color & mask) == (key & mask); }\n" +
+  "bool outsideBorder(ivec2 p, vec2 size, bvec2 axes) { return (axes.x && (p.x < 0 || p.x >= int(size.x))) || (axes.y && (p.y < 0 || p.y >= int(size.y))); }\n" +
+  "vec4 borderFetch(sampler2D tex, ivec2 p, vec2 size, vec4 border, bvec2 axes) { if (outsideBorder(p, size, axes)) return border; return texelFetch(tex, clamp(p, ivec2(0), ivec2(size) - 1), 0); }\n" +
+  "float borderDepth(sampler2D tex, ivec2 p, vec2 size, float border, bvec2 axes) { if (outsideBorder(p, size, axes)) return border; return texelFetch(tex, clamp(p, ivec2(0), ivec2(size) - 1), 0).r; }\n" +
   "const float gaussian3x3[9] = float[9](1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0, 2.0 / 16.0, 4.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0);\n" +
   "const vec2 convolution3x3[9] = vec2[9](vec2(-1.0, -1.0), vec2(0.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 0.0), vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(-1.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 1.0));\n";
 const dotFuncs = ["dotmap_zero_to_one", "dotmap_minus1_to_1_d3d", "dotmap_minus1_to_1_gl", "dotmap_minus1_to_1", "dotmap_hilo_1"];
 function stageInput(k, i) { return i === 0 ? -1 : i === 1 ? 0 : (k.otherStageInput >>> (8 + 4 * i)) & 0xF; }
 function dotMapOf(k, i) { const m = (k.dotMapping >>> (4 * (i - 1))) & 0xF; if (m >= dotFuncs.length) fault("dot product mapping " + m + " on stage " + i); return dotFuncs[m]; }
+function borderAxes(t) { return "bvec2(" + t.borderS + ", " + t.borderT + ")"; }
 function shadowStage(i, k, compareZ) {
-  const t = k.stages[i].tex, func = k.shadowFunc, tex = "tex" + i, pT = "pT" + i, scale = "texScale" + i;
+  const t = k.stages[i].tex, func = k.shadowFunc, tex = "tex" + i, pT = "pT" + i, scale = "texScale" + i, border = t.borderS || t.borderT;
   if (func === 0) return "vec4 t" + i + " = vec4(0.0);\n";
   if (func === 7) return "vec4 t" + i + " = vec4(1.0);\n";
   const op = ["", "<", "==", "<=", ">", "!=", ">="][func];
   const maxDepth = t.bits === 24 ? "16777215.0" : t.floating ? "511.9375" : "65535.0";
-  let s = "vec4 t" + i + ";\n{\nvec2 c = textureCoord(" + pT + ", " + scale + ");\nfloat ref = " + (compareZ ? "clamp(" + pT + ".z / " + pT + ".w, 0.0, " + maxDepth + ")" : "0.0") + ";\n";
+  const fetch = (p) => border ? "borderDepth(" + tex + ", " + p + ", size, texBorder[" + i + "].r, " + borderAxes(t) + ")" : "texelFetch(" + tex + ", clamp(" + p + ", ivec2(0), ivec2(size) - 1), 0).r";
+  let s = "vec4 t" + i + ";\n{\nvec2 c = textureCoord(" + pT + ", " + scale + ");\nfloat ref = " + (compareZ ? "clamp(" + pT + ".z / " + pT + ".w, 0.0, " + maxDepth + ")" : "0.0") + ";\nvec2 size = vec2(textureSize(" + tex + ", 0));\n";
   if (t.smooth) {
-    s += "vec2 size = vec2(textureSize(" + tex + ", 0));\nvec2 p = c * size - 0.5;\nvec2 f = fract(p);\nivec2 b = ivec2(floor(p));\nivec2 last = ivec2(size) - 1;\n";
-    for (const [name, dx, dy] of [["s00", 0, 0], ["s10", 1, 0], ["s01", 0, 1], ["s11", 1, 1]]) s += "float " + name + " = texelFetch(" + tex + ", clamp(b + ivec2(" + dx + ", " + dy + "), ivec2(0), last), 0).r * " + maxDepth + " " + op + " ref ? 1.0 : 0.0;\n";
+    s += "vec2 p = c * size - 0.5;\nvec2 f = fract(p);\nivec2 b = ivec2(floor(p));\n";
+    for (const [name, dx, dy] of [["s00", 0, 0], ["s10", 1, 0], ["s01", 0, 1], ["s11", 1, 1]]) s += "float " + name + " = " + fetch("b + ivec2(" + dx + ", " + dy + ")") + " * " + maxDepth + " " + op + " ref ? 1.0 : 0.0;\n";
     s += "t" + i + " = vec4(mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y));\n";
-  } else s += "t" + i + " = vec4(texture(" + tex + ", c).r * " + maxDepth + " " + op + " ref ? 1.0 : 0.0);\n";
+  } else s += "t" + i + " = vec4(" + fetch("ivec2(floor(c * size))") + " * " + maxDepth + " " + op + " ref ? 1.0 : 0.0);\n";
+  return s + "}\n";
+}
+function borderSample(i, t) {
+  const tex = "tex" + i, fetch = (p) => "borderFetch(" + tex + ", " + p + ", size, texBorder[" + i + "], " + borderAxes(t) + ")";
+  let s = "vec4 t" + i + ";\n{\nvec2 c = textureCoord(pT" + i + ", texScale" + i + ");\nvec2 size = vec2(textureSize(" + tex + ", 0));\n";
+  if (t.smooth) s += "vec2 p = c * size - 0.5;\nvec2 f = fract(p);\nivec2 b = ivec2(floor(p));\nvec4 s00 = " + fetch("b") + ", s10 = " + fetch("b + ivec2(1, 0)") + ", s01 = " + fetch("b + ivec2(0, 1)") + ", s11 = " + fetch("b + ivec2(1, 1)") + ";\nt" + i + " = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);\n";
+  else s += "t" + i + " = " + fetch("ivec2(floor(c * size))") + ";\n";
   return s + "}\n";
 }
 function textureStage(i, k) {
@@ -381,9 +395,10 @@ function textureStage(i, k) {
     if (t === null) return none;
     if (t.depth) return shadowStage(i, k, mode === 2);
     if (t.cube) { if (mode === 2) fault("3D projective sampling of the cube map on stage " + i); return sample("remap2DToCube(" + pT + ".xyw)"); }
+    if (t.borderS || t.borderT) { if (t.conv !== 0) fault("texture convolution with border texels on stage " + i); return borderSample(i, t); }
     if (t.conv === 0) return sample("textureCoord(" + pT + ", " + scale + ")");
     if (t.conv !== 2) fault("texture convolution kernel " + t.conv + " on stage " + i);
-    return none + "{\nvec2 c = textureCoord(" + pT + ", " + scale + ");\nvec2 texel = 1.0 / vec2(textureSize(" + tex + ", 0));\nfor (int k = 0; k < 9; k++) t" + i + " += texture(" + tex + ", c + convolution3x3[k] * texel) * gaussian3x3[k];\n}\n";
+    return none + "{\nvec2 c = textureCoord(" + pT + ", " + scale + ");\nvec2 texel = texTexel" + i + ";\nfor (int k = 0; k < 9; k++) t" + i + " += texture(" + tex + ", c + convolution3x3[k] * texel) * gaussian3x3[k];\n}\n";
   case 3: return t === null ? none : cubeOrFlat(pT + ".xyz");
   case 4: return "vec4 t" + i + " = clamp(" + pT + ", 0.0, 1.0);\n";
   case 5: { let s = none; for (let j = 0; j < 4; j++) s += "if (" + pT + "." + "xyzw"[j] + " " + (((k.clipPlaneMode >>> (4 * i + j)) & 1) !== 0 ? ">=" : "<") + " 0.0) discard;\n"; return s; }
@@ -414,11 +429,12 @@ function stageSource(i, k) {
 }
 function fragmentShaderSource(k) {
   let s = "#version 300 es\nprecision highp float;\nprecision highp sampler2D;\nprecision highp samplerCube;\n";
-  s += (k.flat ? "flat " : "") + "in vec4 vD0;\n" + (k.flat ? "flat " : "") + "in vec4 vD1;\nin vec4 vFog;\nin vec4 vT0;\nin vec4 vT1;\nin vec4 vT2;\nin vec4 vT3;\n";
-  for (let i = 0; i < KELVIN_STAGES; i++) s += "uniform " + (k.stages[i].tex !== null && k.stages[i].tex.cube ? "samplerCube" : "sampler2D") + " tex" + i + ";\nuniform vec4 texScale" + i + ";\n";
-  s += "uniform vec4 c0[" + KELVIN_COMBINERS + "];\nuniform vec4 c1[" + KELVIN_COMBINERS + "];\nuniform vec4 finalC0;\nuniform vec4 finalC1;\nuniform vec4 fogColor;\nuniform float alphaRef;\nuniform mat2 bumpMat[" + KELVIN_STAGES + "];\nuniform float bumpScale[" + KELVIN_STAGES + "];\nuniform float bumpOffset[" + KELVIN_STAGES + "];\nuniform uint colorKey[" + KELVIN_STAGES + "];\nout vec4 fragColor;\n";
+  s += (k.flat ? "flat " : "") + "in vec4 vD0;\n" + (k.flat ? "flat " : "") + "in vec4 vD1;\nin vec4 vFog;\nin vec4 vT0;\nin vec4 vT1;\nin vec4 vT2;\nin vec4 vT3;\nin float vInvW;\nflat in float vInvWFlat;\n";
+  for (let i = 0; i < KELVIN_STAGES; i++) s += "uniform " + (k.stages[i].tex !== null && k.stages[i].tex.cube ? "samplerCube" : "sampler2D") + " tex" + i + ";\nuniform vec4 texScale" + i + ";\nuniform vec2 texTexel" + i + ";\n";
+  s += "uniform vec4 c0[" + KELVIN_COMBINERS + "];\nuniform vec4 c1[" + KELVIN_COMBINERS + "];\nuniform vec4 finalC0;\nuniform vec4 finalC1;\nuniform vec4 fogColor;\nuniform float alphaRef;\nuniform mat2 bumpMat[" + KELVIN_STAGES + "];\nuniform float bumpScale[" + KELVIN_STAGES + "];\nuniform float bumpOffset[" + KELVIN_STAGES + "];\nuniform uint colorKey[" + KELVIN_STAGES + "];\nuniform vec4 texBorder[" + KELVIN_STAGES + "];\nout vec4 fragColor;\n";
   s += fragmentHelpers;
-  s += "void main() {\nvec4 v0 = vD0, v1 = vD1, r0 = vec4(0.0, 0.0, 0.0, 1.0), r1 = vec4(0.0);\nvec4 fog = vec4(fogColor.rgb, clamp(vFog.x, 0.0, 1.0));\nvec4 pT0 = vT0, pT1 = vT1, pT2 = vT2, pT3 = vT3;\n";
+  const colorW = k.flat ? "vInvWFlat" : "vInvW";
+  s += "void main() {\nvec4 v0 = vD0 / " + colorW + ", v1 = vD1 / " + colorW + ", r0 = vec4(0.0, 0.0, 0.0, 1.0), r1 = vec4(0.0);\nvec4 fog = vec4(fogColor.rgb, clamp(vFog.x / vInvW, 0.0, 1.0));\nvec4 pT0 = vT0 / vInvW, pT1 = vT1 / vInvW, pT2 = vT2 / vInvW, pT3 = vT3 / vInvW;\n";
   for (let i = 0; i < KELVIN_STAGES; i++) s += stageSource(i, k);
   const muxTest = (k.control & 0x100) !== 0 ? "r0.a >= 0.5" : "(uint(r0.a * 255.0) & 1u) == 1u";
   for (let i = 0; i < (k.control & 0xF); i++) s += combinerPortion(k.colorICW[i], k.colorOCW[i], i, false, muxTest) + combinerPortion(k.alphaICW[i], k.alphaOCW[i], i, true, muxTest);

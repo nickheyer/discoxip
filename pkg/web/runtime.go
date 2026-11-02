@@ -129,7 +129,7 @@ func writeStart(w *bufio.Writer) {
 	js("// ---- the page's entry ----")
 	js("let scheduled = false, lastStatus = 0;")
 	js("function schedule(ms) { if (scheduled) return; scheduled = true; bridge.later(ms, run); }")
-	js("function status() { const now = bridge.now(); if (now - lastStatus < %d) return; lastStatus = now; bridge.status(Math.round(hwElapsedSeconds()) + \"s \" + stepsRun + \" blocks\" + (phaseBoot ? \", booting\" : inExecutable ? \", running the executable\" : \", running the kernel\") + (next === null ? \", halted\" : \" at \" + next.name) + hwStatus()); }", statusIntervalMs)
+	js("function status() { const now = bridge.now(); if (now - lastStatus < %d) return; lastStatus = now; bridge.status(Math.round(hwElapsedSeconds()) + \"s \" + stepsRun + \" blocks\" + (phaseBoot ? \", booting\" : inExecutable ? \", running the executable\" : \", running the kernel\") + (next === null ? (idle ? \", idle at \" + hex(haltedAt) : \", halted\") : \" at \" + next.name) + hwStatus()); }", statusIntervalMs)
 	js("function run() {")
 	js("scheduled = false;")
 	js("if (fatal !== null) return;")

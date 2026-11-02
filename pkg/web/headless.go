@@ -16,13 +16,14 @@ import (
 const headlessBlocks = 400000000
 
 // The bridge a headless run hands the page, scripts run in the one context, files read from the web directory,
-// no key or gamepad held and nothing kept across runs
+// no key or gamepad held, the audio counted by frame and peak and nothing kept across runs
 const headlessBridge = `
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 const dir = %q;
 const kept = new Map();
-const finish = (text) => { console.log(text); process.exit(0); };
+let audioFrames = 0, audioPeak = 0;
+const finish = (text) => { console.log(text + ", " + audioFrames + " audio frames with peak " + audioPeak); process.exit(0); };
 const load = async (name) => { vm.runInThisContext(await readFile(dir + "/" + name, "utf8"), { filename: name }); };
 await load(%q);
 await start({
@@ -31,6 +32,8 @@ await start({
   later: (ms, fn) => setTimeout(fn, ms),
   load,
   screen: () => null,
+  pixels: () => ({ width: 0, height: 0 }),
+  audio: (rate) => ({ rate, push: (samples) => { audioFrames += samples.length / 2; for (let i = 0; i < samples.length; i++) audioPeak = Math.max(audioPeak, Math.abs(samples[i])); } }),
   keys: () => new Set(),
   gamepads: () => [],
   shown: () => {},
