@@ -1,5 +1,5 @@
 # discoxip
-Unpacks Original Xbox dash from XIP archives and OS from collected reference material.
+Unpacks Original Xbox dash from XIP archives and Operating System into Native C.
 
 ## Install
 ```
