@@ -17,8 +17,6 @@ func TestRequiredFlags(t *testing.T) {
 		{"build", []string{"build", dir}, `required flag(s) "bios", "mcpx" not set`},
 		{"build with bios", []string{"build", dir, "--bios", "f"}, `required flag(s) "mcpx" not set`},
 		{"build with mcpx", []string{"build", "--mcpx", "f", dir}, `required flag(s) "bios" not set`},
-		{"web export", []string{"web", "export", dir}, `required flag(s) "bios", "mcpx" not set`},
-		{"web export with mcpx", []string{"web", "export", "--mcpx", "f", dir}, `required flag(s) "bios" not set`},
 		{"scene info", []string{"scene", "info", "x.xap"}, `required flag(s) "bios", "mcpx", "xbe" not set`},
 		{"scene export", []string{"scene", "export", "x.xap"}, `required flag(s) "bios", "mcpx", "xbe" not set`},
 		{"scene build", []string{"scene", "build", dir}, `required flag(s) "bios", "mcpx", "xbe" not set`},
@@ -29,8 +27,6 @@ func TestRequiredFlags(t *testing.T) {
 		{"buffer dump with xbe", []string{"buffer", "dump", "--xbe", "a", "x.vb"}, `required flag(s) "bios", "mcpx" not set`},
 		{"buffer export", []string{"buffer", "export", "x.vb", "x.ib"}, `required flag(s) "bios", "mcpx", "xbe" not set`},
 		{"buffer export with xbe and mcpx", []string{"buffer", "export", "--xbe", "a", "--mcpx", "m", "x.vb", "x.ib"}, `required flag(s) "bios" not set`},
-		{"bios boot", []string{"bios", "boot", "flash.bin"}, `required flag(s) "launch", "output" not set`},
-		{"bios boot with output", []string{"bios", "boot", "-o", dir, "flash.bin"}, `required flag(s) "launch" not set`},
 	}
 	for _, tc := range tests {
 		res := runCLI(t, tc.args...)
@@ -73,7 +69,7 @@ func TestBIOSCommandsNameTheRevisionWithoutMCPX(t *testing.T) {
 	for _, revision := range []int{0, 1} {
 		path := writeFile(t, filepath.Join(t.TempDir(), fmt.Sprintf("flash%d.bin", revision)), flashBank(revision))
 		want := fmt.Sprintf("bios: %s boots on MCPX 1.%d, pass that ROM dump with --mcpx", path, revision)
-		for _, sub := range []string{"info", "extract", "lift", "machine"} {
+		for _, sub := range []string{"info", "extract", "lift"} {
 			res := runCLI(t, "bios", sub, path)
 			if res.err == nil || res.err.Error() != want {
 				t.Errorf("bios %s on revision %d: error %v, want %q", sub, revision, res.err, want)

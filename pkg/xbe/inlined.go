@@ -46,56 +46,6 @@ func mapExprWithin(e Expr, f func(Expr) (Expr, bool), done map[exprKey]Expr) Exp
 	return r
 }
 
-// FoldMemo rebuilds expressions bottom up with the result of every node kept across calls, so a chain of nodes
-// folded one longer at a time costs each node once, the nodes kept alive while their identities are remembered
-type FoldMemo struct {
-	done map[exprKey]foldEntry
-}
-
-// foldEntry is a node folded before and what it folded to
-type foldEntry struct {
-	src, out Expr
-}
-
-// NewFoldMemo starts remembering folded nodes
-func NewFoldMemo() *FoldMemo {
-	return &FoldMemo{done: map[exprKey]foldEntry{}}
-}
-
-// Len reports the nodes remembered
-func (m *FoldMemo) Len() int {
-	return len(m.done)
-}
-
-// Reset forgets every node remembered
-func (m *FoldMemo) Reset() {
-	m.done = map[exprKey]foldEntry{}
-}
-
-// Fold rebuilds an expression bottom up, f applied to each node once its children are rebuilt, a leaf without the
-// memo and every other node once however often it is shared or folded again
-func (m *FoldMemo) Fold(e Expr, f func(Expr) (Expr, bool)) Expr {
-	if e == nil {
-		return nil
-	}
-	if !hasChildren(e) {
-		if r, ok := f(e); ok {
-			return r
-		}
-		return e
-	}
-	k := keyOf(e)
-	if entry, ok := m.done[k]; ok {
-		return entry.out
-	}
-	r := rebuilt(e, func(x Expr) Expr { return m.Fold(x, f) })
-	if folded, ok := f(r); ok {
-		r = folded
-	}
-	m.done[k] = foldEntry{src: e, out: r}
-	return r
-}
-
 // A node with its children replaced through sub, the node itself where none changed
 func rebuilt(e Expr, sub func(Expr) Expr) Expr {
 	r := e

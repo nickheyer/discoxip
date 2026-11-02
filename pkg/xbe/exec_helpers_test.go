@@ -261,28 +261,6 @@ func liftRoutine(t *testing.T, ti *testImage, label string) *LiftedFunction {
 	return lf
 }
 
-func machineModel(t *testing.T, ti *testImage, roots ...string) *MachineModel {
-	t.Helper()
-	var vas []uint32
-	for _, label := range roots {
-		vas = append(vas, ti.at(t, label))
-	}
-	mm, err := LiftMachineRooted(ti.d, vas, NewExprPool())
-	if err != nil {
-		t.Fatalf("lift machine: %v", err)
-	}
-	return mm
-}
-
-func blockOf(t *testing.T, mm *MachineModel, va uint32) *liftedBlock {
-	t.Helper()
-	b := mm.blocks[blockKey(va, nil)]
-	if b == nil {
-		t.Fatalf("no block %08X among %v", va, keysOf(mm.blocks))
-	}
-	return b
-}
-
 func keysOf(m map[string]*liftedBlock) []string {
 	return sortedKeys(func() map[string]bool {
 		out := map[string]bool{}

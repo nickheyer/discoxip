@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/extract"
-	"github.com/nickheyer/discoxip/pkg/web"
 	"github.com/nickheyer/discoxip/pkg/xbe"
 	"github.com/nickheyer/discoxip/pkg/xip"
 	"github.com/spf13/cobra"
@@ -21,19 +20,16 @@ var buildOutputDir string
 func init() {
 	buildCmd := &cobra.Command{
 		Use:   "build <source-dir>",
-		Short: "Build complete web app from Xbox dashboard data",
-		Long: `Takes a directory tree containing Xbox dashboard files (.xip archives,
-.xbe executable, fonts, Audio/ directory) and produces a self-contained
-Three.js web application.
+		Short: "Extract the archives a dashboard names beside its executable, audio and fonts",
+		Long: `Takes a directory tree holding the dashboard files, the executable, the archives it names,
+fonts and the Audio directory, and lays them out extracted under one directory.
 
-This is the single entry point for the full pipeline:
   1. Find the dashboard executable and the archives it names
-  2. Extract those archives (meshes, textures, scenes)
-  3. Copy auxiliary data (audio, fonts)
-  4. Generate the Three.js web app with everything derived from the executable
+  2. Extract those archives, meshes, textures and scenes
+  3. Copy the audio, the fonts the executable tries first and the executable itself
 
 Example:
-  discoxip build sample/5659 -o output/dashboard`,
+  discoxip build sample/5659 -o build/5659`,
 		Args: cobra.ExactArgs(1),
 		RunE: runBuild,
 	}
@@ -59,7 +55,6 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 
 	extractDir := filepath.Join(outDir, ".extracted")
-	webDir := filepath.Join(outDir, "web")
 
 	fmt.Fprintf(os.Stderr, "Building from %s → %s\n\n", srcDir, outDir)
 
@@ -156,22 +151,8 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "\nStep 4: Building web application...\n")
-	kernel, _, err := loadKernel()
-	if err != nil {
-		return err
-	}
-	bank, mcpx, err := loadBoot()
-	if err != nil {
-		return err
-	}
-	if err := web.Export(extractDir, srcDir, webDir, d, kernel, bank, mcpx); err != nil {
-		return fmt.Errorf("web export: %w", err)
-	}
-
 	fmt.Fprintf(os.Stderr, "\nBuild complete.\n")
-	fmt.Fprintf(os.Stderr, "  Web app: %s\n", webDir)
-	fmt.Fprintf(os.Stderr, "  Run: cd %s && python3 -m http.server\n", webDir)
+	fmt.Fprintf(os.Stderr, "  Extracted: %s\n", extractDir)
 	return nil
 }
 

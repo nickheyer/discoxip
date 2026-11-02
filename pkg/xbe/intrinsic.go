@@ -18,7 +18,7 @@ var mathIntrinsics = map[string]mathIntrinsic{
 	"fmod": {"fmod", 2}, "pow": {"fpow", 2}, "atan2": {"fatan2", 2},
 }
 
-// Recognizes a runtime math thunk by the function name its descriptor names after the descriptor's leading byte,
+// Recognizes a C runtime math thunk by the function name its descriptor names after the descriptor's leading byte,
 // the power thunk by the exponent and base it spills off the x87 stack for its core
 func (d *Disassembly) mathIntrinsic(target uint32) (mathIntrinsic, bool) {
 	fn := d.Functions[target]

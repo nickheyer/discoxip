@@ -43,11 +43,6 @@ func (fn *Function) instructionIndex() map[uint32]int {
 	return index
 }
 
-// Computes the data addresses registers hold before each instruction, agreeing across every path reaching it
-func (d *Disassembly) staticAddressFlow(fn *Function) []map[x86asm.Reg]uint32 {
-	return d.staticAddressFlowFrom(fn, nil)
-}
-
 // Computes the same flow with the addresses the caller already knows the entry registers hold
 func (d *Disassembly) staticAddressFlowFrom(fn *Function, seed map[x86asm.Reg]uint32) []map[x86asm.Reg]uint32 {
 	index := fn.instructionIndex()

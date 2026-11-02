@@ -1,5 +1,5 @@
 # discoxip
-Unpacks Original Xbox dashboard XIP archives.
+Unpacks Original Xbox dash from XIP archives and OS from collected reference material.
 
 ## Install
 ```
@@ -18,15 +18,12 @@ discoxip pack <directory> -o <archive.xip>
 discoxip bios info <flash.bin> --mcpx <mcpx.bin>
 discoxip bios extract <flash.bin> --mcpx <mcpx.bin> [-o <dir>]
 discoxip bios lift <flash.bin> --mcpx <mcpx.bin> [--va <hex>]
-discoxip bios machine <flash.bin> --mcpx <mcpx.bin> [--va <lo>-<hi>]
-discoxip bios boot <flash.bin> --mcpx <mcpx.bin> --launch <dir> -o <dir>
 
 discoxip xbe info <file.xbe>
 discoxip xbe symbols <file.xbe>
 discoxip xbe materials <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-v]
 discoxip xbe render <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-o <file.json>]
 discoxip xbe lift <file.xbe> <va>... --bios <flash.bin> --mcpx <mcpx.bin>
-discoxip xbe program <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin> [-o <file.json>]
 discoxip xbe disasm <file.xbe> [-o <file.c>]
 
 discoxip scene info <file.xap> --xbe <file.xbe> --bios <flash.bin> --mcpx <mcpx.bin>

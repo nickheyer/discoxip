@@ -285,16 +285,12 @@ func TestLiftDumpNamesSharedNodes(t *testing.T) {
 	}
 }
 
-func TestLiftMachineTermsRender(t *testing.T) {
+func TestLiftTermsRender(t *testing.T) {
 	cases := []struct {
 		term  blockTerm
 		succs []string
 		want  string
 	}{
-		{blockTerm{kind: "jumpind", index: Sym{"reg.EAX"}}, nil, "jump to reg.EAX"},
-		{blockTerm{kind: "hlt", target: 0x11002}, []string{"00011002"}, "hlt then 00011002"},
-		{blockTerm{kind: "int", vector: 3, target: 0x11002}, []string{"00011002"}, "int 3 then 00011002"},
-		{blockTerm{kind: "iret"}, nil, "iret"},
 		{blockTerm{kind: "trap"}, nil, "trap"},
 		{blockTerm{kind: "halt"}, nil, "halt"},
 		{blockTerm{kind: "noreturn"}, nil, "noreturn"},
@@ -312,20 +308,6 @@ func TestLiftMachineTermsRender(t *testing.T) {
 		lb := lf.Blocks["00011000"]
 		if lb.Term.Kind != tc.term.kind || lb.ESP != pool.Add(b.spExpr) {
 			t.Errorf("%s serialized as %+v", tc.term.kind, lb)
-		}
-		switch tc.term.kind {
-		case "jumpind":
-			if lb.Term.Index != pool.Add(Sym{"reg.EAX"}) {
-				t.Errorf("jumpind index %d", lb.Term.Index)
-			}
-		case "hlt":
-			if lb.Term.Target != "00011002" {
-				t.Errorf("hlt target %q", lb.Term.Target)
-			}
-		case "int":
-			if lb.Term.Target != "00011002" || lb.Term.Vector != 3 {
-				t.Errorf("int target %q vector %d", lb.Term.Target, lb.Term.Vector)
-			}
 		}
 	}
 }

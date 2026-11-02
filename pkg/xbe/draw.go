@@ -652,7 +652,7 @@ func (rm *RenderModel) deriveDraw(d *Disassembly, ms *MaterialSystem, types map[
 	dm.BufferDraw = bufferDraw
 
 	ex := NewExecutor(d)
-	// The loaded check's own callee reads the mesh file, which the runtime does itself.
+	// The loaded check's own callee reads the mesh file
 	opaque := []uint32{dm.KindCheck, dm.MeshLoaded, rm.Accessor.Function, rm.shaderLookup, dm.MaterialLookup}
 	opaque = append(opaque, d.plainCallees(dm.MeshLoaded)...)
 	opaque = append(opaque, ms.Allocators...)

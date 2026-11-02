@@ -56,14 +56,13 @@ type Disassembly struct {
 	layoutBusy      bool
 	biases          map[uint32]int32
 	stackIns        map[uint32]int
-	boundaries      map[uint32]bool         // routines the image names from outside its code, which no routine runs into
-	noReturn        map[uint32]bool         // routines known never to return to their caller
-	kernel          bool                    // the image is the kernel, whose named routines lie among its own rather than in libraries
-	endsAt          map[uint32]*Instruction // the instruction ending at each address, for the machine lift's entry check
-	scans           *executorScans          // what the executors read off the image, scanned for the first of them
-	entries         []uint32                // routine entries in address order, for finding the routine at an address
-	entrySpan       uint32                  // the longest routine's size, bounding how far below an address its routine starts
-	entriesOf       int                     // routines counted when the entries were sorted
+	boundaries      map[uint32]bool // routines the image names from outside its code, which no routine runs into
+	noReturn        map[uint32]bool // routines known never to return to their caller
+	kernel          bool            // the image is the kernel, whose named routines lie among its own rather than in libraries
+	scans           *executorScans  // what the executors read off the image, scanned for the first of them
+	entries         []uint32        // routine entries in address order, for finding the routine at an address
+	entrySpan       uint32          // the longest routine's size, bounding how far below an address its routine starts
+	entriesOf       int             // routines counted when the entries were sorted
 }
 
 // Disassemble performs full recursive disassembly of the XBE image.

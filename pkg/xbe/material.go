@@ -80,7 +80,7 @@ type MaterialSystem struct {
 	AllocatorVA      uint32
 	Ctors            map[uint32]uint32 // ctor VA to vtable VA
 	Materials        []*MaterialObject
-	TextureProducers []uint32 // dashboard functions that build textures at runtime
+	TextureProducers []uint32 // dashboard functions that build textures while the dashboard runs
 	Allocators       []uint32 // functions whose results become constructed objects
 	Registry         *MaterialRegistry
 }

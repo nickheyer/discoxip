@@ -11,7 +11,7 @@ var segIndex = map[x86asm.Reg]int{x86asm.ES: 0, x86asm.CS: 1, x86asm.SS: 2, x86a
 
 var segNames = [6]string{"ES", "CS", "SS", "DS", "FS", "GS"}
 
-// The calls the processor's own instructions become, which the runtime's processor model answers
+// The effects the processor's own instructions are recorded as
 const (
 	cpuCLI       = "cpu_cli"
 	cpuSTI       = "cpu_sti"
@@ -42,20 +42,14 @@ const (
 	cpuWriteCR   = "cpu_write_cr"
 	cpuReadCR    = "cpu_read_cr"
 	cpuInvlpg    = "cpu_invlpg"
-	cpuCLD       = "cpu_cld"
-	cpuSTD       = "cpu_std"
 	cpuCLTS      = "cpu_clts"
-	cpuFNSTCW    = "cpu_fnstcw"
 	cpuFLDCW     = "cpu_fldcw"
 	cpuFNINIT    = "cpu_fninit"
 	cpuFNCLEX    = "cpu_fnclex"
 )
 
-// Where the registers lie in an x87 save area and the bytes each takes
-const (
-	fsaveRegisters    = 28
-	fsaveRegisterSize = 10
-)
+// The control word the x87 reset leaves, every exception masked at extended precision
+const fpuResetControlWord = 0x037F
 
 // Reports whether a string instruction carries the repne prefix rather than rep or repe
 func repnePrefix(in *Instruction) bool {
@@ -102,9 +96,6 @@ func (ex *Executor) pushWord(s *execState, in *Instruction, v Expr) {
 
 // The bytes a string instruction moves its pointer by, backwards when the direction flag is set
 func (s *execState) stringStep(size int) Expr {
-	if s.machineDF {
-		return Sym{fmt.Sprintf("dfstep%d", size)}
-	}
 	if s.df {
 		return IConst{uint32(-int32(size))}
 	}
@@ -127,25 +118,8 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		ex.cpuEffect(s, in, cpuCLI)
 	case x86asm.STI:
 		ex.cpuEffect(s, in, cpuSTI)
-		// Enabling interrupts ends a machine block, so one pending is taken before the next instruction
-		if ex.machine {
-			ex.block.term = &blockTerm{kind: "jump", target: next}
-			s.va = 0
-			return true, true, nil
-		}
 	case x86asm.CLD, x86asm.STD:
-		s.df, s.machineDF = op == x86asm.STD, false
-		if ex.machine {
-			// A direction change ends a machine block, so every step a block reads live is the direction it was entered with
-			if op == x86asm.STD {
-				ex.cpuEffect(s, in, cpuSTD)
-			} else {
-				ex.cpuEffect(s, in, cpuCLD)
-			}
-			ex.block.term = &blockTerm{kind: "jump", target: next}
-			s.va = 0
-			return true, true, nil
-		}
+		s.df = op == x86asm.STD
 	case x86asm.CLTS:
 		ex.noteTaskSwitchCleared(s)
 		ex.cpuEffect(s, in, cpuCLTS)
@@ -163,22 +137,10 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		ex.cpuEffect(s, in, cpuInvlpg, ex.addr(s, args[0].(x86asm.Mem)))
 	case x86asm.PAUSE:
 	case x86asm.PUSHFD:
-		if ex.machine {
-			// The flags word is assembled by the machine from the record the last flag setter left
-			ex.pushWord(s, in, ex.cpuResult(s, in, cpuPushFD, ex.flagsArgs(s)...))
-			break
-		}
 		ex.pushWord(s, in, ex.cpuResult(s, in, cpuPushFD))
 	case x86asm.POPFD:
 		v := ex.pop(s)
 		ex.cpuEffect(s, in, cpuPopFD, v)
-		if ex.machine {
-			s.fl = flagState{kind: "eflags", a: v}
-			s.machineDF = true
-			ex.block.term = &blockTerm{kind: "jump", target: next}
-			s.va = 0
-			return true, true, nil
-		}
 		// The arithmetic flags a popped word carries are never decided on by compiled code, so a use of them fails
 		s.fl = flagState{kind: "alu", a: Sym{"unbound.popfd"}, b: IConst{0}, r: Sym{"unbound.popfd"}, cf: Sym{"unbound.popfd"}}
 	case x86asm.PUSHAD:
@@ -201,11 +163,6 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 	case x86asm.IRETD:
 		if ex.block == nil || len(s.frames) > 0 {
 			return false, true, fmt.Errorf("interrupt return outside a lifted routine")
-		}
-		if ex.machine {
-			ex.block.term = &blockTerm{kind: "iret"}
-			s.va = 0
-			return true, true, nil
 		}
 		ex.cpuEffect(s, in, cpuIRETD)
 		s.pending = nil
@@ -277,7 +234,7 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 			s.setReg(x86asm.EDI, mkBin("add", dst, s.stringStep(size)))
 			break
 		}
-		// A repeated scan is left to the runtime, which reports how many elements it compared before stopping
+		// A repeated scan is recorded as an effect whose result is the elements it compared before stopping
 		ptr, count := s.getReg(x86asm.EDI), s.getReg(x86asm.ECX)
 		repne := IConst{0}
 		if repnePrefix(in) {
@@ -387,14 +344,14 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		}
 		ex.cpuEffect(s, in, name, ex.addr(s, args[0].(x86asm.Mem)))
 	case x86asm.SGDT, x86asm.SIDT:
-		// The runtime stores the descriptor table register, so the memory it lands in is read back from the run
+		// The descriptor table register lands in memory as the limit word and the base word the processor reports
 		name := cpuSGDT
 		if op == x86asm.SIDT {
 			name = cpuSIDT
 		}
 		at := ex.addr(s, args[0].(x86asm.Mem))
-		ex.forgetAliased(s, at, 6)
-		ex.cpuEffect(s, in, name, at)
+		ex.store(s, at, 2, ex.cpuResult(s, in, name+"_limit", at), in.VA)
+		ex.store(s, mkBin("add", at, IConst{2}), 4, ex.cpuResult(s, in, name+"_base", at), in.VA)
 	case x86asm.LTR:
 		ex.cpuEffect(s, in, cpuLTR, ex.operand(s, in, args[0], 2))
 	case x86asm.MOV:
@@ -429,7 +386,7 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		}
 		at := ex.addr(s, args[0].(x86asm.Mem))
 		ex.cpuEffect(s, in, name, at)
-		// The stack comes back as the runtime restored it, one value a slot, read by the layout of the area
+		// The stack comes back as the restore leaves it, one value a slot, read by the layout of the area
 		restored := cpuFRstorST
 		if op == x86asm.FXRSTOR {
 			restored = cpuFXRstorST
@@ -447,11 +404,6 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 		}
 		s.setReg(x86asm.CS, IConst{uint32(seg)})
 		target := uint32(off)
-		if ex.machine {
-			ex.block.term = &blockTerm{kind: "jump", target: target}
-			s.va = 0
-			return true, true, nil
-		}
 		if ex.block != nil && len(s.frames) == 0 && !ex.block.inside[target] {
 			return false, true, fmt.Errorf("far jump out of the routine")
 		}
@@ -491,10 +443,6 @@ func (ex *Executor) systemStep(s *execState, in *Instruction, next uint32) (done
 func (ex *Executor) overflow(s *execState) (Expr, error) {
 	f := s.fl
 	switch f.kind {
-	case "machine":
-		return Sym{"cond.JO"}, nil
-	case "eflags":
-		return mkBin("and", mkBin("shr", f.a, IConst{11}), IConst{1}), nil
 	case "add":
 		return mkBin("and", mkBin("shr", mkBin("and", mkBin("xor", f.a, f.r), mkBin("xor", f.b, f.r)), IConst{31}), IConst{1}), nil
 	case "sub", "cmp":
@@ -557,4 +505,24 @@ func (ex *Executor) narrowDivide(s *execState, in *Instruction, op x86asm.Op, si
 	dividend := mkBin("or", mkBin("shl", s.getReg(x86asm.DX), IConst{16}), s.getReg(x86asm.AX))
 	s.setReg(x86asm.AX, mkBin(quotient, dividend, divisor))
 	s.setReg(x86asm.DX, mkBin(remainder, dividend, divisor))
+}
+
+// Loads, stores, clears or resets the x87 control word, a load and a reset recorded as processor effects
+func (ex *Executor) controlWordStep(s *execState, in *Instruction) (bool, error) {
+	switch in.Inst.Op {
+	case x86asm.FLDCW:
+		v := ex.load(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2)
+		ex.cpuEffect(s, in, cpuFLDCW, v)
+		s.cw = v
+	case x86asm.FNSTCW:
+		ex.store(s, ex.addr(s, in.Inst.Args[0].(x86asm.Mem)), 2, s.controlWord(), in.VA)
+	case x86asm.FNCLEX:
+		ex.cpuEffect(s, in, cpuFNCLEX)
+	case x86asm.FNINIT:
+		ex.cpuEffect(s, in, cpuFNINIT)
+		s.cw = IConst{fpuResetControlWord}
+		s.fpu = nil
+		s.fcmp = nil
+	}
+	return false, nil
 }

@@ -239,10 +239,9 @@ func DeriveKernel(d *Disassembly, exports map[uint32]uint32) (*KernelModel, erro
 type KernelInput struct {
 	Image   *Image
 	Exports map[uint32]uint32
-	EEPROM  []byte
 }
 
-// Lifts the kernel and joins its routines, names, exports and memory to the model beside the dashboard's
+// Lifts the kernel and joins its routines, names and exports to the model beside the dashboard's
 func (rm *RenderModel) attachKernel(d *Disassembly, kernel *KernelInput) error {
 	km, err := DeriveKernel(d, kernel.Exports)
 	if err != nil {
@@ -261,15 +260,6 @@ func (rm *RenderModel) attachKernel(d *Disassembly, kernel *KernelInput) error {
 	for va, name := range km.Names {
 		rm.Library[va] = name
 	}
-	mem, bytes, err := kernel.Image.Memory()
-	if err != nil {
-		return err
-	}
-	for _, s := range mem.Sections {
-		s.Off += uint32(len(rm.memory))
-		rm.Memory.Sections = append(rm.Memory.Sections, s)
-	}
-	rm.memory = append(rm.memory, bytes...)
 	rm.Kernel = km
 	return nil
 }

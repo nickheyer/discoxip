@@ -80,7 +80,7 @@ func (rm *RenderModel) deviceSurfaces(layout *deviceLayout) ([]uint32, error) {
 	return slices.Sorted(maps.Keys(fields)), nil
 }
 
-// RenderModel is everything the web runtime needs that was derived from the executable.
+// RenderModel is the draw state derived from the executable, its materials, programs, declarations, classes and tables
 type RenderModel struct {
 	XDK            int                           `json:"xdk"`
 	Materials      []*MaterialObject             `json:"materials"`
@@ -103,7 +103,6 @@ type RenderModel struct {
 	ShaderTable    []ShaderBinding               `json:"shader_table"`
 	NVStateNames   map[uint32]string             `json:"nv_state_names"`
 	WorldSlot      int32                         `json:"world_accessor_slot"`
-	Memory         ImageMemory                   `json:"memory"`
 	Types          map[string]*NodeType          `json:"node_types"`
 	Draw           *DrawModel                    `json:"draw"`
 	Lifted         map[uint32]*LiftedFunction    `json:"lifted"`
@@ -117,7 +116,6 @@ type RenderModel struct {
 	Registry       *MaterialRegistry             `json:"material_registry"`
 	Kernel         *KernelModel                  `json:"kernel"`
 	TLS            *TLSDirectory                 `json:"tls"`
-	memory         []byte
 	defaultPaths   []Path
 	nodePaths      []Path // paths of the routines loading the node constants from the matrix stack top
 	shaderLookup   uint32
@@ -161,11 +159,6 @@ type ClockGlobal struct {
 var stageTrace = os.Getenv("DISCOXIP_STAGE_TRACE") != ""
 
 var stageStart = time.Now()
-
-// Stage prints a stage name with the seconds elapsed when stage tracing is on, for the stages other packages run
-func Stage(name string) {
-	stage(name)
-}
 
 // Prints a derivation stage name with the seconds elapsed when stage tracing is on
 func stage(name string) {
@@ -324,37 +317,11 @@ func DeriveRender(d *Disassembly, kernel *KernelInput) (*RenderModel, error) {
 		}
 		rm.Device = DeviceObject{Global: layout.device, Object: object, Surfaces: surfaces}
 	}
-	stage("memory")
-	if err := rm.deriveMemory(d); err != nil {
-		return nil, err
-	}
 	stage("kernel")
 	if err := rm.attachKernel(kd, kernel); err != nil {
 		return nil, err
 	}
-	stage("registrations")
-	if err := rm.replayRegistrations(d, registrar, types); err != nil {
-		return nil, err
-	}
 	return rm, nil
-}
-
-// The startup memory bytes the model's sections index
-func (rm *RenderModel) MemoryBytes() []byte {
-	return rm.memory
-}
-
-// Maps the loaded image as the memory the runtime starts the executable with
-func (rm *RenderModel) deriveMemory(d *Disassembly) error {
-	var err error
-	rm.Memory, rm.memory, err = d.Image.Memory()
-	if err != nil {
-		return err
-	}
-	if len(rm.memory) == 0 {
-		return fmt.Errorf("xbe: the image maps no memory for the runtime to start from")
-	}
-	return nil
 }
 
 // Reports whether an instruction stores through an absolute address overlapping a global range
@@ -612,42 +579,6 @@ func (d *Disassembly) renderStateWrapper() (uint32, map[uint32]uint32, map[uint3
 		return 0, nil, nil, fmt.Errorf("xbe: no render state wrapper indexes a method table")
 	}
 	return wrapper, tables, counts, nil
-}
-
-// The named setters the wrapper calls for one state each, by the index it tests for equality before the call
-func (d *Disassembly) wrapperSetters(wrapper uint32) map[uint32]uint32 {
-	out := map[uint32]uint32{}
-	ins := d.Functions[wrapper].Instructions
-	lastCmp := int64(-1)
-	equality := false
-	for i := range ins {
-		in := &ins[i]
-		switch in.Inst.Op {
-		case x86asm.CMP:
-			if imm, ok := in.Inst.Args[1].(x86asm.Imm); ok {
-				lastCmp = int64(imm)
-				equality = false
-			}
-		case x86asm.JNE, x86asm.JE:
-			equality = true
-		case x86asm.JGE, x86asm.JL, x86asm.JG, x86asm.JLE, x86asm.JA, x86asm.JB, x86asm.JAE, x86asm.JBE:
-			equality = false
-		case x86asm.CALL:
-			if lastCmp < 0 || !equality {
-				continue
-			}
-			callee := d.Functions[resolveTarget(in)]
-			if callee == nil || callee.Symbol == nil || !strings.Contains(callee.Symbol.Name, "SetRenderState") {
-				continue
-			}
-			switch callee.Symbol.Name {
-			case "D3DDevice_SetRenderState_Simple", "D3DDevice_SetRenderState_Deferred", "D3DDevice_SetRenderStateNotInline":
-				continue
-			}
-			out[resolveTarget(in)] = uint32(lastCmp)
-		}
-	}
-	return out
 }
 
 // Derives render state names from the wrapper's method table and the startup defaults

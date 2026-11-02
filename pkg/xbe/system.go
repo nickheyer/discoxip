@@ -13,11 +13,10 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// SystemModel is the console side of the executable the runtime's virtual console reads.
+// SystemModel is the console side of the executable, its script method tables and the data tables the natives index
 type SystemModel struct {
 	Methods          map[string][]string `json:"methods"`
 	Languages        []string            `json:"languages"`
-	Translations     []map[string]string `json:"translations"`
 	TimeZones        []TimeZone          `json:"time_zones"`
 	DaysInMonth      []int               `json:"days_in_month"`
 	DeviceNavigation [][4][]int          `json:"device_navigation"`
@@ -95,13 +94,6 @@ func DeriveSystem(d, kd *Disassembly, kernel *KernelInput, types map[string]*Nod
 		return nil, err
 	}
 	if err := sm.deriveMemoryUnitType(types); err != nil {
-		return nil, err
-	}
-	setLanguage, err := sm.function("Translator", "SetLanguage")
-	if err != nil {
-		return nil, err
-	}
-	if err := sm.deriveTranslations(d, kd, kernel, setLanguage); err != nil {
 		return nil, err
 	}
 	textFn, err := sm.function("Translator", "GetTimeZoneText")

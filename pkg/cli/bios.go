@@ -13,7 +13,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var biosMCPX, biosOutput, biosLiftVA, biosLaunch string
+var biosMCPX, biosOutput, biosLiftVA string
 
 func init() {
 	biosCmd := &cobra.Command{
@@ -44,26 +44,7 @@ func init() {
 	liftCmd.Flags().StringVar(&biosMCPX, "mcpx", "", "MCPX ROM dump holding the 2BL key (required)")
 	extractCmd.Flags().StringVarP(&biosOutput, "output", "o", "", "output directory (default: <flash>.out)")
 	liftCmd.Flags().StringVar(&biosLiftVA, "va", "", "lift one routine at this hex address and print its blocks")
-	machineCmd := &cobra.Command{
-		Use:   "machine <flash.bin>",
-		Short: "Lift the kernel as the processor runs it and report every block that fails",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runBIOSMachine,
-	}
-	machineCmd.Flags().StringVar(&biosMCPX, "mcpx", "", "MCPX ROM dump holding the 2BL key (required)")
-	machineCmd.Flags().StringVar(&biosLiftVA, "va", "", "print the blocks in a hex address range, as lo-hi")
-	bootCmd := &cobra.Command{
-		Use:   "boot <flash.bin>",
-		Short: "Write the machine lift of the 2BL and kernel with the state the ROM leaves them in",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runBIOSBoot,
-	}
-	bootCmd.Flags().StringVar(&biosMCPX, "mcpx", "", "MCPX ROM dump holding the 2BL key (required)")
-	bootCmd.Flags().StringVarP(&biosOutput, "output", "o", "", "output directory (required)")
-	bootCmd.Flags().StringVar(&biosLaunch, "launch", "", "directory holding the dashboard the launch partition carries (required)")
-	bootCmd.MarkFlagRequired("output")
-	bootCmd.MarkFlagRequired("launch")
-	biosCmd.AddCommand(infoCmd, extractCmd, liftCmd, machineCmd, bootCmd)
+	biosCmd.AddCommand(infoCmd, extractCmd, liftCmd)
 	rootCmd.AddCommand(biosCmd)
 }
 
@@ -237,58 +218,5 @@ func loadKernel() (*xbe.KernelInput, *bios.Bank, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	eeprom, err := b.EEPROM(bios.DefaultConsole())
-	if err != nil {
-		return nil, nil, err
-	}
-	return &xbe.KernelInput{Image: img, Exports: exports, EEPROM: eeprom}, b, nil
-}
-
-func runBIOSMachine(cmd *cobra.Command, args []string) error {
-	b, err := openBIOS(args[0])
-	if err != nil {
-		return err
-	}
-	img, exports, err := b.Image()
-	if err != nil {
-		return err
-	}
-	d, err := xbe.DisassembleKernel(img, exports)
-	if err != nil {
-		return err
-	}
-	started := time.Now()
-	mm, err := xbe.LiftMachine(d, xbe.KernelRoots(d, exports))
-	if err != nil {
-		return err
-	}
-	fmt.Printf("machine: %d blocks, %d failed, %d expression nodes, in %.1fs\n", len(mm.Blocks), len(mm.Errors), len(mm.Exprs.Nodes), time.Since(started).Seconds())
-	if biosLiftVA != "" {
-		var lo, hi uint32
-		if _, err := fmt.Sscanf(biosLiftVA, "%x-%x", &lo, &hi); err != nil {
-			if _, err := fmt.Sscanf(biosLiftVA, "%x", &lo); err != nil {
-				return fmt.Errorf("machine: %q is no address range", biosLiftVA)
-			}
-			hi = lo
-		}
-		fmt.Print(mm.Dump(lo, hi))
-		return nil
-	}
-	keys := make([]string, 0, len(mm.Errors))
-	for key := range mm.Errors {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		fmt.Printf("  %-18s %s\n", key, mm.Errors[key])
-	}
-	return nil
-}
-
-func runBIOSBoot(cmd *cobra.Command, args []string) error {
-	b, err := openBIOS(args[0])
-	if err != nil {
-		return err
-	}
-	return bios.WriteBoot(b, biosOutput, biosLaunch)
+	return &xbe.KernelInput{Image: img, Exports: exports}, b, nil
 }

@@ -179,9 +179,8 @@ const (
 
 type execState struct {
 	regs       [8]Expr
-	segs       [6]Expr // segment selectors, read as the runtime's processor holds them where no block set them
+	segs       [6]Expr // segment selectors, open where no block set them
 	df         bool    // the direction flag, string instructions moving backwards while it is set
-	machineDF  bool    // a machine block reads the direction flag live, nothing in the block having set it
 	xmm        [8][4]Expr
 	mm         [8][2]Expr
 	mem        map[memKey]memVal
@@ -228,8 +227,7 @@ type Executor struct {
 	nameOf       map[uint32]string
 	Opaque       map[uint32]bool // functions never inlined
 	ftol         map[uint32]bool
-	probe        map[uint32]bool // stack probes that reserve the frame their caller sizes in eax
-	errCount     int
+	probe        map[uint32]bool         // stack probes that reserve the frame their caller sizes in eax
 	dropped      int                     // paths left unsummarized because they reach through a null pointer
 	allocHook    func() Expr             // fresh object pointer for the allocator when set
 	written      map[uint32]bool         // global bytes some instruction stores to directly
@@ -248,19 +246,16 @@ type Executor struct {
 	callTarget   uint32                  // library function the opaque call being recorded resolves to
 	callReceiver bool                    // the opaque call being recorded takes its receiver in ecx
 	callee       uint32                  // the routine the named call being recorded reaches
-	// ImageCreations models the creations the runtime runs from the image as handing back their object
-	ImageCreations bool
 	// OutBuffers is memory routines a derivation names write through a pointer argument, forgotten as the library's are
-	OutBuffers map[string][]OutBuffer
-	arrayIdx   map[uint32]arrayIndex // counted array indexes the optimizer inlined, by their first instruction
-	Stop       map[uint32]bool       // addresses a path ends at, for a routine the runtime enters and leaves mid function
-	block      *blockRun             // the basic block being lifted, nil while paths are summarized
-	loopCut    bool                  // a loop left after its unroll budget, so the paths miss its longer runs
-	pointer    Expr                  // the function pointer the call being recorded goes through
-	tail       bool                  // the call being recorded is a jump leaving the return address under the arguments
-	tailClean  uint32                // stack bytes the callee of a tail jump removes, which its return then applies
-	machine    bool                  // blocks are lifted as the processor runs them, the stack in memory and calls as jumps
-	template   *CodeTemplate         // code lifted as a template whose patched words the copy supplies
+	OutBuffers     map[string][]OutBuffer
+	arrayIdx       map[uint32]arrayIndex // counted array indexes the optimizer inlined, by their first instruction
+	Stop           map[uint32]bool       // addresses a path ends at, for a loop body entered and left mid routine
+	ImageCreations bool                  // the creations a derivation runs from the image hand back their object through an out parameter
+	block          *blockRun             // the basic block being lifted, nil while paths are summarized
+	loopCut        bool                  // a loop left after its unroll budget, so the paths miss its longer runs
+	pointer        Expr                  // the function pointer the call being recorded goes through
+	tail           bool                  // the call being recorded is a jump leaving the return address under the arguments
+	tailClean      uint32                // stack bytes the callee of a tail jump removes, which its return then applies
 }
 
 // executorScans is what every executor of one image reads off it, its named routines, the objects its routines run
@@ -576,8 +571,7 @@ func (ex *Executor) scanWrittenGlobals() {
 	}
 }
 
-// Reports whether a global range is initialized image data that no instruction stores to, a machine block folding
-// only what lies in memory the processor cannot write
+// Reports whether a global range is initialized image data that no instruction stores to
 func (ex *Executor) isConstantGlobal(va uint32, size int) bool {
 	sec := ex.d.sectionOf(va)
 	if sec == nil || va+uint32(size) > sec.VirtualAddr+sec.RawSize {
@@ -585,9 +579,6 @@ func (ex *Executor) isConstantGlobal(va uint32, size int) bool {
 	}
 	if !sec.Writable() {
 		return true
-	}
-	if ex.machine {
-		return false
 	}
 	for b := uint32(0); b < uint32(size); b++ {
 		if ex.written[va+b] {
@@ -931,7 +922,7 @@ func (ex *Executor) RunWithRetries(entry uint32, init func(s *execState), retrie
 
 // NewExecutorShared makes an executor reusing another one's precomputed knowledge.
 func NewExecutorShared(base *Executor) *Executor {
-	return &Executor{d: base.d, arrayIdx: base.arrayIdx, Stop: base.Stop, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Opaque: map[uint32]bool{}, ftol: base.ftol, probe: base.probe, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush, frameAlloc: base.frameAlloc, frameSizes: base.frameSizes, staticThis: base.staticThis, thisLoc: base.thisLoc, OutBuffers: base.OutBuffers}
+	return &Executor{d: base.d, arrayIdx: base.arrayIdx, vtables: base.vtables, symbols: base.symbols, nameOf: base.nameOf, Stop: base.Stop, Opaque: map[uint32]bool{}, ftol: base.ftol, probe: base.probe, Results: map[uint32]Expr{}, written: base.written, Allocators: base.Allocators, savePush: base.savePush, frameAlloc: base.frameAlloc, frameSizes: base.frameSizes, staticThis: base.staticThis, thisLoc: base.thisLoc, OutBuffers: base.OutBuffers}
 }
 
 // Reports whether a data pointer starts a table of code addresses
@@ -1052,17 +1043,6 @@ func (s *execState) setReg(r x86asm.Reg, v Expr) {
 
 // Computes the address expression of a memory operand
 func (ex *Executor) addr(s *execState, m x86asm.Mem) Expr {
-	// A machine block reaches segment relative memory through the base the processor holds for the segment
-	if ex.machine && (m.Segment == x86asm.FS || m.Segment == x86asm.GS) {
-		var e Expr = IConst{uint32(m.Disp)}
-		if m.Base != 0 {
-			e = mkBin("add", s.getReg(m.Base), e)
-		}
-		if m.Index != 0 {
-			e = mkBin("add", e, mkBin("mul", s.getReg(m.Index), IConst{uint32(m.Scale)}))
-		}
-		return mkBin("add", Sym{"segbase." + m.Segment.String()}, e)
-	}
 	// Thread local memory, which the compiler links its exception records into, is its own region
 	if m.Segment != 0 && m.Base == 0 && m.Index == 0 {
 		return Ptr{strings.ToLower(m.Segment.String()), int32(m.Disp)}
@@ -1096,13 +1076,6 @@ func indexesTable(v Expr) bool {
 
 // The address a memory access reads, a call result added to an image address being a table it indexes
 func (ex *Executor) asAddress(a Expr) Expr {
-	// A machine block addresses memory by value alone, a fixed address being the only pointer form
-	if ex.machine {
-		if c, ok := isConst(a); ok {
-			return Ptr{"", int32(c)}
-		}
-		return a
-	}
 	p := asPtr(a)
 	q, ok := p.(Ptr)
 	if ok && strings.HasPrefix(q.Base, "res") && ex.d.sectionOf(uint32(q.Off)) != nil {
@@ -1137,13 +1110,10 @@ func asPtr(a Expr) Expr {
 func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 	a = ex.asAddress(a)
 	p, ok := a.(Ptr)
-	if ok && p.Base == "" && uint32(p.Off) < ex.d.Image.BaseAddr && !ex.machine {
+	if ok && p.Base == "" && uint32(p.Off) < ex.d.Image.BaseAddr {
 		s.nulled = true
 	}
 	if !ok {
-		if ex.machine {
-			ex.forgetAliased(s, a, size)
-		}
 		s.effects = append(s.effects, Effect{Kind: "store", VA: va, Base: "?", Addr: a, Size: size, Value: v})
 		return
 	}
@@ -1179,7 +1149,7 @@ func (ex *Executor) store(s *execState, a Expr, size int, v Expr, va uint32) {
 		}
 	}
 	s.mem[memKey{p.Base, p.Off}] = memVal{size: size, v: v, va: va}
-	if p.Base == "" && !ex.d.layoutBusy && !ex.machine && ex.stateStore(s, uint32(p.Off), size, v, va) {
+	if p.Base == "" && !ex.d.layoutBusy && ex.stateStore(s, uint32(p.Off), size, v, va) {
 		return
 	}
 	// A path folds its own stack away, a lifted block leaves its frame for the blocks after it to read
@@ -1240,19 +1210,10 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 	a = ex.asAddress(a)
 	p, ok := a.(Ptr)
 	if !ok {
-		if ex.machine {
-			if v, stored := s.machineStoredThrough(a, size); stored {
-				return v
-			}
-			return Load{Addr: a, Size: size, Epoch: len(s.effects)}
-		}
 		if v, stored := s.storedThrough(a, size); stored {
 			return v
 		}
 		return Load{Addr: a, Size: size, Epoch: len(s.effects)}
-	}
-	if ex.machine && p.Base == "" && !memoryAddress(IConst{uint32(p.Off)}) {
-		return ex.loadBacking(s, p, size)
 	}
 	if mv, ok := s.mem[memKey{p.Base, p.Off}]; ok && mv.size == size {
 		if f, isF := mv.v.(FConst); isF {
@@ -1305,24 +1266,6 @@ func (ex *Executor) load(s *execState, a Expr, size int) Expr {
 
 // Reads memory never written on this path from the image or as a symbolic input a guard may have fixed
 func (ex *Executor) loadBacking(s *execState, p Ptr, size int) Expr {
-	if p.Base == "" && ex.machine {
-		// A machine block folds only what the image holds in memory the processor never writes
-		va := uint32(p.Off)
-		if sec := ex.d.sectionOf(va); sec != nil && !sec.Writable() && ex.d.sectionOf(va+uint32(size)-1) == sec {
-			switch size {
-			case 1:
-				v, _ := ex.d.Image.ReadU8(va)
-				return IConst{uint32(v)}
-			case 2:
-				v, _ := ex.d.Image.ReadU16(va)
-				return IConst{uint32(v)}
-			case 4:
-				v, _ := ex.d.Image.ReadU32(va)
-				return IConst{v}
-			}
-		}
-		return Load{Base: p.Base, Off: p.Off, Size: size, Epoch: len(s.effects)}
-	}
 	if p.Base == "" {
 		va := uint32(p.Off)
 		if va < ex.d.Image.BaseAddr {
@@ -1511,10 +1454,6 @@ func (ex *Executor) rawOperand(s *execState, in *Instruction, a x86asm.Arg, size
 	case x86asm.Reg:
 		return s.getReg(v)
 	case x86asm.Imm:
-		// An immediate the copy of a template patches is read from the copy
-		if off, patched := ex.template.patchedWord(in); patched && size == 4 {
-			return ex.template.slotLoad(off)
-		}
 		switch size {
 		case 1:
 			return IConst{uint32(uint8(v))}
@@ -1699,10 +1638,6 @@ func (ex *Executor) run(s *execState) error {
 			return nil
 		}
 		in, ok := ex.d.InsnByVA[s.va]
-		if !ok && ex.machine {
-			in = ex.d.insnAt(s.va)
-			ok = in != nil
-		}
 		if !ok {
 			return &ExecError{VA: s.va, Frames: s.frames, Err: fmt.Errorf("no instruction"), Effects: s.effects}
 		}
@@ -1725,11 +1660,11 @@ func (ex *Executor) run(s *execState) error {
 		if debugTrace && (s.steps%5000 == 0 || s.steps < 400) {
 			fmt.Printf("  trace: %08X %-28s esp=%s pushes=%d pending=%v\n", in.VA, in.Inst.String(), ExprString(s.regs[4]), s.pushes, s.pending != nil)
 		}
-		if a, ok := ex.arrayIdx[s.va]; ok && !ex.machine {
+		if a, ok := ex.arrayIdx[s.va]; ok {
 			ex.arrayElement(s, in, a)
 			continue
 		}
-		if r, ok := ex.d.resourceRef[s.va]; ok && !ex.machine {
+		if r, ok := ex.d.resourceRef[s.va]; ok {
 			if err := ex.resourceCount(s, in, r); err != nil {
 				return &ExecError{VA: in.VA, Insn: in.Inst.String(), Frames: s.frames, Err: err, Effects: s.effects}
 			}
@@ -1818,7 +1753,7 @@ func (ex *Executor) doReturn(s *execState, clean int32) (bool, error) {
 // Finishes a path when the outermost return executes, a lifted block ending in its return instead
 func (ex *Executor) finish(s *execState) {
 	if ex.block != nil {
-		// A block returning what it entered with hands back the accumulator as the runtime holds it
+		// A block returning what it entered with hands back the accumulator as entered
 		ex.block.term = &blockTerm{kind: "return", value: s.getReg(x86asm.EAX)}
 		return
 	}
@@ -2050,9 +1985,6 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		// Writing the caches back leaves memory holding what the stores already put there
 		return false, nil
 	case x86asm.INT, x86asm.HLT, x86asm.UD2:
-		if ex.machine {
-			return ex.machineTrap(s, in, next)
-		}
 		// A path that traps, such as a failed stack cookie check, never completes and is abandoned.
 		if ex.block != nil && len(s.frames) == 0 {
 			ex.block.term = &blockTerm{kind: "trap"}
@@ -2088,9 +2020,6 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 	case x86asm.PUSH:
 		v := ex.operand(s, in, args[0], 4)
 		ex.pushWord(s, in, v)
-		if ex.machine {
-			break
-		}
 		if !ex.savePush[in.VA] && !ex.savesRegister(s, in, args[0]) {
 			s.pushes++
 		} else {
@@ -2334,9 +2263,6 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			// The ordering flags land in ah exactly where fnstsw puts the condition codes.
 			s.fcmp = &fcmpRec{a: s.fl.a, b: s.fl.b}
 			s.regs[0] = Sym{"fsw"}
-			if ex.machine {
-				s.regs[0] = mkBin("or", mkBin("and", s.getReg(x86asm.EAX), IConst{0xFFFF00FF}), mkBin("or", statusWord(s.fl.a, s.fl.b), IConst{0x200}))
-			}
 			s.axFSW = true
 			return false, nil
 		}
@@ -2421,9 +2347,6 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		c := ex.condition(s, op)
 		ex.setOperand(s, in, args[0], 1, c)
 	case x86asm.JMP:
-		if ex.machine {
-			return ex.machineJump(s, in)
-		}
 		if rel, ok := args[0].(x86asm.Rel); ok {
 			target := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
 			if !ex.Opaque[target] && !(ex.block != nil && len(s.frames) == 0 && !ex.block.inside[target]) {
@@ -2454,28 +2377,15 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		taken := in.VA + uint32(in.Inst.Len) + uint32(int32(rel))
 		return ex.branch(s, mkCond("eq", s.getReg(x86asm.ECX), IConst{0}), taken, next)
 	case x86asm.CALL:
-		if ex.machine {
-			return ex.machineCall(s, in, next)
-		}
 		return false, ex.call(s, in, next)
 	case x86asm.RET:
 		clean := int32(0)
 		if nargs > 0 {
 			clean = int32(args[0].(x86asm.Imm))
 		}
-		if ex.machine {
-			return ex.machineReturn(s, clean, false)
-		}
 		return ex.doReturn(s, clean)
 	case x86asm.LRET:
-		clean := int32(0)
-		if nargs > 0 {
-			clean = int32(args[0].(x86asm.Imm))
-		}
-		if !ex.machine {
-			return false, fmt.Errorf("far return")
-		}
-		return ex.machineReturn(s, clean, true)
+		return false, fmt.Errorf("far return")
 	case x86asm.STOSD, x86asm.STOSB, x86asm.STOSW:
 		size := map[x86asm.Op]int{x86asm.STOSD: 4, x86asm.STOSB: 1, x86asm.STOSW: 2}[op]
 		src := map[x86asm.Op]x86asm.Reg{x86asm.STOSD: x86asm.EAX, x86asm.STOSB: x86asm.AL, x86asm.STOSW: x86asm.AX}[op]
@@ -2483,7 +2393,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		if hasRep(in) {
 			c, ok := isConst(s.getReg(x86asm.ECX))
 			if !ok || c > maxRepUnroll {
-				// A fill of unknown or long length is kept as an effect the runtime performs, the pointer moving past it.
+				// A fill of unknown or long length is kept as an effect, the pointer moving past it
 				dst := s.getReg(x86asm.EDI)
 				n := s.getReg(x86asm.ECX)
 				s.effects = append(s.effects, Effect{Kind: "fill", VA: in.VA, Addr: dst, Size: size, Value: s.getReg(src), Args: []Expr{n, s.stringStep(size)}})
@@ -2507,9 +2417,8 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 		bytes := size
 		if hasRep(in) {
 			c, ok := isConst(s.getReg(x86asm.ECX))
-			if !ok || ex.machine {
-				// A repeated compare of unknown length is left to the runtime, which reports the elements it passed,
-				// as is every one in a machine block, where the registers it leaves must be exact
+			if !ok {
+				// A repeated compare of unknown length is recorded as an effect whose result is the elements it passed
 				esi, edi, count := s.getReg(x86asm.ESI), s.getReg(x86asm.EDI), s.getReg(x86asm.ECX)
 				repne := IConst{0}
 				if repnePrefix(in) {
@@ -2553,7 +2462,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 				}
 			}
 			if !ok || cnt > maxRepUnroll {
-				// A copy of unknown or long length is kept as an effect the runtime performs, the pointers moving past it.
+				// A copy of unknown or long length is kept as an effect, the pointers moving past it
 				dst, src := s.getReg(x86asm.EDI), s.getReg(x86asm.ESI)
 				base := "?"
 				off := int32(0)
@@ -2575,7 +2484,7 @@ func (ex *Executor) step(s *execState, in *Instruction, next uint32) (bool, erro
 			ex.movs(s, in, size)
 		}
 	case x86asm.IN, x86asm.OUT:
-		// A port access reaches the console's hardware, kept as a call the runtime's hardware answers
+		// A port access reaches the console's hardware, kept as a call
 		data, port := in.Inst.Args[0], in.Inst.Args[1]
 		if op == x86asm.OUT {
 			data, port = port, data
@@ -2617,7 +2526,7 @@ func (ex *Executor) noteNotAvailable(s *execState, kind int) {
 	}
 }
 
-// Marks the machine block as clearing the task switched bit, so the float instructions after it never trap
+// Marks the block as clearing the task switched bit, so the float instructions after it never trap
 func (ex *Executor) noteTaskSwitchCleared(s *execState) {
 	if ex.block != nil && len(s.frames) == 0 {
 		ex.block.tsCleared = true
@@ -2639,8 +2548,7 @@ func calleeName(fn *Function) string {
 // Reads a matrix copy straight into or out of the device's transform array as the inlined transform setter or
 // getter, reporting whether the copy was one and whether it was taken that way
 func (ex *Executor) transformCopyAt(s *execState, in *Instruction, cnt uint32, known bool, size int) (bool, bool) {
-	// A machine block copies the bytes themselves, the runtime reading the device's matrices where they land
-	if !known || ex.machine {
+	if !known {
 		return false, false
 	}
 	if state, ok := ex.transformCopy(s.getReg(x86asm.EDI), cnt*uint32(size)); ok {
@@ -2693,14 +2601,6 @@ func (ex *Executor) movs(s *execState, in *Instruction, size int) {
 	s.setReg(x86asm.EDI, mkBin("add", dst, s.stringStep(size)))
 }
 
-// The x87 status word a compare leaves, its condition codes set for less, unordered and equal
-func statusWord(a, b Expr) Expr {
-	less := mkBin("mul", mkFCmp(a, b, 1), IConst{0x100})
-	unordered := mkBin("mul", mkFCmp(a, b, 8), IConst{0x400})
-	equal := mkBin("mul", mkFCmp(a, b, 2), IConst{0x4000})
-	return mkBin("or", less, mkBin("or", unordered, equal))
-}
-
 // Builds the predicate a conditional jump tests from the last flag producer
 func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 	f := s.fl
@@ -2709,14 +2609,6 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 	}
 	if f.kind == "comiss" {
 		return ex.comissCondition(s, op)
-	}
-	// A machine block entered from anywhere decides on the flag record the processor holds, and one after a popped
-	// flags word decides on that word's bits
-	if f.kind == "machine" {
-		return Sym{"cond." + jumpName(op)}
-	}
-	if f.kind == "eflags" {
-		return eflagsCondition(f.a, op)
 	}
 	zero := func() Expr { return mkCond("eq", f.r, IConst{0}) }
 	sign := func() Expr { return mkCond("lt", f.r, IConst{0}) }
@@ -2805,45 +2697,6 @@ func (ex *Executor) condition(s *execState, op x86asm.Op) Expr {
 		return mkCond("eq", of, IConst{0})
 	}
 	panic(fmt.Sprintf("condition %v", op))
-}
-
-// The jump deciding the same condition as a set or a conditional move, which the machine names conditions by
-func jumpName(op x86asm.Op) string {
-	switch op {
-	case x86asm.SETE:
-		return "JE"
-	case x86asm.SETNE:
-		return "JNE"
-	case x86asm.SETL:
-		return "JL"
-	case x86asm.SETGE:
-		return "JGE"
-	case x86asm.SETLE:
-		return "JLE"
-	case x86asm.SETG:
-		return "JG"
-	case x86asm.SETB:
-		return "JB"
-	case x86asm.SETAE:
-		return "JAE"
-	case x86asm.SETBE:
-		return "JBE"
-	case x86asm.SETA:
-		return "JA"
-	case x86asm.SETS:
-		return "JS"
-	case x86asm.SETNS:
-		return "JNS"
-	case x86asm.SETP:
-		return "JP"
-	case x86asm.SETNP:
-		return "JNP"
-	case x86asm.SETO:
-		return "JO"
-	case x86asm.SETNO:
-		return "JNO"
-	}
-	return op.String()
 }
 
 // Resolves a jump after fnstsw/test ah by enumerating float compare outcomes
@@ -3033,7 +2886,7 @@ func (ex *Executor) call(s *execState, in *Instruction, next uint32) error {
 		return nil
 	}
 	if m, ok := ex.d.mathIntrinsic(target); ok {
-		// The runtime math thunks take their operands on the x87 stack, the first argument below the top.
+		// The C runtime math thunks take their operands on the x87 stack, the first argument below the top
 		s.pushes = 0
 		s.pending = nil
 		y := s.fpuPop()
@@ -3251,8 +3104,8 @@ func (d *Disassembly) callReadsVtable(fn *Function, callVA uint32, base x86asm.R
 	return false, false
 }
 
-// Records a call through a function pointer the path holds symbolically, the runtime following the pointer, the
-// caller's own cleanup after the call fixing the arity of a routine the caller cleans up after
+// Records a call through a function pointer the path holds symbolically, the caller's own cleanup after the call
+// fixing the arity of a routine the caller cleans up after
 func (ex *Executor) pointerCall(s *execState, in *Instruction, next uint32, fp Expr) error {
 	ex.pointer = fp
 	if fn := ex.d.Functions[s.currentFunction()]; fn != nil {
@@ -3768,11 +3621,13 @@ func (ex *Executor) forget(s *execState, p Ptr, bytes int) {
 }
 
 // XDK functions that return a handle through a pointer argument
+// The out parameter a creation a derivation runs from the image hands its object back through
+var imageOutParams = map[string]int{"D3DXCreateTexture": 7}
+
 var outParams = map[string]int{"D3DDevice_CreateVertexShader": 2, "D3DDevice_CreatePixelShader": 1, "D3DDevice_CreateVertexBuffer": 4, "D3DVertexBuffer_Lock": 3, "D3DXCreateMatrixStack": 1}
 
 // Creations the runtime runs from the image, which hand back their object through a pointer argument only in the
 // derivations made at build time
-var imageOutParams = map[string]int{"D3DXCreateTexture": 7}
 
 // D3DSURFACE_DESC words in the Xbox layout
 const surfaceDescFormat, surfaceDescWidth, surfaceDescHeight = 0, 0x14, 0x18
@@ -3835,11 +3690,7 @@ func d3dxBufferSize(name string) int {
 
 // Reads a whole buffer as one value, falling back to a symbolic block load
 func (ex *Executor) loadBlock(s *execState, a Expr, size int) Expr {
-	if ex.machine {
-		a = ex.asAddress(a)
-	} else {
-		a = asPtr(a)
-	}
+	a = asPtr(a)
 	p, ok := a.(Ptr)
 	if !ok {
 		if v, stored := s.storedThrough(a, size); stored {
@@ -4520,10 +4371,6 @@ func (ex *Executor) fpuStep(s *execState, in *Instruction) error {
 	case x86asm.FNSTSW:
 		s.axFSW = s.fcmp != nil
 		s.regs[0] = Sym{"fsw"}
-		// A machine block holds the status word's condition codes as the compare in it decides them
-		if ex.machine && s.fcmp != nil {
-			s.regs[0] = statusWord(s.fcmp.a, s.fcmp.b)
-		}
 	case x86asm.FTST:
 		s.fcmp = &fcmpRec{a: s.st(0), b: FConst{0}}
 	case x86asm.FPATAN:

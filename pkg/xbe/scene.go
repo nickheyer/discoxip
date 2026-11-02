@@ -61,14 +61,14 @@ type ScriptCalls struct {
 	StringVtable uint32 `json:"string_vtable"`
 }
 
-// SceneSlots are the per class methods the runtime runs, zero where the class inherits none.
+// SceneSlots are the per class methods the engine dispatches, zero where the class inherits none
 type SceneSlots struct {
 	Draw uint32 `json:"draw"`
 	Tick uint32 `json:"tick"`
 	Hook uint32 `json:"hook"`
 }
 
-// SceneLoadHelpers are the scene tree loader's steps the runtime performs itself when it builds an inline.
+// SceneLoadHelpers are the scene tree loader's steps when it builds an inline, in call order
 type SceneLoadHelpers struct {
 	Reset    uint32   `json:"reset"`
 	Resolve  uint32   `json:"resolve"`
@@ -78,7 +78,7 @@ type SceneLoadHelpers struct {
 	Join     PathJoin `json:"join"`
 }
 
-// PathJoin is the helper joining a path onto a base path, its inputs numbered as the runtime receives them,
+// PathJoin is the helper joining a path onto a base path, its inputs numbered as the callee receives them,
 // the receiver register first, then the argument registers, then the stack
 type PathJoin struct {
 	VA   uint32 `json:"va"`
@@ -155,7 +155,7 @@ func pathEffects(paths []Path) int {
 	return n
 }
 
-// The XDK routines through which the dashboard reaches the controllers, which the runtime drives itself
+// The XDK routines through which the dashboard reaches the controllers
 var inputRoutines = map[string]bool{"XGetDevices": true, "XGetDeviceChanges": true, "XInputOpen": true, "XInputClose": true, "XInputGetState": true, "XInputPoll": true, "XInputGetCapabilities": true}
 
 // The routines calling the controller routines directly, less those writing a global, which belong to the scene
@@ -315,7 +315,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		ex.Stop = map[uint32]bool{stop: true}
 	}
 	// The camera is the static object the tick advances by the clock, the other callees being the script timers,
-	// the audio voices and the input, which the runtime drives itself.
+	// the audio voices and the input
 	for _, c := range d.plainCallees(sc.Tick) {
 		this := callers[c]
 		if c == sc.Frame {
@@ -361,13 +361,13 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 		return err
 	}
 
-	// The base node tick runs the script engine, which the runtime drives itself.
+	// The base node tick runs the script engine
 	node := types["Node"]
 	if node == nil || len(node.Slots) <= int(sc.TickSlot/4) {
 		return fmt.Errorf("xbe: Node is not registered with a tick slot")
 	}
 	sc.ScriptTick = node.Slots[sc.TickSlot/4]
-	// The image texture getter loads its file through helpers the runtime's own texture loading stands in for.
+	// The image texture getter loads its file through helpers
 	image := types["ImageTexture"]
 	if image == nil || len(image.Slots) <= int(rm.Draw.TextureSlot/4) {
 		return fmt.Errorf("xbe: ImageTexture is not registered with a texture getter")
@@ -438,7 +438,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			}
 		}()
 		sub := NewExecutorShared(ex)
-		// Routines the runtime enters directly and the required chain get the full path budget, other callees a small one.
+		// Routines the engine enters directly and the required chain get the full path budget, other callees a small one
 		sub.PathLimit = 4096
 		if w.depth > 0 && !w.required {
 			sub.PathLimit = 256
@@ -522,8 +522,8 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	enqueue(sc.Disk, 0, true, 0)
 	enqueue(sc.MainLoad, sc.Renderer, true, 0)
 	enqueue(sc.CameraTick, sc.Camera, true, 0)
-	// The dashboard's own static initializers besides the class registrations run in the runtime before the
-	// renderer starts, the C runtime's own being the runtime's business as the rest of that library is
+	// The dashboard's own static initializers besides the class registrations run before the renderer starts, the
+	// C runtime's own belonging to that library
 	inits, err := d.staticInitializers()
 	if err != nil {
 		return err
@@ -562,7 +562,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 	sort.Strings(names)
 	for _, name := range names {
 		nt := types[name]
-		// The helpers a constructor keeps as calls run when the runtime constructs the class
+		// The helpers a constructor keeps as calls run when the class is constructed
 		for _, p := range nt.Construct {
 			for _, e := range p.Effects {
 				if e.Kind != "call" {
@@ -574,7 +574,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 				}
 			}
 		}
-		// A routine the constructor hands a library call as a callback is run by the runtime as well
+		// A routine the constructor hands a library call as a callback is reached through that call
 		for _, p := range nt.ctorPaths {
 			for _, e := range p.Effects {
 				if e.Kind != "call" {
@@ -636,7 +636,7 @@ func (rm *RenderModel) deriveScene(d *Disassembly, ms *MaterialSystem, types map
 			for _, c := range d.plainCallees(w.va) {
 				enqueue(c, staticCallees[c], w.required, w.depth+1)
 			}
-			// A routine the dashboard hands a library call as a callback is run by the runtime as well, and so is
+			// A routine the dashboard hands a library call as a callback is reached through that call, and so is
 			// every method of a class the routine builds an object of
 			for _, p := range rm.pathsOf(w.va) {
 				for _, e := range p.Effects {

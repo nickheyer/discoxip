@@ -194,44 +194,6 @@ func TestLibBuild(t *testing.T) {
 	}
 }
 
-func TestMemoryLayout(t *testing.T) {
-	spec := sampleSpec()
-	spec.sections = []testSection{spec.sections[1], spec.sections[0]}
-	img := parseXBE(t, spec)
-	mem, raw, err := img.Memory()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mem.File != MemoryFile || mem.Base != imgBase || len(mem.Sections) != 3 {
-		t.Fatalf("memory %+v", mem)
-	}
-	want := []ImageSection{
-		{Name: "header", VA: imgBase, Size: testHeaderSize, Off: 0},
-		{Name: ".text", VA: 0x11000, Size: 0x40, Off: testHeaderSize},
-		{Name: ".data", VA: 0x12000, Size: 0x100, Off: testHeaderSize + 0x40, Writable: true},
-	}
-	for i, w := range want {
-		if mem.Sections[i] != w {
-			t.Fatalf("section %d %+v want %+v", i, mem.Sections[i], w)
-		}
-	}
-	if len(raw) != int(testHeaderSize)+0x40+0x100 || string(raw[:4]) != Magic || raw[testHeaderSize] != 0x55 || !bytes.Equal(raw[testHeaderSize+0x40:testHeaderSize+0x40+28], spec.sections[0].data) {
-		t.Fatalf("bytes %d", len(raw))
-	}
-}
-
-func TestMemoryRejectsOverlap(t *testing.T) {
-	img := parseXBE(t, sampleSpec())
-	over := NewImage(imgBase, img.EntryPoint, make([]byte, 0x1004), img.Sections)
-	if _, _, err := over.Memory(); err == nil || !strings.Contains(err.Error(), "inside section") {
-		t.Fatalf("err %v", err)
-	}
-	claim := &Image{BaseAddr: imgBase, HeadersSize: 0x20, raw: make([]byte, 0x10)}
-	if _, _, err := claim.Memory(); err == nil || !strings.Contains(err.Error(), "claims") {
-		t.Fatalf("err %v", err)
-	}
-}
-
 func TestReadsAtSectionBounds(t *testing.T) {
 	img := parseXBE(t, sampleSpec())
 	if v, ok := img.ReadU8(0x11000); !ok || v != 0x55 {

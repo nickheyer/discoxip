@@ -54,43 +54,32 @@ func systemImage(t *testing.T) *testImage {
 	return buildImage(t, systemText(), nil, []chunk{lbl("gsys"), word(0)}, nil)
 }
 
-// Checks every processor instruction the kernel uses records the call named for it, each direction change and the
-// interrupt enable ending a block
+// Checks every processor instruction the kernel uses records the effect named for it
 func TestSystemInstructionCallNames(t *testing.T) {
-	ti := buildKernelImage(t, systemKernelText(), []chunk{lbl("ksdata"), rep(16, 0)}, map[uint32]string{104: "kSys"})
-	mm := machineModel(t, ti, "kSys")
-	if len(mm.Errors) != 0 {
-		t.Fatalf("errors %v", mm.Errors)
-	}
-	blocks, _ := mm.RoutineBlocks(ti.at(t, "kSys"))
-	starts := []uint32{}
-	for _, b := range blocks {
-		starts = append(starts, b.va)
-	}
-	wantStarts := []uint32{ti.at(t, "kSys"), ti.at(t, "kSysCld"), ti.at(t, "kSysStrings"), ti.at(t, "kSysSti"), ti.at(t, "kSysRet")}
-	if !reflect.DeepEqual(starts, wantStarts) {
-		t.Fatalf("blocks start at %X, want %X", starts, wantStarts)
+	ti := buildKernelImage(t, systemKernelText(), []chunk{lbl("ksdata"), rep(16, 0)}, map[uint32]string{104: "kSys", 105: "kStr", 106: "kIret"})
+	lf := liftRoutine(t, ti, "kSys")
+	body := lf.blocks[key(ti.at(t, "kSys"))]
+	if len(lf.blocks) != 1 || body == nil {
+		t.Fatalf("blocks %v, want the one at kSys", keysOf(lf.blocks))
 	}
 	names := map[string]int{}
-	for _, b := range blocks {
-		for _, e := range b.effects {
-			if e.Kind == "call" {
-				names[e.Fn]++
-			}
+	for _, e := range body.effects {
+		if e.Kind == "call" {
+			names[e.Fn]++
 		}
 	}
 	want := map[string]int{
-		cpuCLI: 1, cpuCLTS: 1, cpuInvlpg: 1, cpuCLD: 1, cpuSTD: 1, cpuINS: 1, cpuOUTS: 1, cpuSCAS: 1, cpuCMPS: 1,
+		cpuCLI: 1, cpuCLTS: 1, cpuInvlpg: 1, cpuINS: 1, cpuOUTS: 1, cpuSCAS: 1, cpuCMPS: 1,
 		cpuWRMSR: 1, cpuRDMSRLo: 1, cpuRDMSRHi: 1, cpuRDTSCLo: 1, cpuRDTSCHi: 1,
 		cpuCPUID + "EAX": 1, cpuCPUID + "EBX": 1, cpuCPUID + "ECX": 1, cpuCPUID + "EDX": 1,
-		cpuFXSave: 1, cpuFXRstor: 1, cpuFXRstorST: 8, cpuFNSave: 1, cpuFRstor: 1, cpuFRstorST: 16,
+		cpuFXSave: 1, cpuFXRstor: 1, cpuFXRstorST: 8, cpuFNSave: 1, cpuFRstor: 1, cpuFRstorST: 8,
 		cpuLGDT: 1, cpuLIDT: 1, cpuLTR: 1, cpuWriteCR: 1, cpuReadCR: 1,
 		cpuFLDCW: 1, cpuFNINIT: 1, cpuFNCLEX: 1, cpuPushFD: 1, cpuPopFD: 1, cpuSTI: 1,
 	}
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("recorded calls %v\nwant %v", names, want)
 	}
-	constants := []string{cpuCLI, cpuSTI, cpuPushFD, cpuPopFD, cpuIRETD, cpuINS, cpuOUTS, cpuSCAS, cpuCMPS, cpuWRMSR, cpuRDMSRLo, cpuRDMSRHi, cpuRDTSCLo, cpuRDTSCHi, cpuCPUID, cpuFXSave, cpuFXRstor, cpuFXRstorST, cpuFNSave, cpuFRstor, cpuFRstorST, cpuLGDT, cpuLIDT, cpuSGDT, cpuSIDT, cpuLTR, cpuWriteCR, cpuReadCR, cpuInvlpg, cpuCLD, cpuSTD, cpuCLTS, cpuFNSTCW, cpuFLDCW, cpuFNINIT, cpuFNCLEX}
+	constants := []string{cpuCLI, cpuSTI, cpuPushFD, cpuPopFD, cpuIRETD, cpuINS, cpuOUTS, cpuSCAS, cpuCMPS, cpuWRMSR, cpuRDMSRLo, cpuRDMSRHi, cpuRDTSCLo, cpuRDTSCHi, cpuCPUID, cpuFXSave, cpuFXRstor, cpuFXRstorST, cpuFNSave, cpuFRstor, cpuFRstorST, cpuLGDT, cpuLIDT, cpuSGDT, cpuSIDT, cpuLTR, cpuWriteCR, cpuReadCR, cpuInvlpg, cpuCLTS, cpuFLDCW, cpuFNINIT, cpuFNCLEX}
 	seen := map[string]bool{}
 	for _, c := range constants {
 		if !strings.HasPrefix(c, "cpu_") || seen[c] {
@@ -98,10 +87,9 @@ func TestSystemInstructionCallNames(t *testing.T) {
 		}
 		seen[c] = true
 	}
-	if len(seen) != 36 {
-		t.Errorf("%d processor call names, want 36", len(seen))
+	if len(seen) != 33 {
+		t.Errorf("%d processor call names, want 33", len(seen))
 	}
-	body := blocks[2]
 	for _, e := range body.effects {
 		switch e.Fn {
 		case cpuWriteCR:
@@ -114,31 +102,29 @@ func TestSystemInstructionCallNames(t *testing.T) {
 			exprEq(t, "buffer", e.Args[1], Sym{"reg.EDI"})
 			exprEq(t, "count", e.Args[2], IConst{1})
 			exprEq(t, "size", e.Args[3], IConst{1})
-			exprEq(t, "step", e.Args[4], Sym{"dfstep1"})
+			exprEq(t, "step", e.Args[4], IConst{1})
 		case cpuSCAS:
 			exprEq(t, "repne", e.Args[5], IConst{1})
 		case cpuCMPS:
 			exprEq(t, "repe", e.Args[5], IConst{0})
-		case cpuPushFD:
-			exprEq(t, "flags kind after the string compare", e.Args[0], IConst{flagKindCodes["cmp"]})
+		case cpuFLDCW:
+			exprEq(t, "control word loaded back after its store", e.Args[0], Sym{"fpu.cw"})
 		case cpuReadCR:
 			exprEq(t, "read control register number", e.Args[0], IConst{0})
 		}
 	}
-	if len(body.fpu) != 8 {
-		t.Fatalf("x87 stack holds %d values", len(body.fpu))
+	for i, e := range callsNamed(body.effects, cpuFRstorST) {
+		exprEq(t, "restored slot", e.Args[1], IConst{uint32(i)})
 	}
-	for i, v := range body.fpu {
-		cr, ok := v.(CallResult)
-		if !ok || cr.Fn != cpuFRstorST || !equalExprs(cr.Args[1], IConst{uint32(i)}) {
-			t.Errorf("st%d restored as %s", i, ExprString(v))
-		}
+	if len(body.fpu) != 0 {
+		t.Errorf("x87 stack holds %d values after the reset", len(body.fpu))
 	}
-	str := blockOf(t, machineModel(t, ti, "kStr"), ti.at(t, "kStr"))
-	exprEq(t, "byte step source", str.regs[6], Bin{"add", Sym{"reg.ESI"}, Sym{"dfstep1"}})
-	exprEq(t, "byte then word step", str.regs[7], Bin{"add", Bin{"add", Sym{"reg.EDI"}, Sym{"dfstep1"}}, Sym{"dfstep2"}})
-	iret := blockOf(t, machineModel(t, ti, "kIret"), ti.at(t, "kIret"))
-	if iret.term.kind != "iret" || len(iret.effects) != 0 {
+	exprEq(t, "control word after the reset", body.cw, IConst{fpuResetControlWord})
+	str := liftRoutine(t, ti, "kStr").blocks[key(ti.at(t, "kStr"))]
+	exprEq(t, "byte step source", str.regs[6], Bin{"add", Sym{"reg.ESI"}, IConst{1}})
+	exprEq(t, "byte then word step", str.regs[7], Bin{"add", Bin{"add", Sym{"reg.EDI"}, IConst{1}}, IConst{2}})
+	iret := liftRoutine(t, ti, "kIret").blocks[key(ti.at(t, "kIret"))]
+	if iret.term.kind != "return" || len(callsNamed(iret.effects, cpuIRETD)) != 1 {
 		t.Errorf("interrupt return block %+v with %v", iret.term, iret.effects)
 	}
 }
@@ -189,12 +175,6 @@ func TestSystemConditionalMoveUsesJumpCondition(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cmovJump, want) {
 		t.Errorf("conditional move table %v", cmovJump)
-	}
-	sets := map[x86asm.Op]string{x86asm.SETE: "JE", x86asm.SETNE: "JNE", x86asm.SETL: "JL", x86asm.SETGE: "JGE", x86asm.SETLE: "JLE", x86asm.SETG: "JG", x86asm.SETB: "JB", x86asm.SETAE: "JAE", x86asm.SETBE: "JBE", x86asm.SETA: "JA", x86asm.SETS: "JS", x86asm.SETNS: "JNS", x86asm.SETP: "JP", x86asm.SETNP: "JNP", x86asm.SETO: "JO", x86asm.SETNO: "JNO", x86asm.JE: "JE", x86asm.JNE: "JNE"}
-	for op, name := range sets {
-		if got := jumpName(op); got != name {
-			t.Errorf("%v names %s, want %s", op, got, name)
-		}
 	}
 	p = onePath(t, runPaths(t, ti, "fcmovFn", noInit))
 	stores := effectsOf(p, "store")

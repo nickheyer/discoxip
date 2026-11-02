@@ -88,7 +88,7 @@ func TestStaticAddressFlow(t *testing.T) {
 	if len(flow.Instructions) != 9 {
 		t.Fatalf("flow %v", opsOf(flow))
 	}
-	states := d.staticAddressFlow(flow)
+	states := d.staticAddressFlowFrom(flow, nil)
 	want := []map[x86asm.Reg]uint32{
 		{},
 		{x86asm.ESI: 0x12100},
@@ -113,7 +113,7 @@ func TestStaticAddressFlow(t *testing.T) {
 		t.Errorf("seeded branch held %v", got)
 	}
 	orphan := &Function{EntryVA: 0x15000, Instructions: flow.Instructions}
-	if got := d.staticAddressFlow(orphan); len(got) != 9 || got[0] != nil {
+	if got := d.staticAddressFlowFrom(orphan, nil); len(got) != 9 || got[0] != nil {
 		t.Fatal("entry outside the instructions computed a flow")
 	}
 }

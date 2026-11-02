@@ -11,7 +11,7 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// LiftedFunction is a routine the runtime runs block by block, its loops being the jumps the executable makes.
+// LiftedFunction is a routine lifted block by block, its loops being the jumps the executable makes.
 type LiftedFunction struct {
 	Entry  string                  `json:"entry"`
 	Regs   []string                `json:"input_regs"`
@@ -63,8 +63,7 @@ type LiftedFCmp struct {
 	AxFSW bool `json:"ax_fsw"`
 }
 
-// LiftedTerm is how a block ends: a jump, a branch, a switch or the routine's return, and in a machine lift a jump
-// through a computed address, a halt, a software interrupt or an interrupt return.
+// LiftedTerm is how a block ends, a jump, a branch, a switch, a trap or the routine's return
 type LiftedTerm struct {
 	Kind    string   `json:"kind"`
 	Target  string   `json:"target,omitempty"`
@@ -74,7 +73,6 @@ type LiftedTerm struct {
 	Index   int      `json:"index,omitempty"`
 	Targets []string `json:"targets,omitempty"`
 	Value   int      `json:"value,omitempty"`
-	Vector  int      `json:"vector,omitempty"`
 }
 
 // liftedBlock is a block before its expressions are pooled.
@@ -97,7 +95,6 @@ type liftedBlock struct {
 	term    *blockTerm
 	succs   []string
 	npx     int
-	loads   map[int][]Expr // the loads to read at each epoch, found once the block is run or written
 }
 
 // blockTerm is the symbolic end of a block as the executor reached it.
@@ -110,8 +107,6 @@ type blockTerm struct {
 	index   Expr
 	targets []uint32
 	value   Expr
-	vector  int
-	ret     uint32 // the return address a call pushed before the jump, for walking a routine past its calls
 }
 
 // blockRun is the block the executor is lifting, with the leaders that end it and the instructions it owns.
@@ -350,8 +345,8 @@ func entryFlags(pred *liftedBlock) (flagState, *fcmpRec, bool) {
 	return fl, fcmp, pred.axFSW
 }
 
-// Lift runs a routine block by block with every input symbolic, keeping its control flow for the runtime to follow,
-// the blocks lifted before a failure coming back beside the error
+// Lift runs a routine block by block with every input symbolic, keeping its control flow, the blocks lifted before
+// a failure coming back beside the error
 func (ex *Executor) Lift(entry uint32) (*LiftedFunction, error) {
 	fn := ex.d.Functions[entry]
 	if fn == nil {
@@ -523,9 +518,7 @@ func (ex *Executor) liftBlock(fn *Function, leaders, inside map[uint32]bool, va 
 		}
 		b.regs[i] = v
 	}
-	for i := range s.fpu {
-		b.fpu = append(b.fpu, s.fpu[i])
-	}
+	b.fpu = append(b.fpu, s.fpu...)
 	for i := range s.xmm {
 		for lane := range s.xmm[i] {
 			if s.xmm[i][lane] != nil {
@@ -625,18 +618,14 @@ func serializeBlock(in *interner, b *liftedBlock) *LiftedBlock {
 	t := b.term
 	lb.Term = LiftedTerm{Kind: t.kind}
 	switch t.kind {
-	case "jump", "hlt":
+	case "jump":
 		lb.Term.Target = b.succs[0]
-	case "int":
-		lb.Term.Target, lb.Term.Vector = b.succs[0], t.vector
 	case "branch":
 		lb.Term.Cond, lb.Term.Taken, lb.Term.Fall = in.add(t.cond), b.succs[0], b.succs[1]
 	case "switch":
 		lb.Term.Index, lb.Term.Targets = in.add(t.index), b.succs
 	case "return":
 		lb.Term.Value = in.add(t.value)
-	case "jumpind":
-		lb.Term.Index = in.add(t.index)
 	}
 	return lb
 }
@@ -724,14 +713,6 @@ func (lf *LiftedFunction) String() string {
 			p.line("halt")
 		case "noreturn":
 			p.line("noreturn")
-		case "jumpind":
-			p.line("jump to %s", p.render(t.index))
-		case "hlt":
-			p.line("hlt then %s", b.succs[0])
-		case "int":
-			p.line("int %d then %s", t.vector, b.succs[0])
-		case "iret":
-			p.line("iret")
 		}
 	}
 	return sb.String()
@@ -749,27 +730,6 @@ func (b *liftedBlock) shown() []Expr {
 		out = append(out, b.segs[name])
 	}
 	return append(out, b.term.cond, b.term.index, b.term.value)
-}
-
-// Every expression a block's run evaluates, the dump's beside the float stack, the control word, the vector
-// lanes, the flag record and the pending float compare
-func (b *liftedBlock) emitted() []Expr {
-	out := append(b.shown(), b.fpu...)
-	out = append(out, b.cw)
-	for _, name := range slices.Sorted(maps.Keys(b.xmm)) {
-		out = append(out, b.xmm[name])
-	}
-	for _, name := range slices.Sorted(maps.Keys(b.mm)) {
-		out = append(out, b.mm[name])
-	}
-	out = append(out, b.fl.a, b.fl.b, b.fl.r, b.fl.cf)
-	if b.fl.fsw != nil {
-		out = append(out, b.fl.fsw.a, b.fl.fsw.b)
-	}
-	if b.fcmp != nil {
-		out = append(out, b.fcmp.a, b.fcmp.b)
-	}
-	return out
 }
 
 // graphPrinter renders a block's expressions with every compound node the block shares named once
@@ -830,4 +790,17 @@ func effectString(e Effect, str func(Expr) string) string {
 		args[i] = str(a)
 	}
 	return fmt.Sprintf("%s#%d(%s)", e.Fn, e.Seq, strings.Join(args, ", "))
+}
+
+// Serializes the flag record of a block, an index of -1 standing for an operand the record lacks
+func (b *liftedBlock) flagsJSON(in *interner) *LiftedFlags {
+	f := b.fl
+	if f.kind == "" {
+		return nil
+	}
+	out := &LiftedFlags{Kind: f.kind, A: optional(in, f.a), B: optional(in, f.b), R: optional(in, f.r), CF: optional(in, f.cf), FswA: -1, FswB: -1}
+	if f.fsw != nil {
+		out.FswA, out.FswB = optional(in, f.fsw.a), optional(in, f.fsw.b)
+	}
+	return out
 }

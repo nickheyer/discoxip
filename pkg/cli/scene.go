@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/nickheyer/discoxip/pkg/scene"
+	"github.com/nickheyer/discoxip/pkg/xbe"
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +18,24 @@ var sceneXBE string
 
 // Loads the vertex layouts the dashboard executable declares
 func sceneLayouts() (map[uint32]scene.Layout, error) {
-	layouts, _, err := loadLayouts(sceneXBE)
+	return loadLayouts(sceneXBE)
+}
+
+// Derives the vertex layouts an executable binds to its buffer formats, the kernel lifted beside it
+func loadLayouts(xbePath string) (map[uint32]scene.Layout, error) {
+	img, err := xbe.Open(xbePath)
+	if err != nil {
+		return nil, err
+	}
+	d, err := xbe.Disassemble(img)
+	if err != nil {
+		return nil, err
+	}
+	kernel, _, err := loadKernel()
+	if err != nil {
+		return nil, err
+	}
+	layouts, _, err := scene.LoadLayouts(d, kernel)
 	return layouts, err
 }
 

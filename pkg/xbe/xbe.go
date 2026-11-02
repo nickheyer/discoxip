@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"unicode/utf16"
 )
@@ -380,50 +379,6 @@ func (img *Image) ReadWideString(va uint32) string {
 		units = append(units, c)
 	}
 	return string(utf16.Decode(units))
-}
-
-// MemoryFile is the name the exported startup memory is written under
-const MemoryFile = "image.bin"
-
-// ImageSection is where one loaded section sits in the startup memory and in the file holding it
-type ImageSection struct {
-	Name     string `json:"name"`
-	VA       uint32 `json:"va"`
-	Size     uint32 `json:"size"`
-	Off      uint32 `json:"off"`
-	Writable bool   `json:"writable"`
-}
-
-// ImageMemory is the loaded image the runtime reads as the memory the console starts the executable with
-type ImageMemory struct {
-	File     string         `json:"file"`
-	Base     uint32         `json:"base"`
-	Sections []ImageSection `json:"sections"`
-}
-
-// Lays every loaded section out in address order as the memory the console starts the executable with
-func (img *Image) Memory() (ImageMemory, []byte, error) {
-	order := make([]*Section, 0, len(img.Sections))
-	for i := range img.Sections {
-		order = append(order, &img.Sections[i])
-	}
-	sort.Slice(order, func(i, j int) bool { return order[i].VirtualAddr < order[j].VirtualAddr })
-	mem := ImageMemory{File: MemoryFile, Base: img.BaseAddr}
-	var bytes []byte
-	// The loader maps the header at the base address, the certificate the executable reads its title from inside it
-	if int(img.HeadersSize) > len(img.raw) {
-		return mem, nil, fmt.Errorf("xbe: the header claims %d bytes of a %d byte file", img.HeadersSize, len(img.raw))
-	}
-	if len(order) > 0 && img.BaseAddr+img.HeadersSize > order[0].VirtualAddr {
-		return mem, nil, fmt.Errorf("xbe: the header ends at %08X inside section %s at %08X", img.BaseAddr+img.HeadersSize, order[0].Name, order[0].VirtualAddr)
-	}
-	mem.Sections = append(mem.Sections, ImageSection{Name: "header", VA: img.BaseAddr, Size: img.HeadersSize, Off: 0, Writable: false})
-	bytes = append(bytes, img.raw[:img.HeadersSize]...)
-	for _, s := range order {
-		mem.Sections = append(mem.Sections, ImageSection{Name: s.Name, VA: s.VirtualAddr, Size: s.VirtualSize, Off: uint32(len(bytes)), Writable: s.Writable()})
-		bytes = append(bytes, s.Data...)
-	}
-	return mem, bytes, nil
 }
 
 // FindSection returns the section with the given name, or nil.

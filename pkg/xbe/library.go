@@ -8,7 +8,7 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// XDK routines the runtime's GPU runs from the image to read the textures the executable creates
+// XDK routines that read the textures the executable creates
 var gpuRoutines = []string{"D3DTexture_GetLevelDesc", "D3DTexture_GetSurfaceLevel", "D3DSurface_GetDesc", "D3DResource_Release", "XGBytesPerPixelFromFormat", "XGIsSwizzledFormat", "XGUnswizzleRect"}
 
 // The miniport routine mapping the GPU's registers and the routine finding a texture level's data
@@ -27,7 +27,7 @@ type SurfaceDescLayout struct {
 	Height int32 `json:"height"`
 }
 
-// Lifts every library routine the runtime's routines reach so it runs the image's code wherever it has no stand-in
+// Lifts every library routine the engine's routines reach
 func (rm *RenderModel) deriveLibrary(d *Disassembly, ex *Executor, sc *SceneModel, types map[string]*NodeType, hooked map[uint32]bool) {
 	named := map[string]uint32{}
 	ambiguous := map[string]bool{}
@@ -193,7 +193,7 @@ func (d *Disassembly) readsReceiver(fn *Function) bool {
 	return false
 }
 
-// Reports whether a class's load creates a device texture no image loader of the runtime fills
+// Reports whether a class's load creates a device texture no image loader fills
 func (d *Disassembly) createsOwnTexture(nt *NodeType, loadSlot, textureSlot int32, imageLoad []uint32) bool {
 	if int(loadSlot/4) >= len(nt.Slots) || int(textureSlot/4) >= len(nt.Slots) {
 		return false

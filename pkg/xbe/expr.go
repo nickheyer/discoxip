@@ -23,7 +23,7 @@ type IConst struct{ V uint32 }
 // FConst is a floating point value.
 type FConst struct{ V float64 }
 
-// Sym is a named runtime input such as the node pointer or the clock.
+// Sym is a named open input such as the node pointer or the clock
 type Sym struct{ Name string }
 
 // Ptr is an address formed from a base object plus a constant offset.
@@ -38,7 +38,7 @@ type Load struct {
 	Off   int32
 	Size  int
 	Addr  Expr // set when the address itself is symbolic
-	Epoch int  // effects recorded before the load, which the runtime reads the memory as of
+	Epoch int  // effects recorded before the load, which the memory is read as of
 }
 
 // Bin is a binary integer or float operation.
@@ -299,24 +299,6 @@ func ExprString(e Expr) string {
 	return formatExpr(e, ExprString)
 }
 
-// Nodes an abbreviated rendering spells out before eliding the rest
-const exprStringNodes = 400
-
-// ExprStringShort renders an expression as ExprString does, nodes past a budget elided, for messages about values
-// whose shared subexpressions would otherwise unfold without bound
-func ExprStringShort(e Expr) string {
-	left := exprStringNodes
-	var render func(Expr) string
-	render = func(e Expr) string {
-		if left <= 0 {
-			return "..."
-		}
-		left--
-		return formatExpr(e, render)
-	}
-	return render(e)
-}
-
 // Renders one node in the dump notation, child handing back the text of each node it is built from
 func formatExpr(e Expr, child func(Expr) string) string {
 	switch v := e.(type) {
@@ -428,8 +410,7 @@ func mkBin(op string, a, b Expr) Expr {
 			}
 		}
 	}
-	// An opaque call result entering pointer arithmetic is an object base, two results added being plain integers,
-	// except in a machine lift where every value is the number it is
+	// An opaque call result entering pointer arithmetic is an object base, two results added being plain integers
 	_, aResult := a.(CallResult)
 	_, bResult := b.(CallResult)
 	if cr, ok := a.(CallResult); ok && !bResult && (op == "add" || op == "sub") && resultPointers {

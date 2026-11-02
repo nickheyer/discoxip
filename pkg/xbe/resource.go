@@ -464,7 +464,7 @@ func (r *resourceCalls) readPush(p Path, i int) (push, bool, error) {
 	return out, true, nil
 }
 
-// Folds the resource routines the optimizer inlined back into the XDK calls the runtime implements
+// Folds the resource routines the optimizer inlined back into the XDK calls they came from
 func (ex *Executor) foldInlinedResources(paths []Path) ([]Path, error) {
 	r := ex.d.resources
 	if r == nil {
@@ -610,7 +610,7 @@ func (ex *Executor) foldResources(p Path, r *resourceCalls) (Path, bool, error) 
 		case e.Kind == "call" && e.Fn == memFree && mentionsAllocation(e.Args, allocated):
 			drop[i] = true
 		case e.Kind == "store" && e.Addr != nil && r.deviceHeld(e.Addr) != nil:
-			// The setter releases the texture the stage held, which the runtime keeps alive like every resource
+			// The setter releases the texture the stage held
 			if _, _, isSlot := r.stageSlot(r.deviceHeld(e.Addr)); !isSlot {
 				return Path{}, false, fmt.Errorf("xbe: the store at %08X writes through the pointer the device holds at %s, which no XDK routine the derivation reads touches", e.VA, ExprString(r.deviceHeld(e.Addr)))
 			}

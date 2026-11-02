@@ -85,7 +85,6 @@ func buildXBE(spec xbeSpec) []byte {
 		binary.LittleEndian.PutUint32(header[cursor+8:], spec.tls.Index)
 		binary.LittleEndian.PutUint32(header[cursor+12:], spec.tls.Callbacks)
 		binary.LittleEndian.PutUint32(header[cursor+16:], spec.tls.ZeroFill)
-		cursor += 20
 	}
 	file := append([]byte(nil), header...)
 	for i, s := range spec.sections {
