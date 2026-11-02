@@ -1,5 +1,5 @@
 # discoxip
-Unpacks Original Xbox dash from XIP archives and OS from collected reference material to native c
+Derive the X Dashboard from XIP archives and OS from collected reference material
 
 ## Install
 ```
@@ -9,7 +9,7 @@ Prebuilt binaries are on the [releases page](https://github.com/nickheyer/discox
 
 ## Usage
 ```
-discoxip build <source-dir> --bios <flash.bin> --mcpx <mcpx.bin> [-o <dir>]          extract archives, decode the XBE
+discoxip build <source-dir> --bios <flash.bin> --mcpx <mcpx.bin> [-o <dir>]          derive and decode the XBE
 
 discoxip info <archive.xip>
 discoxip extract [path] [-o <dir>] [-r] [-v]
