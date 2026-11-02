@@ -1,5 +1,5 @@
 # discoxip
-Unpacks Original Xbox dashboard XIP archives and rebuilds the dashboard as a Three.js web app.
+Unpacks Original Xbox dashboard XIP archives.
 
 ## Install
 ```
@@ -9,8 +9,7 @@ Prebuilt binaries are on the [releases page](https://github.com/nickheyer/discox
 
 ## Usage
 ```
-discoxip build <source-dir> --bios <flash.bin> --mcpx <mcpx.bin> [-o <dir>]          extract archives, decode the XBE, emit the web app
-discoxip web export <extracted-dir> --bios <flash.bin> --mcpx <mcpx.bin> [-o <dir>]  emit the web app from an extracted directory
+discoxip build <source-dir> --bios <flash.bin> --mcpx <mcpx.bin> [-o <dir>]          extract archives, decode the XBE
 
 discoxip info <archive.xip>
 discoxip extract [path] [-o <dir>] [-r] [-v]
@@ -42,20 +41,4 @@ discoxip buffer export <file.vb> <file.ib> --xbe <file.xbe> --bios <flash.bin> -
 discoxip texture info|export <file.xbx>
 discoxip texture export-all <directory>
 discoxip font info|export <file.xtf>
-```
-
-## Controls
-```
-Arrows             D-pad          Enter or A    A         Backspace or B   B
-X, Y               X, Y           Space         Start     Escape           Back
-Q, E               White, Black   Z, C          triggers  V, N             thumb clicks
-I J K L            left stick     Numpad 8 4 5 6  right stick
-Gamepads use the browser's standard mapping
-```
-
-## Development
-```
-make dev                       # build sample/5659 into build/dev, decompile the XBE, serve on :8000
-make dev SRC=<dir> PORT=9000
-make test
 ```
