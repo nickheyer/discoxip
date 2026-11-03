@@ -1,0 +1,523 @@
+{
+  "4034": {
+    "flash": "kernels/4034_orig.bin",
+    "mcpx": "kernels/mcpx-1.0.bin",
+    "signature": "native/boot/2bl/4034/signature.bin",
+    "bldr": {
+      "tools": "vc6",
+      "asm": "vc6sp5",
+      "base": "0x400000",
+      "cflags": [
+        "/O1",
+        "/Gz",
+        "/Zl",
+        "/Inative/boot/2bl",
+        "/Inative/private/ntos/inc",
+        "/DBLDR_BUILD=4034"
+      ],
+      "aflags": [
+        "/coff",
+        "/DBLDR_BUILD=4034"
+      ],
+      "objects": [
+        {
+          "file": "native/boot/2bl/start.asm"
+        },
+        {
+          "file": "native/boot/2bl/smbus.asm"
+        },
+        {
+          "file": "native/boot/2bl/bldr.c",
+          "tools": "vc7",
+          "flags": [
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/boot/2bl/bldrsup.c",
+          "tools": "vc7",
+          "flags": [
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/ldi.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decapi.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decinit.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectran.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decmain.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decmisc.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decuncmp.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decverb.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decalign.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decbuf.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectree.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectbl.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/lzxtbl.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/sdktools/crt/crtw32/stdio/output.c"
+        },
+        {
+          "file": "native/private/sdktools/crt/crtw32/i386/ulldvrm.asm"
+        },
+        {
+          "file": "native/boot/2bl/imagedir.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/i386/rc4fast.asm"
+        },
+        {
+          "file": "native/private/rsa322/sha.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/i386/shafast.asm"
+        },
+        {
+          "file": "native/private/rsa322/uint4.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        }
+      ],
+      "link": [
+        "/NODEFAULTLIB",
+        "/BASE:0x400000",
+        "/ENTRY:BldrEntry",
+        "/SUBSYSTEM:NATIVE",
+        "/DRIVER",
+        "/OPT:REF"
+      ],
+      "layout": [
+        ".data",
+        ".rdata",
+        ".text",
+        ".bss"
+      ],
+      "biases": [
+        "0x80000000",
+        "0xFFC90000"
+      ]
+    }
+  },
+  "5713": {
+    "flash": "kernels/5713_orig.bin",
+    "mcpx": "kernels/mcpx-1.1.bin",
+    "signature": "native/boot/2bl/5713/signature.bin",
+    "nonce": "native/boot/2bl/5713/nonce.bin",
+    "header": "native/boot/2bl/5713/header.bin",
+    "reenter": "_BldrReenter",
+    "bldr": {
+      "tools": "vc6",
+      "asm": "vc6sp5",
+      "base": "0x400000",
+      "cflags": [
+        "/O1",
+        "/Gz",
+        "/Zl",
+        "/Inative/boot/2bl",
+        "/Inative/private/ntos/inc",
+        "/DBLDR_BUILD=5713"
+      ],
+      "aflags": [
+        "/coff",
+        "/DBLDR_BUILD=5713"
+      ],
+      "objects": [
+        {
+          "file": "native/boot/2bl/start.asm"
+        },
+        {
+          "file": "native/boot/2bl/smbus.asm"
+        },
+        {
+          "file": "native/boot/2bl/bldr.c",
+          "tools": "vc7",
+          "flags": [
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/boot/2bl/bldrsup.c",
+          "tools": "vc7",
+          "flags": [
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/ldi.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decapi.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decinit.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectran.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decmain.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decmisc.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decuncmp.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decverb.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decalign.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/decbuf.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectree.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/decoder/dectbl.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/private/windows/diamond/lzx/lzxtbl.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/windows/diamond/lzx/decoder"
+          ]
+        },
+        {
+          "file": "native/boot/2bl/imagedir.c",
+          "tools": "vc7",
+          "flags": [
+            "/Oy-",
+            "/Ob1",
+            "/Inative/private/windows/diamond/lzx",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/i386/rc4fast.asm"
+        }
+      ],
+      "link": [
+        "/NODEFAULTLIB",
+        "/BASE:0x400000",
+        "/ENTRY:BldrEntry",
+        "/SUBSYSTEM:NATIVE",
+        "/DRIVER",
+        "/OPT:REF"
+      ],
+      "layout": [
+        ".data",
+        ".rdata",
+        ".text",
+        ".bss"
+      ],
+      "biases": [
+        "0x80000000",
+        "0xFFC90000"
+      ]
+    },
+    "preldr": {
+      "tools": "vc6",
+      "asm": "vc6sp5",
+      "base": "0xFFFFD400",
+      "cflags": [
+        "/O1",
+        "/Gz",
+        "/Zl",
+        "/Inative/boot/2bl",
+        "/Inative/private/ntos/inc"
+      ],
+      "aflags": [
+        "/coff"
+      ],
+      "objects": [
+        {
+          "file": "native/boot/2bl/fbl.asm"
+        },
+        {
+          "file": "native/boot/2bl/fbl.c",
+          "tools": "vc7",
+          "flags": [
+            "/Ob1",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/sdktools/crt/crtw32/i386/ulldiv.asm"
+        },
+        {
+          "file": "native/private/rsa322/sha.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/rsa_pub.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/i386/rc4fast.asm"
+        },
+        {
+          "file": "native/private/rsa322/i386/shafast.asm"
+        },
+        {
+          "file": "native/private/rsa322/uint4.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/benaloh.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/rsa_math.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        },
+        {
+          "file": "native/private/rsa322/i386/rsafast.asm"
+        },
+        {
+          "file": "native/private/rsa322/i386/rsa_port.c",
+          "tools": "vc7",
+          "flags": [
+            "/O2",
+            "/Inative/private/rsa322"
+          ]
+        }
+      ],
+      "link": [
+        "/NODEFAULTLIB",
+        "/ENTRY:FblEntry",
+        "/SUBSYSTEM:NATIVE",
+        "/DRIVER",
+        "/OPT:REF"
+      ],
+      "layout": [
+        ".rdata",
+        ".text",
+        ".data",
+        ".bss"
+      ]
+    }
+  }
+}

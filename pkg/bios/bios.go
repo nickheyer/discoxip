@@ -12,18 +12,37 @@ import (
 
 // Sizes and places of the parts of one 256 KB flash bank
 const (
-	bankSize         = 0x40000
-	mcpxSize         = 0x200
-	bldrSize         = 0x6000
-	bldrBase         = 0x00090000
-	preldrBlockSize  = 0x2A00
-	preldrBase       = 0x100000000 - mcpxSize - preldrBlockSize
-	preldrParamsSize = 0x80
-	preldrNonceSize  = 0x10
-	keySize          = 16
-	bootParamsSize   = 36
-	bootSignature    = 0x7854794A
+	bankSize        = 0x40000
+	mcpxSize        = 0x200
+	bldrSize        = 0x6000
+	bldrBase        = 0x00090000
+	preldrBlockSize = 0x2A00
+	preldrBase      = 0x100000000 - mcpxSize - preldrBlockSize
+	preldrNonceSize = 0x10
+	keySize         = 16
+	bootParamsSize  = 36
+	bootSignature   = 0x7854794A
+	signatureSize   = 0x100
+	signatureAt     = 0x5E80
+	overlayAt       = 0x5800
+	overlayHeader10 = 12
+	overlayHeader11 = 20
+	bldrRecordAt    = bldrSize - preldrBlockSize - 8
 )
+
+// Overlay is the plaintext the build tool wrote over the encrypted 2BL, the signature and its header among it
+type Overlay struct {
+	Start, End int
+	Nonce      bool
+}
+
+// The overlay each MCPX revision's flash carries, the second loader's block for the 1.1 scheme
+func OverlayFor(rev int) Overlay {
+	if rev == 0 {
+		return Overlay{Start: overlayAt, End: signatureAt + signatureSize + overlayHeader10}
+	}
+	return Overlay{Start: bldrSize - preldrBlockSize, End: signatureAt + signatureSize + overlayHeader11, Nonce: true}
+}
 
 // BootParams are the sizes at the end of the 2BL that place the kernel and its data
 type BootParams struct {
@@ -127,51 +146,45 @@ func (b *Bank) MCPXRevision() int {
 	return 0
 }
 
+// PreldrKey derives the RC4 key of a 1.1 bank, the SHA1 of the ROM secret, the nonce and the secret xored with 0x5C
+func PreldrKey(secret, nonce []byte) []byte {
+	h := sha1.New()
+	h.Write(secret)
+	h.Write(nonce)
+	xored := make([]byte, len(secret))
+	for i := range xored {
+		xored[i] = secret[i] ^ 0x5C
+	}
+	h.Write(xored)
+	return h.Sum(nil)
+}
+
 // Decrypt unlocks the 2BL with the MCPX key, reads its parameters and keys, and extracts the kernel
 func (b *Bank) Decrypt(mcpx *MCPX) error {
 	if mcpx.Revision != b.MCPXRevision() {
 		return fmt.Errorf("bios: the bank boots on MCPX 1.%d and the ROM given is MCPX 1.%d", b.MCPXRevision(), mcpx.Revision)
 	}
 	bldr := b.Bldr
-	preldr := bldr[bldrSize-preldrBlockSize:]
+	raw := make([]byte, bldrSize)
+	copy(raw, bldr)
 	paramsAt := bldrSize - bootParamsSize
+	var key []byte
 	if b.Preldr {
-		// The preldr's key is the SHA1 of the secret, the preldr's nonce and the secret xored with 0x5C
-		h := sha1.New()
-		h.Write(mcpx.Key)
-		h.Write(preldr[preldrBlockSize-preldrNonceSize:])
-		xored := make([]byte, keySize)
-		for i := range xored {
-			xored[i] = mcpx.Key[i] ^ 0x5C
-		}
-		h.Write(xored)
-		c, err := rc4.NewCipher(h.Sum(nil))
-		if err != nil {
-			return err
-		}
-		// The 2BL is decrypted around the preldr, whose block stays as the flash holds it
-		c.XORKeyStream(bldr[:bldrSize-preldrBlockSize], bldr[:bldrSize-preldrBlockSize])
-		skip := make([]byte, preldrBlockSize-preldrParamsSize)
-		c.XORKeyStream(skip, skip)
-		tail := bldr[bldrSize-preldrParamsSize:]
-		c.XORKeyStream(tail, tail)
-		// The first 16 bytes were zeroed at build, the entry coming back from the preldr's entry record
-		entryOff := binary.LittleEndian.Uint32(bldr[bldrSize-preldrBlockSize-8:])
-		if entryOff > bldrSize {
-			return fmt.Errorf("bios: the preldr names a 2BL entry at %#x past the 2BL", entryOff)
-		}
-		for i := 0; i < 16; i++ {
-			bldr[i] = 0
-		}
-		binary.LittleEndian.PutUint32(bldr, bldrBase+entryOff)
-		// The nonce took the last 16 bytes, so the boot params sit 16 bytes earlier
+		key = PreldrKey(mcpx.Key, raw[bldrSize-preldrNonceSize:])
 		paramsAt -= preldrNonceSize
 	} else {
-		c, err := rc4.NewCipher(mcpx.Key)
-		if err != nil {
-			return err
-		}
-		c.XORKeyStream(bldr, bldr)
+		key = mcpx.Key
+	}
+	c, err := rc4.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	// The whole 2BL was one RC4 stream, the overlay and nonce written over the ciphertext afterwards
+	c.XORKeyStream(bldr, bldr)
+	ov := OverlayFor(b.MCPXRevision())
+	copy(bldr[ov.Start:ov.End], raw[ov.Start:ov.End])
+	if ov.Nonce {
+		copy(bldr[bldrSize-preldrNonceSize:], raw[bldrSize-preldrNonceSize:])
 	}
 	p := bldr[paramsAt:]
 	b.Params = BootParams{
@@ -187,8 +200,13 @@ func (b *Bank) Decrypt(mcpx *MCPX) error {
 	if b.Params.KernelSize > bankSize || b.Params.KernelDataSize > bankSize || b.Params.InitTableSize > bankSize {
 		return fmt.Errorf("bios: the 2BL names a %d byte kernel, %d bytes of kernel data and a %d byte init table in a %d byte bank", b.Params.KernelSize, b.Params.KernelDataSize, b.Params.InitTableSize, bankSize)
 	}
-	b.Entry = binary.LittleEndian.Uint32(bldr)
-	entryOff := int(b.Entry & 0xFFFF)
+	if b.Preldr {
+		// The 1.1 scheme keeps the entry offset in a record at the end of the 2BL rather than a header pointer
+		b.Entry = bldrBase + binary.LittleEndian.Uint32(bldr[bldrRecordAt:])
+	} else {
+		b.Entry = binary.LittleEndian.Uint32(bldr)
+	}
+	entryOff := int(b.Entry - bldrBase)
 	if entryOff < 8 || entryOff > bldrSize {
 		return fmt.Errorf("bios: the 2BL entry %08X lies outside the 2BL", b.Entry)
 	}
@@ -232,4 +250,116 @@ func (b *Bank) Decrypt(mcpx *MCPX) error {
 	}
 	b.Kernel = kernel
 	return nil
+}
+
+// BldrFlash is where the 2BL sits in the address space, just under the MCPX ROM
+const BldrFlash = 0x100000000 - mcpxSize - bldrSize
+
+// Layout places the plaintext fields of a 2BL image for one MCPX revision
+type Layout struct {
+	Size        int
+	ParamsAt    int
+	RecordAt    int
+	SignatureAt int
+	HeaderAt    int
+	NonceAt     int
+	Overlay     Overlay
+	PreldrAt    int
+	PreldrSize  int
+}
+
+// LayoutFor describes the 2BL image of a bank booted by the given MCPX revision
+func LayoutFor(rev int) Layout {
+	l := Layout{Size: bldrSize, ParamsAt: bldrSize - bootParamsSize, SignatureAt: signatureAt, HeaderAt: signatureAt + signatureSize, Overlay: OverlayFor(rev)}
+	if rev == 1 {
+		l.ParamsAt -= preldrNonceSize
+		l.RecordAt = bldrRecordAt
+		l.NonceAt = bldrSize - preldrNonceSize
+		l.PreldrAt = bldrSize - preldrBlockSize
+		l.PreldrSize = signatureAt - l.PreldrAt
+	}
+	return l
+}
+
+// KernelRaw returns the compressed kernel as the flash stores it, encrypted when the bank carries a key
+func (b *Bank) KernelRaw() []byte {
+	bldrAt := bankSize - bldrSize - mcpxSize
+	dataAt := bldrAt - int(b.Params.KernelDataSize)
+	return b.Data[dataAt-int(b.Params.KernelSize) : dataAt]
+}
+
+// BootDigest computes the digest the 2BL checks the kernel against, a keyed double SHA1 over every flash part for 1.0 and a plain SHA1 of kernel and data for 1.1
+func (b *Bank) BootDigest() [20]byte {
+	var out [20]byte
+	var size [4]byte
+	h := sha1.New()
+	if b.MCPXRevision() == 0 {
+		h.Write(b.Keys.Kernel[:])
+		binary.LittleEndian.PutUint32(size[:], b.Params.KernelSize)
+		h.Write(size[:])
+		h.Write(b.KernelRaw())
+		binary.LittleEndian.PutUint32(size[:], b.Params.KernelDataSize)
+		h.Write(size[:])
+		h.Write(b.KernelData)
+		binary.LittleEndian.PutUint32(size[:], b.Params.InitTableSize)
+		h.Write(size[:])
+		h.Write(b.InitTable)
+		inner := h.Sum(nil)
+		h = sha1.New()
+		h.Write(b.Keys.Kernel[:])
+		h.Write(inner)
+	} else {
+		h.Write(b.KernelRaw())
+		h.Write(b.KernelData)
+	}
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// Compose lays a rebuilt 2BL, and for 1.1 banks its preldr, into the plaintext image the flash encrypts, writing the fields the build tool fills in
+func (b *Bank) Compose(bldr, preldr, signature, nonce, header []byte, entry, reenter uint32) ([]byte, error) {
+	rev := b.MCPXRevision()
+	l := LayoutFor(rev)
+	img := make([]byte, l.Size)
+	if len(bldr) > l.Overlay.Start {
+		return nil, fmt.Errorf("bios: the 2BL is %d bytes and runs into the overlay at %#x", len(bldr), l.Overlay.Start)
+	}
+	copy(img, bldr)
+	if len(signature) != signatureSize {
+		return nil, fmt.Errorf("bios: the signature is %d bytes, not %d", len(signature), signatureSize)
+	}
+	copy(img[l.SignatureAt:], signature)
+	hdr := img[l.HeaderAt:]
+	binary.LittleEndian.PutUint32(hdr, 0xFFF00000)
+	binary.LittleEndian.PutUint32(hdr[4:], b.Params.InitTableSize)
+	if rev == 0 {
+		binary.LittleEndian.PutUint32(img, bldrBase+entry)
+		binary.LittleEndian.PutUint32(hdr[8:], BldrFlash-b.Params.KernelDataSize-b.Params.KernelSize)
+	} else {
+		if len(header) != 16 {
+			return nil, fmt.Errorf("bios: the 2BL header is %d bytes, not 16", len(header))
+		}
+		copy(img, header)
+		if len(preldr) > l.PreldrSize {
+			return nil, fmt.Errorf("bios: the preldr is %d bytes, more than the %d its block holds", len(preldr), l.PreldrSize)
+		}
+		copy(img[l.PreldrAt:], preldr)
+		binary.LittleEndian.PutUint32(img[l.RecordAt:], entry)
+		binary.LittleEndian.PutUint32(img[l.RecordAt+4:], reenter)
+		binary.LittleEndian.PutUint32(hdr[8:], BldrFlash)
+		binary.LittleEndian.PutUint32(hdr[12:], BldrFlash)
+		binary.LittleEndian.PutUint32(hdr[16:], 0x00400000)
+		if len(nonce) != preldrNonceSize {
+			return nil, fmt.Errorf("bios: the nonce is %d bytes, not %d", len(nonce), preldrNonceSize)
+		}
+		copy(img[l.NonceAt:], nonce)
+	}
+	p := img[l.ParamsAt:]
+	binary.LittleEndian.PutUint32(p, b.Params.KernelDataSize)
+	binary.LittleEndian.PutUint32(p[4:], b.Params.InitTableSize)
+	binary.LittleEndian.PutUint32(p[8:], bootSignature)
+	binary.LittleEndian.PutUint32(p[12:], b.Params.KernelSize)
+	digest := b.BootDigest()
+	copy(p[16:], digest[:])
+	return img, nil
 }

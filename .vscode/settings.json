@@ -1,0 +1,14 @@
+{
+    "files.exclude": {
+        "**/build/wine/**": true
+    },
+    "search.exclude": {
+        "**/build/wine/**": true
+    },
+    "gopls": {
+        "build.directoryFilters": [
+            "-**/node_modules",
+            "-build/wine"
+        ]
+    }
+}

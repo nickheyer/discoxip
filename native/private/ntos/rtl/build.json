@@ -1,0 +1,14 @@
+{
+  "xapilib": {
+    "cl": "vc71",
+    "flags": [
+      "/Oxs",
+      "/Gy",
+      "/GF",
+      "/Zl",
+      "/Z7",
+      "/Inative/private/ntos/rtl",
+      "/Inative/private/ntos/inc"
+    ]
+  }
+}

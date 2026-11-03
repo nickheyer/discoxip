@@ -4,3 +4,4 @@ sample/
 references/
 kernels/
 *.env
+.claude/

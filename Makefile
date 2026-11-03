@@ -6,12 +6,13 @@ OUT       ?= $(BUILD_DIR)/dev
 XBE       ?= $(firstword $(wildcard $(SRC)/*.xbe))
 BIOS      ?= kernels/5713_orig.bin
 MCPX      ?= kernels/mcpx-1.1.bin
+NATIVE_DOC  ?= references/docs/NATIVE_C.md
 NATIVE_SETS ?= 5659=sample/5659:kernels/5713_orig.bin:kernels/mcpx-1.1.bin:references/xdk/5659 4304=sample/4304:kernels/4034_orig.bin:kernels/mcpx-1.0.bin:references/xdk/4627
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS   := -ldflags "-X github.com/nickheyer/discoxip/pkg/cli.Version=$(VERSION) -X github.com/nickheyer/discoxip/pkg/cli.Commit=$(COMMIT)"
 
-.PHONY: all build dev pipeline decompile native-c test test-samples vet fmt clean
+.PHONY: all build dev pipeline decompile native-c native-verify test test-samples vet fmt clean
 
 all: build
 
@@ -29,7 +30,10 @@ decompile: build
 	$(BIN) xbe disasm $(XBE) -o $(OUT)/$(notdir $(basename $(XBE))).c
 
 native-c: build
-	python3 -B references/scripts/gen_native_c.py --bin $(BIN) --cache $(BUILD_DIR)/native --out NATIVE_C.md $(NATIVE_SETS)
+	python3 -B references/scripts/gen_native_c.py --bin $(BIN) --cache $(BUILD_DIR)/native --out $(NATIVE_DOC) $(NATIVE_SETS)
+
+native-verify: native-c
+	$(BIN) native verify $(BUILD_DIR)/native/manifest.json --work $(BUILD_DIR)/native/verify
 
 test:
 	go test ./...
